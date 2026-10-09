@@ -1,5 +1,7 @@
 # bench: phase-0 benchmark harness
 
+Results and their interpretation for the first host measured are in `RESULTS.md`.
+
 Measures the numbers the build plan could not source (`docs/research/build-plan.md`,
 "What research could not source, and so must be measured in phase 0") on the host it
 is run on. Python 3 standard library only; no `hyperfine`, no root, no changes to the
@@ -8,7 +10,7 @@ user's Podman configuration.
 ## Run it
 
 ```sh
-# everything, default sample counts (about 70 minutes on a 4-core laptop)
+# everything, default sample counts (52 minutes on the 4-thread laptop in RESULTS.md)
 python3 bench/sbxbench.py
 
 # the run that produced bench/RESULTS.md (adds the opt-in quota confirmation, see below)
@@ -83,6 +85,8 @@ clock around `subprocess.run`, which includes about 1 ms of fork/exec (see `floo
   at exit, also on SIGINT/SIGTERM. `~/.config/containers` is never read for writing.
 - REST calls go to the harness's own `podman system service --time 0` on a private
   socket, not to the user's `podman.socket`.
+- If that service process exits, the harness records its exit code and log under
+  `extra.service_deaths` in `results.json` and starts a new one.
 - The agent binary is built into the temp directory; nothing outside `bench/` changes.
 - The density ramp stops when `MemAvailable` falls below `--density-mem-floor-mb` (2500),
   `--density-key-headroom` (20) keys short of `kernel.keys.maxkeys`, or

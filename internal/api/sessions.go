@@ -288,11 +288,15 @@ func (s *Server) watch(sess *session, info agentapi.ProcessInfo, req agentapi.St
 			// away under the command.
 			data["reason"] = "sandbox_terminated"
 			if sess.ctx.Err() == nil && streamErr != nil {
-				if term := s.terminated(sess); term != nil {
-					if r, ok := term.Details["reason"]; ok {
-						data["sandbox_reason"] = r
-					}
-				}
+				_ = s.terminated(sess) // fail the sandbox now if its instance died
+			}
+			// Whoever noticed first (this watcher, a request, the sweeper),
+			// the row says why the sandbox ended.
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(s.baseCtx), 5*time.Second)
+			acc, err := s.store.GetSandboxAccess(ctx, sess.id)
+			cancel()
+			if err == nil && acc.Sandbox.Generation == sess.gen && acc.Sandbox.State != core.StateRunning && acc.Sandbox.Reason != "" {
+				data["sandbox_reason"] = string(acc.Sandbox.Reason)
 			}
 		}
 		s.appendEvent(store.Event{SandboxID: sess.id, TenantID: sess.tenantID, Type: EventCommandFinished, Data: data})

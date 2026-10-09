@@ -418,12 +418,23 @@ def start_service():
     """Our own `podman system service --time 0` on the default store, as the
     research notes recommend for the product (no idle exit, no socket
     activation on the request path). The user's podman.socket is untouched."""
-    if SERVICE_SOCK[0]:
+    if SERVICE_SOCK[0] and _SERVICE and _SERVICE[0].poll() is None:
         return
-    sock = os.path.join(RUN, "podman.sock")
+    logp = os.path.join(RUN, "service.log")
+    if _SERVICE:
+        # our service process died: record how, then start a new one
+        dead = _SERVICE.pop(0)
+        try:
+            tail = open(logp, errors="replace").read()[-3000:]
+        except OSError:
+            tail = ""
+        REC.extra.setdefault("service_deaths", []).append(dict(time=time.strftime("%H:%M:%S"), returncode=dead.returncode, log_tail=tail))
+        log(f"podman system service had exited (rc={dead.returncode}); restarting it")
+        _tls.api = None
+    sock = os.path.join(RUN, f"podman{len(REC.extra.get('service_deaths', []))}.sock")
     p = subprocess.Popen(["podman", "system", "service", "--time", "0", f"unix://{sock}"],
-                         stdout=subprocess.DEVNULL, stderr=open(os.path.join(RUN, "service.log"), "wb"))
-    _SERVICE.append(p)
+                         stdout=subprocess.DEVNULL, stderr=open(logp, "ab"))
+    _SERVICE.insert(0, p)
     for _ in range(200):
         if os.path.exists(sock):
             break
@@ -437,7 +448,7 @@ def start_service():
 
 
 def papi():
-    if not getattr(_tls, "api", None):
+    if not getattr(_tls, "api", None) or _tls.api.path != SERVICE_SOCK[0]:
         _tls.api = Api(SERVICE_SOCK[0], API_PREFIX[0])
     return _tls.api
 
@@ -1270,6 +1281,7 @@ def bench_parallel(a):
         for transport in ("rest-api", "cli"):
             for conc in a.parallel_conc:
                 made, lock = [], threading.Lock()
+                start_service()  # restarts it (and records why) if it died
 
                 def one(_, transport=transport):
                     if transport == "rest-api":
@@ -1317,7 +1329,8 @@ def bench_parallel(a):
                            wall_s=round(wall, 3), creates_per_s=round(len(lat) / wall, 2),
                            per_create_ms=stats(lat), create_errors=errs[:3], n_create_errors=len(errs),
                            teardown_wall_s=round(rwall, 3), removals_per_s=round(len(made) / rwall, 2),
-                           teardown_errors=rerr[:3], load_start=l0, load_end=loadavg())
+                           teardown_errors=rerr[:3], load_start=l0, load_end=loadavg(),
+                           service_alive_after=bool(_SERVICE and _SERVICE[0].poll() is None))
                 out.append(row)
                 log(f"parallel r{rnd + 1} {transport} c={conc}: {row['creates_per_s']} creates/s, "
                     f"{row['removals_per_s']} rm/s, errors={len(errs)}/{len(rerr)}")
@@ -1630,6 +1643,7 @@ def probe_storage_opt(a):
 @probe("exec_detached_reattach", "Can a detached `podman exec -d` session be re-attached?")
 def probe_exec_reattach(a):
     start_service()
+    _tls.api = None  # fresh keep-alive connection: a stale one must not decide this probe
     name = new_name("pe")
     ms, rc, out, err = sh(["podman", "run", "-d", "--name", name, "--network", "none", "--stop-timeout", "0", ALPINE, *IDLE])
     if rc != 0:

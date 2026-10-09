@@ -433,7 +433,7 @@ paths:
       tags: [commands]
       operationId: listCommands
       summary: List the sandbox's commands
-      description: Running and exited commands, in start order. Includes commands started inside the sandbox through the agent only if they were started with this API.
+      description: Running and exited commands, in start order.
       security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
       responses:
         "200":
@@ -489,7 +489,7 @@ paths:
       tags: [commands]
       operationId: writeStdin
       summary: Write to a command's stdin
-      description: The raw request body is streamed to stdin (pipe mode started with `stdin: true`, or a PTY). Returns when the command has accepted all of it.
+      description: "The raw request body is streamed to stdin (pipe mode started with `stdin: true`, or a PTY). Returns when the command has accepted all of it."
       security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
       requestBody:
         required: true
@@ -1036,7 +1036,7 @@ components:
       type: object
       required: [exit_code, reason]
       properties:
-        exit_code: { type: integer, description: "The exit code; -1 if the command was ended by a signal." }
+        exit_code: { type: integer, description: "The exit code; 128 + the signal number if the command was ended by a signal (137 for SIGKILL)." }
         signal: { type: string, example: SIGKILL }
         reason:
           type: string

@@ -1,0 +1,614 @@
+{
+ "config": {
+  "only": [
+   "parallel"
+  ],
+  "samples": 50,
+  "rounds": 2,
+  "warmup": 5,
+  "runtime": "crun",
+  "workload_rounds": 3,
+  "workload_reps": 5,
+  "userns_reps": 3,
+  "userns_subsequent": 20,
+  "userns_auto_concurrent": 6,
+  "userns_auto_max": 80,
+  "density_step": 20,
+  "density_rounds": 2,
+  "density_ceiling": 400,
+  "density_mem_floor_mb": 2500,
+  "density_key_headroom": 20,
+  "density_inotify_headroom": 64,
+  "density_settle": 3.0,
+  "density_teardown_conc": 4,
+  "push_to_limit": false,
+  "parallel_n": 32,
+  "parallel_conc": [
+   1,
+   2,
+   4,
+   8
+  ],
+  "quick": false,
+  "out": null
+ },
+ "rows": [],
+ "extra": {
+  "agent_binary": {
+   "built": true,
+   "error": null
+  },
+  "parallel": [
+   {
+    "round": 0,
+    "transport": "rest-api",
+    "concurrency": 1,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.964,
+    "creates_per_s": 10.8,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 92.43449884365873,
+     "stddev": 15.13679726453343,
+     "min": 75.63165300234687,
+     "p50": 88.38288399783778,
+     "p95": 129.82963645154086,
+     "p99": 141.84097248944457,
+     "max": 146.08918799785897
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.723,
+    "removals_per_s": 11.75,
+    "teardown_errors": [],
+    "load_start": [
+     1.7,
+     0.67,
+     0.26
+    ],
+    "load_end": [
+     1.8,
+     0.71,
+     0.28
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "rest-api",
+    "concurrency": 2,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 1.828,
+    "creates_per_s": 17.5,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 113.18538578143489,
+     "stddev": 14.892953638409875,
+     "min": 87.01775600638939,
+     "p50": 112.50730149913579,
+     "p95": 137.40955015236977,
+     "p99": 144.64151258245693,
+     "max": 147.26230900123483
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.811,
+    "removals_per_s": 11.39,
+    "teardown_errors": [],
+    "load_start": [
+     1.8,
+     0.71,
+     0.28
+    ],
+    "load_end": [
+     1.9,
+     0.75,
+     0.29
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "rest-api",
+    "concurrency": 4,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 3.184,
+    "creates_per_s": 10.05,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 379.08245131211515,
+     "stddev": 266.6197578181145,
+     "min": 113.33425399789121,
+     "p50": 268.9967849983077,
+     "p95": 846.5190910013916,
+     "p99": 1000.5532455995856,
+     "max": 1059.8288850014796
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.638,
+    "removals_per_s": 12.13,
+    "teardown_errors": [],
+    "load_start": [
+     1.9,
+     0.75,
+     0.29
+    ],
+    "load_end": [
+     1.85,
+     0.77,
+     0.3
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "rest-api",
+    "concurrency": 8,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.168,
+    "creates_per_s": 14.76,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 501.4877577507377,
+     "stddev": 496.23320152245446,
+     "min": 134.74683000094956,
+     "p50": 269.08480299971416,
+     "p95": 1691.4837229982368,
+     "p99": 1946.9878895997686,
+     "max": 2030.1697370014153
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.979,
+    "removals_per_s": 10.74,
+    "teardown_errors": [],
+    "load_start": [
+     1.85,
+     0.77,
+     0.3
+    ],
+    "load_end": [
+     2.1,
+     0.84,
+     0.33
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "cli",
+    "concurrency": 1,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 6.624,
+    "creates_per_s": 4.83,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 206.88167884327413,
+     "stddev": 80.76865066833189,
+     "min": 130.86085200484376,
+     "p50": 187.7624119988468,
+     "p95": 395.0718350475654,
+     "p99": 476.7522620881938,
+     "max": 509.15831699967384
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 5.691,
+    "removals_per_s": 5.62,
+    "teardown_errors": [],
+    "load_start": [
+     2.1,
+     0.84,
+     0.33
+    ],
+    "load_end": [
+     2.33,
+     0.93,
+     0.36
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "cli",
+    "concurrency": 2,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.505,
+    "creates_per_s": 12.77,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 155.45297140647563,
+     "stddev": 11.240219137820935,
+     "min": 140.24754500132985,
+     "p50": 153.8002549968951,
+     "p95": 178.62870454991935,
+     "p99": 184.81683343619807,
+     "max": 186.446433996025
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.955,
+    "removals_per_s": 10.83,
+    "teardown_errors": [],
+    "load_start": [
+     2.33,
+     0.93,
+     0.36
+    ],
+    "load_end": [
+     2.62,
+     1.02,
+     0.39
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "cli",
+    "concurrency": 4,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.03,
+    "creates_per_s": 15.77,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 247.19723368752966,
+     "stddev": 57.640421449580366,
+     "min": 191.92687699978705,
+     "p50": 219.08392450131942,
+     "p95": 376.31633334858634,
+     "p99": 386.7110092882649,
+     "max": 390.2380779982195
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 3.567,
+    "removals_per_s": 8.97,
+    "teardown_errors": [],
+    "load_start": [
+     2.62,
+     1.02,
+     0.39
+    ],
+    "load_end": [
+     3.54,
+     1.23,
+     0.47
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "cli",
+    "concurrency": 8,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.124,
+    "creates_per_s": 15.06,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 495.97732040615483,
+     "stddev": 228.79358941569345,
+     "min": 239.8693369977991,
+     "p50": 436.14366599649657,
+     "p95": 911.9153227518834,
+     "p99": 1245.808412901679,
+     "max": 1315.8271860011155
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 3.911,
+    "removals_per_s": 8.18,
+    "teardown_errors": [],
+    "load_start": [
+     3.54,
+     1.23,
+     0.47
+    ],
+    "load_end": [
+     3.81,
+     1.33,
+     0.5
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "rest-api",
+    "concurrency": 1,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 3.013,
+    "creates_per_s": 10.62,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 93.99559475059505,
+     "stddev": 17.000166262342468,
+     "min": 82.65496899548452,
+     "p50": 89.17568799733999,
+     "p95": 114.0924152037769,
+     "p99": 159.10419462292344,
+     "max": 174.1256160021294
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.626,
+    "removals_per_s": 12.19,
+    "teardown_errors": [],
+    "load_start": [
+     3.81,
+     1.33,
+     0.5
+    ],
+    "load_end": [
+     3.61,
+     1.37,
+     0.52
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "rest-api",
+    "concurrency": 2,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 1.909,
+    "creates_per_s": 16.76,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 117.11846037519535,
+     "stddev": 15.389295917416446,
+     "min": 92.11283799959347,
+     "p50": 115.57085399908829,
+     "p95": 141.38067054991552,
+     "p99": 153.17374473896055,
+     "max": 157.41179999895394
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.284,
+    "removals_per_s": 14.01,
+    "teardown_errors": [],
+    "load_start": [
+     3.61,
+     1.37,
+     0.52
+    ],
+    "load_end": [
+     3.61,
+     1.37,
+     0.52
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "rest-api",
+    "concurrency": 4,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.103,
+    "creates_per_s": 15.22,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 255.54733378135097,
+     "stddev": 213.4523362438579,
+     "min": 112.44964499928756,
+     "p50": 206.19164849995286,
+     "p95": 535.2254464476573,
+     "p99": 1046.8439200618022,
+     "max": 1275.5241850027232
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.584,
+    "removals_per_s": 12.38,
+    "teardown_errors": [],
+    "load_start": [
+     3.61,
+     1.37,
+     0.52
+    ],
+    "load_end": [
+     4.28,
+     1.54,
+     0.59
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "rest-api",
+    "concurrency": 8,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 1.57,
+    "creates_per_s": 20.39,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 360.2264351241047,
+     "stddev": 251.95799685489064,
+     "min": 120.78855399886379,
+     "p50": 263.14123249903787,
+     "p95": 956.9031953473312,
+     "p99": 1091.2032354965777,
+     "max": 1113.4388689970365
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 2.733,
+    "removals_per_s": 11.71,
+    "teardown_errors": [],
+    "load_start": [
+     4.28,
+     1.54,
+     0.59
+    ],
+    "load_end": [
+     5.14,
+     1.77,
+     0.66
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "cli",
+    "concurrency": 1,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 4.103,
+    "creates_per_s": 7.8,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 128.07732168721486,
+     "stddev": 10.658172353598244,
+     "min": 116.93639599980088,
+     "p50": 126.10603199937032,
+     "p95": 136.8746588977956,
+     "p99": 165.8385289097351,
+     "max": 178.77477900037775
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 3.949,
+    "removals_per_s": 8.1,
+    "teardown_errors": [],
+    "load_start": [
+     5.14,
+     1.77,
+     0.66
+    ],
+    "load_end": [
+     4.66,
+     1.78,
+     0.68
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "cli",
+    "concurrency": 2,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.467,
+    "creates_per_s": 12.97,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 152.54856662454586,
+     "stddev": 9.729575524866826,
+     "min": 138.59344600496115,
+     "p50": 152.37090000300668,
+     "p95": 170.47147449775366,
+     "p99": 173.17056589003187,
+     "max": 173.1970030014054
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 3.787,
+    "removals_per_s": 8.45,
+    "teardown_errors": [],
+    "load_start": [
+     4.66,
+     1.78,
+     0.68
+    ],
+    "load_end": [
+     4.44,
+     1.78,
+     0.69
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "cli",
+    "concurrency": 4,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 3.133,
+    "creates_per_s": 10.21,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 379.9204633116915,
+     "stddev": 202.07258499561965,
+     "min": 190.74670599366073,
+     "p50": 314.6994264970999,
+     "p95": 744.2942824003693,
+     "p99": 1042.4844769687484,
+     "max": 1132.6163609992363
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 3.472,
+    "removals_per_s": 9.22,
+    "teardown_errors": [],
+    "load_start": [
+     4.44,
+     1.78,
+     0.69
+    ],
+    "load_end": [
+     4.49,
+     1.83,
+     0.71
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "cli",
+    "concurrency": 8,
+    "n": 32,
+    "ok": 32,
+    "wall_s": 2.724,
+    "creates_per_s": 11.75,
+    "per_create_ms": {
+     "n": 32,
+     "mean": 618.6049214365994,
+     "stddev": 353.87477907298154,
+     "min": 231.3296479987912,
+     "p50": 508.37222499467316,
+     "p95": 1310.6934224466386,
+     "p99": 1618.0564863505429,
+     "max": 1753.8740320014767
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 5.137,
+    "removals_per_s": 6.23,
+    "teardown_errors": [],
+    "load_start": [
+     4.49,
+     1.83,
+     0.71
+    ],
+    "load_end": [
+     4.86,
+     2.0,
+     0.78
+    ],
+    "service_alive_after": true
+   }
+  ],
+  "bench_wall_seconds": {
+   "parallel": 98.9
+  },
+  "bench_load_at_end": {
+   "parallel": [
+    4.86,
+    2.0,
+    0.78
+   ]
+  }
+ }
+}

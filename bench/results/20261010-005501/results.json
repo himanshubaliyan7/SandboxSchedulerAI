@@ -1,0 +1,476 @@
+{
+ "config": {
+  "only": [
+   "parallel"
+  ],
+  "samples": 50,
+  "rounds": 3,
+  "warmup": 5,
+  "runtime": "crun",
+  "workload_rounds": 3,
+  "workload_reps": 5,
+  "userns_reps": 3,
+  "userns_subsequent": 20,
+  "userns_auto_concurrent": 6,
+  "userns_auto_max": 80,
+  "density_step": 20,
+  "density_rounds": 2,
+  "density_ceiling": 400,
+  "density_mem_floor_mb": 2500,
+  "density_key_headroom": 20,
+  "density_inotify_headroom": 64,
+  "density_settle": 3.0,
+  "density_teardown_conc": 4,
+  "push_to_limit": false,
+  "parallel_n": 64,
+  "parallel_conc": [
+   4,
+   8
+  ],
+  "quick": false,
+  "out": null
+ },
+ "rows": [],
+ "extra": {
+  "agent_binary": {
+   "built": true,
+   "error": null
+  },
+  "parallel": [
+   {
+    "round": 0,
+    "transport": "rest-api",
+    "concurrency": 4,
+    "n": 64,
+    "ok": 63,
+    "wall_s": 3.293,
+    "creates_per_s": 19.13,
+    "per_create_ms": {
+     "n": 63,
+     "mean": 202.02050936495652,
+     "stddev": 83.59387972928278,
+     "min": 87.10254700417863,
+     "p50": 176.799815002596,
+     "p95": 364.3009548992267,
+     "p99": 488.1679982948117,
+     "max": 491.15524199442007
+    },
+    "create_errors": [
+     "start 500: {\"cause\":\"OCI runtime error\",\"message\":\"crun: write to `/proc/sys/net/ipv4/ping_group_range`: Invalid argument: OCI runtime error\",\"response\":500}\n"
+    ],
+    "n_create_errors": 1,
+    "teardown_wall_s": 4.708,
+    "removals_per_s": 13.38,
+    "teardown_errors": [],
+    "load_start": [
+     4.0,
+     1.95,
+     0.78
+    ],
+    "load_end": [
+     3.84,
+     1.95,
+     0.79
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "rest-api",
+    "concurrency": 8,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 3.177,
+    "creates_per_s": 20.14,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 384.57326848379125,
+     "stddev": 380.1086877776172,
+     "min": 114.39269100083038,
+     "p50": 224.78677250182955,
+     "p95": 1264.6237847045995,
+     "p99": 1656.3111785591893,
+     "max": 1804.8149599999306
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 4.818,
+    "removals_per_s": 13.28,
+    "teardown_errors": [],
+    "load_start": [
+     3.84,
+     1.95,
+     0.79
+    ],
+    "load_end": [
+     3.64,
+     1.97,
+     0.81
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "cli",
+    "concurrency": 4,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 4.023,
+    "creates_per_s": 15.91,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 247.55460015592234,
+     "stddev": 44.68818997866656,
+     "min": 180.4872080028872,
+     "p50": 243.80091949933558,
+     "p95": 323.7427579522773,
+     "p99": 351.36168717210234,
+     "max": 361.1484479988576
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 5.878,
+    "removals_per_s": 10.89,
+    "teardown_errors": [],
+    "load_start": [
+     3.64,
+     1.97,
+     0.81
+    ],
+    "load_end": [
+     3.62,
+     2.02,
+     0.84
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 0,
+    "transport": "cli",
+    "concurrency": 8,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 3.693,
+    "creates_per_s": 17.33,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 438.81863120361686,
+     "stddev": 289.867307243019,
+     "min": 216.26927299803356,
+     "p50": 382.9013094982656,
+     "p95": 804.207473998031,
+     "p99": 1686.9038209917176,
+     "max": 2236.1750080017373
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 7.995,
+    "removals_per_s": 8.01,
+    "teardown_errors": [],
+    "load_start": [
+     3.62,
+     2.02,
+     0.84
+    ],
+    "load_end": [
+     3.75,
+     2.11,
+     0.88
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "rest-api",
+    "concurrency": 4,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 3.484,
+    "creates_per_s": 18.37,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 212.7827244215723,
+     "stddev": 99.52738714664913,
+     "min": 115.35127500246745,
+     "p50": 191.05385250077234,
+     "p95": 364.6151272991119,
+     "p99": 556.1351323912813,
+     "max": 785.1447610009927
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 4.697,
+    "removals_per_s": 13.63,
+    "teardown_errors": [],
+    "load_start": [
+     3.75,
+     2.11,
+     0.88
+    ],
+    "load_end": [
+     3.71,
+     2.15,
+     0.9
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "rest-api",
+    "concurrency": 8,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 3.756,
+    "creates_per_s": 17.04,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 441.09464185953584,
+     "stddev": 398.25741587747865,
+     "min": 139.50846700026887,
+     "p50": 295.2920784991875,
+     "p95": 1107.0063688963276,
+     "p99": 2007.1820792029746,
+     "max": 2300.891330000013
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 7.175,
+    "removals_per_s": 8.92,
+    "teardown_errors": [],
+    "load_start": [
+     3.71,
+     2.15,
+     0.9
+    ],
+    "load_end": [
+     3.89,
+     2.24,
+     0.95
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "cli",
+    "concurrency": 4,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 4.327,
+    "creates_per_s": 14.79,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 266.0678547970292,
+     "stddev": 60.342405573928474,
+     "min": 166.31749999942258,
+     "p50": 253.2191874961427,
+     "p95": 373.7241337505111,
+     "p99": 435.09765238784877,
+     "max": 482.45560099894647
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 7.283,
+    "removals_per_s": 8.79,
+    "teardown_errors": [],
+    "load_start": [
+     3.89,
+     2.24,
+     0.95
+    ],
+    "load_end": [
+     3.91,
+     2.3,
+     0.98
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 1,
+    "transport": "cli",
+    "concurrency": 8,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 4.682,
+    "creates_per_s": 13.67,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 560.8134809218654,
+     "stddev": 195.57218383636095,
+     "min": 303.25044200435514,
+     "p50": 517.4311189985019,
+     "p95": 959.146981853337,
+     "p99": 1195.9453160053815,
+     "max": 1270.484504995693
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 8.127,
+    "removals_per_s": 7.87,
+    "teardown_errors": [],
+    "load_start": [
+     3.91,
+     2.3,
+     0.98
+    ],
+    "load_end": [
+     4.83,
+     2.6,
+     1.1
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 2,
+    "transport": "rest-api",
+    "concurrency": 4,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 3.318,
+    "creates_per_s": 19.29,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 203.9031517812191,
+     "stddev": 110.91272740732818,
+     "min": 106.28130699478788,
+     "p50": 171.92856049587135,
+     "p95": 397.9722568983562,
+     "p99": 627.2695277070299,
+     "max": 816.8424389950815
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 4.99,
+    "removals_per_s": 12.83,
+    "teardown_errors": [],
+    "load_start": [
+     4.83,
+     2.6,
+     1.1
+    ],
+    "load_end": [
+     4.54,
+     2.61,
+     1.12
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 2,
+    "transport": "rest-api",
+    "concurrency": 8,
+    "n": 64,
+    "ok": 63,
+    "wall_s": 3.347,
+    "creates_per_s": 18.82,
+    "per_create_ms": {
+     "n": 63,
+     "mean": 377.46819441282054,
+     "stddev": 255.98683393388052,
+     "min": 116.6119310000795,
+     "p50": 291.1220750029315,
+     "p95": 950.2227719021902,
+     "p99": 1215.6534772610757,
+     "max": 1222.727414999099
+    },
+    "create_errors": [
+     "start 500: {\"cause\":\"OCI runtime error\",\"message\":\"crun: write to `/proc/sys/net/ipv4/ping_group_range`: Invalid argument: OCI runtime error\",\"response\":500}\n"
+    ],
+    "n_create_errors": 1,
+    "teardown_wall_s": 4.899,
+    "removals_per_s": 12.86,
+    "teardown_errors": [],
+    "load_start": [
+     4.54,
+     2.61,
+     1.12
+    ],
+    "load_end": [
+     4.41,
+     2.62,
+     1.13
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 2,
+    "transport": "cli",
+    "concurrency": 4,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 4.212,
+    "creates_per_s": 15.19,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 259.6328198280844,
+     "stddev": 81.21753701760572,
+     "min": 162.94125499553047,
+     "p50": 234.87219549861038,
+     "p95": 412.2984752040793,
+     "p99": 522.1996008823766,
+     "max": 652.8087590049836
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 8.904,
+    "removals_per_s": 7.19,
+    "teardown_errors": [],
+    "load_start": [
+     4.41,
+     2.62,
+     1.13
+    ],
+    "load_end": [
+     5.33,
+     2.91,
+     1.25
+    ],
+    "service_alive_after": true
+   },
+   {
+    "round": 2,
+    "transport": "cli",
+    "concurrency": 8,
+    "n": 64,
+    "ok": 64,
+    "wall_s": 5.728,
+    "creates_per_s": 11.17,
+    "per_create_ms": {
+     "n": 64,
+     "mean": 695.3188927337806,
+     "stddev": 462.42878222417875,
+     "min": 253.17245600308524,
+     "p50": 509.6285265026381,
+     "p95": 1854.7405703982809,
+     "p99": 2110.5056176199278,
+     "max": 2310.216830999707
+    },
+    "create_errors": [],
+    "n_create_errors": 0,
+    "teardown_wall_s": 8.874,
+    "removals_per_s": 7.21,
+    "teardown_errors": [],
+    "load_start": [
+     5.33,
+     2.91,
+     1.25
+    ],
+    "load_end": [
+     4.65,
+     2.88,
+     1.27
+    ],
+    "service_alive_after": true
+   }
+  ],
+  "bench_wall_seconds": {
+   "parallel": 126.0
+  },
+  "bench_load_at_end": {
+   "parallel": [
+    4.65,
+    2.88,
+    1.27
+   ]
+  }
+ }
+}

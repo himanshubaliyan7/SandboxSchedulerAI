@@ -502,15 +502,24 @@ func TestEndToEnd(t *testing.T) {
 				Data    map[string]any `json:"data"`
 			} `json:"events"`
 		}
-		acme.must(200, "GET", "/v1/sandboxes/"+victim.ID+"/events", nil, "").decode(t, &ev)
+		// The execution record is written by a background recorder, so
+		// it may land a moment after the sandbox is reported destroyed.
 		var sawFailed, sawRecord bool
-		for _, e := range ev.Events {
-			if e.ToState == "failed" && e.Reason == "oom_killed" && e.Data["exit_code"] == float64(137) {
-				sawFailed = true
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			acme.must(200, "GET", "/v1/sandboxes/"+victim.ID+"/events", nil, "").decode(t, &ev)
+			for _, e := range ev.Events {
+				if e.ToState == "failed" && e.Reason == "oom_killed" && e.Data["exit_code"] == float64(137) {
+					sawFailed = true
+				}
+				if e.Type == "command_finished" && e.Data["reason"] == "sandbox_terminated" && e.Data["sandbox_reason"] == "oom_killed" {
+					sawRecord = true
+				}
 			}
-			if e.Type == "command_finished" && e.Data["reason"] == "sandbox_terminated" && e.Data["sandbox_reason"] == "oom_killed" {
-				sawRecord = true
+			if (sawFailed && sawRecord) || time.Now().After(deadline) {
+				break
 			}
+			time.Sleep(100 * time.Millisecond)
 		}
 		if !sawFailed || !sawRecord {
 			t.Errorf("events lack the failure (%v) or the execution record (%v): %+v", sawFailed, sawRecord, ev.Events)
@@ -544,6 +553,19 @@ except Exception as e:
 		t.Helper()
 		res := acme.exec(sb, map[string]any{"cmd": "python3", "args": []string{"-c", probe, target}, "timeout_ms": 20000})
 		return strings.TrimSpace(string(res.Stdout) + string(res.Stderr))
+	}
+	// fetchUpstream is fetch for the private upstream, which is a shell
+	// loop around nc and refuses connections for an instant between two
+	// requests: a 502 (the proxy allowed the request and the upstream was
+	// not there) is retried. A policy refusal is a 403 and never retried.
+	fetchUpstream := func(sb sandbox, target string) string {
+		t.Helper()
+		got := fetch(sb, target)
+		for i := 0; i < 10 && strings.HasPrefix(got, "HTTP 502"); i++ {
+			time.Sleep(200 * time.Millisecond)
+			got = fetch(sb, target)
+		}
+		return got
 	}
 	// direct tries a TCP connection that does not go through the proxy.
 	const direct = `
@@ -612,7 +634,7 @@ except Exception as e:
 		path := "/v1/sandboxes/" + net1.ID + "/network"
 
 		if upstream != "" {
-			if got := fetch(net1, "http://"+upstream+"/"); got != "OK 200 upstream-ok" {
+			if got := fetchUpstream(net1, "http://"+upstream+"/"); got != "OK 200 upstream-ok" {
 				t.Errorf("allowed private upstream through the proxy: %q", got)
 			}
 			// The proxy is the only way: a direct connection has no route.
@@ -678,7 +700,7 @@ except Exception as e:
 		}
 		if upstream != "" {
 			acme.must(200, "PUT", path, map[string]any{"mode": "allowlist", "allow_cidrs": []string{upstreamIP + "/32"}}, "")
-			if got := fetch(net1, "http://"+upstream+"/"); got != "OK 200 upstream-ok" {
+			if got := fetchUpstream(net1, "http://"+upstream+"/"); got != "OK 200 upstream-ok" {
 				t.Errorf("after re-opening: %q", got)
 			}
 		}

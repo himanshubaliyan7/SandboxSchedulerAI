@@ -1,0 +1,1086 @@
+{
+ "config": {
+  "only": [
+   "probes"
+  ],
+  "samples": 50,
+  "rounds": 2,
+  "warmup": 5,
+  "runtime": "crun",
+  "workload_rounds": 3,
+  "workload_reps": 5,
+  "userns_reps": 3,
+  "userns_subsequent": 20,
+  "userns_auto_concurrent": 6,
+  "userns_auto_max": 80,
+  "density_step": 20,
+  "density_rounds": 2,
+  "density_ceiling": 400,
+  "density_mem_floor_mb": 2500,
+  "density_key_headroom": 20,
+  "density_inotify_headroom": 64,
+  "density_settle": 3.0,
+  "density_teardown_conc": 4,
+  "push_to_limit": false,
+  "parallel_n": 32,
+  "parallel_conc": [
+   1,
+   2,
+   4,
+   8
+  ],
+  "quick": false,
+  "out": null
+ },
+ "rows": [],
+ "extra": {
+  "probes": {
+   "cgroup_kill": {
+    "result": "works",
+    "pids_before": 62,
+    "cgroup": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-04214a139404a6b7284f99f96426b860d7cb8a2b2394e8f1fcc24b42896f945e.scope/container",
+    "file_owner": "uid=1000 mode=0o200",
+    "ms_until_cgroup_empty": 4.11,
+    "ms_until_podman_reports_exited": 119.0,
+    "podman_state_after": "stopped 137 false -> exited 137",
+    "detail": "62 pids (60 sleeps + a fork loop) gone 4.1 ms after writing 1; Podman state 'stopped 137 false -> exited 137' after 119 ms",
+    "question": "Can the rootless user write cgroup.kill for a Podman-created container cgroup, and does it kill a fork-heavy tree?"
+   },
+   "memory_oom_group": {
+    "result": "works",
+    "runs": {
+     "1": {
+      "file_value_in_leaf_cgroup": 1,
+      "final_state": "exited 137 false"
+     },
+     "0": {
+      "file_value_in_leaf_cgroup": 0,
+      "final_state": "exited 42 false"
+     }
+    },
+    "detail": "oom.group=1: file reads 1, container ended 'exited 137 false' (status exitcode OOMKilled); control oom.group=0: ended 'exited 42 false' (42 = only the hog was killed and the shell carried on)",
+    "question": "Does --cgroup-conf memory.oom.group=1 take effect?"
+   },
+   "storage_opt_size": {
+    "result": "fails",
+    "rc": 125,
+    "detail": "Error: storage option overlay.size and overlay.inodes only supported for backingFS XFS. Found extfs",
+    "graphroot_fs": "/dev/sda2      ext4 228554124 32789856 184081504  16% /",
+    "question": "Does --storage-opt size= work rootless on this filesystem?"
+   },
+   "exec_detached_reattach": {
+    "result": "fails",
+    "evidence": {
+     "cli_exec_d": {
+      "rc": 0,
+      "stdout": "fea38229c470d499d717a550838cb884b3f0eac0bbd70ac01bea1b9c7a242e9f",
+      "stderr": ""
+     },
+     "cli_has_exec_attach_subcommand": false,
+     "api_start_detached": {
+      "status": 200,
+      "body": "\n"
+     },
+     "api_inspect_running": true,
+     "api_second_start_attached": {
+      "status": 500,
+      "body": "\"exec session state improper\",\"message\":\"can only start created exec sessions, while container f39c7bb28a01dc5a499d8f561b81ae580a2d5cdd4866a88cfd7fb83d6ca51c57 session e634fdacc29c2d6211e452c61f19e518ca3145a0b8bd30aa7a8e9935b79b2c03 state is \\\"running\\\": exec session state improper\",\"response\":500}\n"
+     },
+     "note_container_attach": "POST /containers/{name}/attach attaches to the container's main process only, not to an exec session"
+    },
+    "detail": "second start of a detached, still-running exec session -> HTTP 500: bb28a01dc5a499d8f561b81ae580a2d5cdd4866a88cfd7fb83d6ca51c57 session e634fdacc29c2d6211e452c61f19e518ca3145a0b8bd30aa7a8e9935b79b2c03 state is \\\"running\\\": exec session state improper\",\"response\":500}",
+    "question": "Can a detached `podman exec -d` session be re-attached?"
+   },
+   "seccomp_syscalls": {
+    "result": "recorded",
+    "detail": "default container: unshare(CLONE_NEWUSER)=OK, bpf(BPF_MAP_CREATE)=EPERM, io_uring_setup(1)=ENOSYS, socket(AF_ALG, SOCK_SEQPACKET)=OK",
+    "runtime_results": {
+     "default container (default seccomp, default caps, root in userns)": {
+      "arch": "x86_64",
+      "unshare(CLONE_NEWUSER)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "unshare(CLONE_NEWNS)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "unshare(CLONE_NEWNET)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "bpf(BPF_MAP_CREATE)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "io_uring_setup(1)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "userfaultfd(0)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "keyctl(GET_KEYRING_ID, session)": {
+       "ret": 994295045,
+       "errno": 0,
+       "err": "OK"
+      },
+      "add_key(user)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "ptrace(PTRACE_TRACEME)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "mount(tmpfs on /tmp)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "perf_event_open": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "clone3(NULL)": {
+       "ret": -1,
+       "errno": 22,
+       "err": "EINVAL"
+      },
+      "personality(query)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "open_by_handle_at": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "kexec_load": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "init_module": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "setns(-1)": {
+       "ret": -1,
+       "errno": 9,
+       "err": "EBADF"
+      },
+      "pivot_root": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "process_vm_readv(pid 1)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_ALG, SOCK_SEQPACKET)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_NETLINK, SOCK_RAW)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_PACKET, SOCK_RAW)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_INET, SOCK_RAW, ICMP)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_VSOCK, SOCK_STREAM)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_UNIX, SOCK_STREAM)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "status": {
+       "Uid": "0\t0\t0\t0",
+       "CapEff": "00000000800405fb",
+       "CapBnd": "00000000800405fb",
+       "NoNewPrivs": "0",
+       "Seccomp": "2",
+       "Seccomp_filters": "1"
+      }
+     },
+     "default seccomp, cap-drop all, no-new-privileges, uid 1000 (hardened without the product profile)": {
+      "arch": "x86_64",
+      "unshare(CLONE_NEWUSER)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "unshare(CLONE_NEWNS)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "unshare(CLONE_NEWNET)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "bpf(BPF_MAP_CREATE)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "io_uring_setup(1)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "userfaultfd(0)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "keyctl(GET_KEYRING_ID, session)": {
+       "ret": 398551171,
+       "errno": 0,
+       "err": "OK"
+      },
+      "add_key(user)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "ptrace(PTRACE_TRACEME)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "mount(tmpfs on /tmp)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "perf_event_open": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "clone3(NULL)": {
+       "ret": -1,
+       "errno": 22,
+       "err": "EINVAL"
+      },
+      "personality(query)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "open_by_handle_at": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "kexec_load": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "init_module": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "setns(-1)": {
+       "ret": -1,
+       "errno": 9,
+       "err": "EBADF"
+      },
+      "pivot_root": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "process_vm_readv(pid 1)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_ALG, SOCK_SEQPACKET)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_NETLINK, SOCK_RAW)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_PACKET, SOCK_RAW)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_INET, SOCK_RAW, ICMP)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_VSOCK, SOCK_STREAM)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_UNIX, SOCK_STREAM)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "status": {
+       "Uid": "1000\t1000\t1000\t1000",
+       "CapEff": "0000000000000000",
+       "CapBnd": "0000000000000000",
+       "NoNewPrivs": "1",
+       "Seccomp": "2",
+       "Seccomp_filters": "1"
+      }
+     },
+     "product profile (hardened spec)": {
+      "arch": "x86_64",
+      "unshare(CLONE_NEWUSER)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "unshare(CLONE_NEWNS)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "unshare(CLONE_NEWNET)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "bpf(BPF_MAP_CREATE)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "io_uring_setup(1)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "userfaultfd(0)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "keyctl(GET_KEYRING_ID, session)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "add_key(user)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "ptrace(PTRACE_TRACEME)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "mount(tmpfs on /tmp)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "perf_event_open": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "clone3(NULL)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "personality(query)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "open_by_handle_at": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "kexec_load": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "init_module": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "setns(-1)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "pivot_root": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "process_vm_readv(pid 1)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_ALG, SOCK_SEQPACKET)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "socket(AF_NETLINK, SOCK_RAW)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "socket(AF_PACKET, SOCK_RAW)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "socket(AF_INET, SOCK_RAW, ICMP)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_VSOCK, SOCK_STREAM)": {
+       "ret": -1,
+       "errno": 38,
+       "err": "ENOSYS"
+      },
+      "socket(AF_UNIX, SOCK_STREAM)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "status": {
+       "Uid": "1000\t1000\t1000\t1000",
+       "CapEff": "0000000000000000",
+       "CapBnd": "0000000000000000",
+       "NoNewPrivs": "1",
+       "Seccomp": "2",
+       "Seccomp_filters": "1"
+      }
+     },
+     "seccomp=unconfined, default caps (control: what the kernel itself refuses)": {
+      "arch": "x86_64",
+      "unshare(CLONE_NEWUSER)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "unshare(CLONE_NEWNS)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "unshare(CLONE_NEWNET)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "bpf(BPF_MAP_CREATE)": {
+       "ret": -1,
+       "errno": 22,
+       "err": "EINVAL"
+      },
+      "io_uring_setup(1)": {
+       "ret": 6,
+       "errno": 0,
+       "err": "OK"
+      },
+      "userfaultfd(0)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "keyctl(GET_KEYRING_ID, session)": {
+       "ret": 819051630,
+       "errno": 0,
+       "err": "OK"
+      },
+      "add_key(user)": {
+       "ret": 212850501,
+       "errno": 0,
+       "err": "OK"
+      },
+      "ptrace(PTRACE_TRACEME)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "mount(tmpfs on /tmp)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "perf_event_open": {
+       "ret": -1,
+       "errno": 13,
+       "err": "EACCES"
+      },
+      "clone3(NULL)": {
+       "ret": -1,
+       "errno": 22,
+       "err": "EINVAL"
+      },
+      "personality(query)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "open_by_handle_at": {
+       "ret": -1,
+       "errno": 14,
+       "err": "EFAULT"
+      },
+      "kexec_load": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "init_module": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "setns(-1)": {
+       "ret": -1,
+       "errno": 9,
+       "err": "EBADF"
+      },
+      "pivot_root": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "process_vm_readv(pid 1)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_ALG, SOCK_SEQPACKET)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_NETLINK, SOCK_RAW)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_PACKET, SOCK_RAW)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_INET, SOCK_RAW, ICMP)": {
+       "ret": -1,
+       "errno": 1,
+       "err": "EPERM"
+      },
+      "socket(AF_VSOCK, SOCK_STREAM)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "socket(AF_UNIX, SOCK_STREAM)": {
+       "ret": 0,
+       "errno": 0,
+       "err": "OK"
+      },
+      "status": {
+       "Uid": "0\t0\t0\t0",
+       "CapEff": "00000000800405fb",
+       "CapBnd": "00000000800405fb",
+       "NoNewPrivs": "0",
+       "Seccomp": "0",
+       "Seccomp_filters": "0"
+      }
+     }
+    },
+    "host_sysctls": {
+     "kernel.unprivileged_bpf_disabled": "2",
+     "kernel.io_uring_disabled": "0",
+     "vm.unprivileged_userfaultfd": "0",
+     "kernel.apparmor_restrict_unprivileged_userns": "1",
+     "kernel.unprivileged_userns_clone": "1",
+     "kernel.perf_event_paranoid": "4",
+     "kernel.yama.ptrace_scope": "1",
+     "user.max_user_namespaces": "40650"
+    },
+    "default_profile_path": "/usr/share/containers/seccomp.json",
+    "default_profile_static": {
+     "defaultAction": "SCMP_ACT_ERRNO",
+     "defaultErrnoRet": 38,
+     "rules": {
+      "unshare": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       }
+      ],
+      "bpf": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "only_with_caps": [
+         "CAP_SYS_ADMIN"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "only_without_caps": [
+         "CAP_SYS_ADMIN"
+        ],
+        "errnoRet": 1
+       }
+      ],
+      "io_uring_setup": "not listed (default action applies)",
+      "userfaultfd": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "keyctl": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       }
+      ],
+      "add_key": "not listed (default action applies)",
+      "ptrace": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       }
+      ],
+      "mount": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       }
+      ],
+      "perf_event_open": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "only_with_caps": [
+         "CAP_SYS_ADMIN"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "only_without_caps": [
+         "CAP_SYS_ADMIN"
+        ],
+        "errnoRet": 1
+       }
+      ],
+      "clone3": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       }
+      ],
+      "personality": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 0"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 8"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 131072"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 131080"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 4294967295"
+        ]
+       }
+      ],
+      "open_by_handle_at": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "only_with_caps": [
+         "CAP_DAC_READ_SEARCH"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "only_without_caps": [
+         "CAP_DAC_READ_SEARCH"
+        ],
+        "errnoRet": 1
+       }
+      ],
+      "kexec_load": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "init_module": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "only_with_caps": [
+         "CAP_SYS_MODULE"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "only_without_caps": [
+         "CAP_SYS_MODULE"
+        ],
+        "errnoRet": 1
+       }
+      ],
+      "setns": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "only_with_caps": [
+         "CAP_SYS_ADMIN"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "only_without_caps": [
+         "CAP_SYS_ADMIN"
+        ],
+        "errnoRet": 1
+       }
+      ],
+      "pivot_root": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       }
+      ],
+      "process_vm_readv": [
+       {
+        "action": "SCMP_ACT_ALLOW"
+       }
+      ],
+      "socket": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "args": [
+         "arg0 SCMP_CMP_EQ 16",
+         "arg2 SCMP_CMP_EQ 9"
+        ],
+        "only_without_caps": [
+         "CAP_AUDIT_WRITE"
+        ],
+        "errnoRet": 22
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg2 SCMP_CMP_NE 9"
+        ],
+        "only_without_caps": [
+         "CAP_AUDIT_WRITE"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_NE 16"
+        ],
+        "only_without_caps": [
+         "CAP_AUDIT_WRITE"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg2 SCMP_CMP_NE 9"
+        ],
+        "only_without_caps": [
+         "CAP_AUDIT_WRITE"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "only_with_caps": [
+         "CAP_AUDIT_WRITE"
+        ]
+       }
+      ]
+     }
+    },
+    "product_profile_static": {
+     "defaultAction": "SCMP_ACT_ERRNO",
+     "defaultErrnoRet": 38,
+     "rules": {
+      "unshare": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_MASKED_EQ 2114060416"
+        ]
+       }
+      ],
+      "bpf": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "io_uring_setup": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 38
+       }
+      ],
+      "userfaultfd": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "keyctl": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "add_key": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "ptrace": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "mount": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "perf_event_open": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "clone3": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 38
+       }
+      ],
+      "personality": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 0"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 8"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 131072"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 131080"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 4294967295"
+        ]
+       }
+      ],
+      "open_by_handle_at": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "kexec_load": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "init_module": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "setns": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "pivot_root": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "process_vm_readv": [
+       {
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1
+       }
+      ],
+      "socket": [
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 1"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 2"
+        ]
+       },
+       {
+        "action": "SCMP_ACT_ALLOW",
+        "args": [
+         "arg0 SCMP_CMP_EQ 10"
+        ]
+       }
+      ]
+     }
+    },
+    "question": "What do the installed default seccomp profile and the product profile do with unshare, bpf, io_uring_setup, AF_ALG and friends?"
+   },
+   "session_keyring_quota": {
+    "result": "recorded",
+    "runs": {
+     "default": {
+      "keys_before": 5,
+      "keys_with_3_containers": 8,
+      "delta": 3,
+      "errors": []
+     },
+     "CONTAINERS_CONF_OVERRIDE keyring=false": {
+      "keys_before": 5,
+      "keys_with_3_containers": 5,
+      "delta": 0,
+      "errors": []
+     }
+    },
+    "kernel_keys_maxkeys": 200,
+    "kernel_keys_maxbytes": 20000,
+    "detail": "3 containers add 3 keys by default and 0 with keyring=false; per-user quota kernel.keys.maxkeys=200",
+    "question": "Does every container consume one kernel key from the user's quota, and does keyring=false avoid it?"
+   },
+   "checkpoint_rootless": {
+    "result": "fails",
+    "rc": 125,
+    "detail": "Error: checkpointing a container requires root",
+    "question": "Does podman container checkpoint (CRIU) work rootless?"
+   },
+   "cgroup_delegation": {
+    "result": "works",
+    "leaf_cgroup_values": {
+     "cpu.max": "100000 100000",
+     "memory.max": "268435456",
+     "memory.high": "241590272",
+     "memory.swap.max": "0",
+     "memory.oom.group": "1",
+     "pids.max": "128"
+    },
+    "detail": "{\"cpu.max\": \"100000 100000\", \"memory.max\": \"268435456\", \"memory.high\": \"241590272\", \"memory.swap.max\": \"0\", \"memory.oom.group\": \"1\", \"pids.max\": \"128\"}",
+    "user_service_cgroup_controllers": [
+     "cpu",
+     "memory",
+     "pids"
+    ],
+    "user_service_subtree_control": [
+     "cpu",
+     "memory",
+     "pids"
+    ],
+    "podman_info_cgroupControllers": "[memory pids]",
+    "question": "Which cgroup v2 controllers are delegated to the rootless user, and do cpu/memory/pids limits land in the container cgroup?"
+   }
+  },
+  "bench_wall_seconds": {
+   "probes": 20.0
+  },
+  "bench_load_at_end": {
+   "probes": [
+    2.08,
+    0.5,
+    0.18
+   ]
+  }
+ }
+}
