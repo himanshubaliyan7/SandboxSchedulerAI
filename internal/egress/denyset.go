@@ -315,6 +315,14 @@ type policy struct {
 	deny    []netip.Prefix
 }
 
+// ValidatePolicy reports whether Attach and Update would accept p. The
+// API layer calls it before a claim, so that a malformed policy is a
+// client error and not a sandbox that fails after it was assigned.
+func ValidatePolicy(p core.NetworkPolicy) error {
+	_, err := compilePolicy(p)
+	return err
+}
+
 func compilePolicy(p core.NetworkPolicy) (*policy, error) {
 	out := &policy{mode: p.Mode}
 	switch p.Mode {

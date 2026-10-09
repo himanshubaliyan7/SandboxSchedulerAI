@@ -133,10 +133,12 @@ func (b *Backend) List(ctx context.Context) ([]runtime.Instance, error) {
 	}
 	q := url.Values{"all": {"true"}, "filters": {string(filters)}}
 	var rows []struct {
-		ID      string            `json:"Id"`
-		Labels  map[string]string `json:"Labels"`
-		State   string            `json:"State"`
-		Created time.Time         `json:"Created"`
+		ID       string            `json:"Id"`
+		Labels   map[string]string `json:"Labels"`
+		State    string            `json:"State"`
+		Created  time.Time         `json:"Created"`
+		Exited   bool              `json:"Exited"`
+		ExitCode int               `json:"ExitCode"`
 	}
 	if _, err := b.c.do(ctx, http.MethodGet, "/containers/json", q, nil, &rows); err != nil {
 		return nil, err
@@ -149,7 +151,12 @@ func (b *Backend) List(ctx context.Context) ([]runtime.Instance, error) {
 			continue
 		}
 		// A paused container still holds its resources and its tenant.
-		out = append(out, instanceFrom(r.ID, r.Labels, r.State == "running" || r.State == "paused", r.Created))
+		inst := instanceFrom(r.ID, r.Labels, r.State == "running" || r.State == "paused", r.Created)
+		if !inst.Running && (r.Exited || r.State == "exited") {
+			inst.ExitCode = r.ExitCode
+			inst.OOMKilled = killedFromOutside(r.ExitCode)
+		}
+		out = append(out, inst)
 	}
 	return out, nil
 }
@@ -165,8 +172,28 @@ type inspectState struct {
 	Running    bool   `json:"Running"`
 	Paused     bool   `json:"Paused"`
 	OOMKilled  bool   `json:"OOMKilled"`
+	ExitCode   int    `json:"ExitCode"`
 	CgroupPath string `json:"CgroupPath"`
 }
+
+// sigkillExitCode is what Podman reports for a container whose init
+// process was ended by SIGKILL (128 + 9).
+const sigkillExitCode = 137
+
+// killedFromOutside reports whether an exited container's init process
+// was ended by SIGKILL. That is this backend's evidence of an OOM kill
+// when Podman has none of its own: on rootless Podman 4.9.3 the cgroup of
+// a dead container is removed together with its memory.events, and
+// State.OOMKilled stays false. The inference rests on three facts: the
+// kernel never delivers SIGKILL to a PID namespace's init from inside
+// that namespace, so code in the sandbox cannot produce this exit status;
+// this backend's own kill (Destroy) removes the container, so a container
+// it killed is never inspected afterwards; and memory.oom.group=1 makes
+// the OOM killer take init with everything else. What is left is the OOM
+// killer and a SIGKILL sent on the host by someone else (an operator, or
+// the user session being torn down), which is why callers should record
+// the exit code next to the reason.
+func killedFromOutside(exitCode int) bool { return exitCode == sigkillExitCode }
 
 func (b *Backend) inspect(ctx context.Context, instanceID string) (runtime.Instance, inspectState, error) {
 	if instanceID == "" {
@@ -191,7 +218,12 @@ func (b *Backend) inspect(ctx context.Context, instanceID string) (runtime.Insta
 	if data.Config != nil {
 		labels = data.Config.Labels
 	}
-	return instanceFrom(data.ID, labels, st.Running || st.Paused, data.Created), st, nil
+	inst := instanceFrom(data.ID, labels, st.Running || st.Paused, data.Created)
+	if !inst.Running && st.Status == "exited" {
+		inst.ExitCode = st.ExitCode
+		inst.OOMKilled = st.OOMKilled || killedFromOutside(st.ExitCode)
+	}
+	return inst, st, nil
 }
 
 // Pause implements runtime.Backend.

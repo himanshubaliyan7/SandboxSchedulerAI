@@ -27,6 +27,19 @@ type ClaimOptions struct {
 	// Wait is how long to queue when the pool is empty. Zero means
 	// Config.ClaimWait; negative means do not wait.
 	Wait time.Duration
+	// Lifetime overrides the template's max lifetime for this sandbox. It
+	// can only shorten it: zero, or a value above the template's (when
+	// the template has one), means the template's max lifetime.
+	Lifetime time.Duration
+}
+
+// lifetime is the max lifetime a claim with opts gets from tmpl.
+func lifetime(tmpl core.Template, opts ClaimOptions) time.Duration {
+	max := tmpl.Timeouts.MaxLifetime
+	if opts.Lifetime > 0 && (max <= 0 || opts.Lifetime < max) {
+		return opts.Lifetime
+	}
+	return max
 }
 
 func networkRank(m core.NetworkMode) int {
@@ -118,7 +131,7 @@ func (c *Controller) claimRow(ctx context.Context, tenantID string, tmpl core.Te
 	opts ClaimOptions, wait time.Duration) (sb core.Sandbox, waited bool, err error) {
 	params := store.ClaimParams{
 		TenantID: tenantID, TemplateID: tmpl.ID, TemplateVersion: tmpl.Version, HostID: c.cfg.HostID,
-		AssignedDeadline: c.cfg.InitTimeout, MaxLifetime: tmpl.Timeouts.MaxLifetime,
+		AssignedDeadline: c.cfg.InitTimeout, MaxLifetime: lifetime(tmpl, opts),
 		AccessTokenHash: opts.AccessTokenHash, NetworkPolicy: &policy,
 	}
 	var (
@@ -182,6 +195,9 @@ func (c *Controller) activate(ctx context.Context, sb core.Sandbox, policy core.
 			if err := c.egress.Attach(sb.ID, filepath.Join(runDir, runtime.EgressSocket), policy); err != nil {
 				return core.Sandbox{}, fmt.Errorf("attach egress: %w", err)
 			}
+			c.mu.Lock()
+			c.proxied[sb.ID] = struct{}{}
+			c.mu.Unlock()
 		}
 		err := c.agent.Init(ictx, runDir, agentapi.InitRequest{
 			SandboxID: sb.ID, Generation: sb.Generation, Env: opts.Env, EgressProxy: proxied,
@@ -312,7 +328,14 @@ func (c *Controller) Touch(ctx context.Context, sandboxID string, generation int
 }
 
 // UpdateNetwork replaces the egress policy of a live sandbox, in the
-// proxy and in the store. The mode must stay within the template's.
+// proxy and in the store. The mode must stay within the template's. It
+// may be "none", which locks a sandbox down after it has, say, installed
+// its dependencies: the proxy stays attached and refuses everything, and
+// a later update can open it again. A sandbox that was claimed with mode
+// "none" has no proxy (and no bridge to one inside it), so it cannot be
+// given a network afterwards: that is ErrNoEgress. Attachments are
+// remembered in memory only, which is sound because a restarted
+// controller ends every tenant session it inherits (see Reconcile).
 func (c *Controller) UpdateNetwork(ctx context.Context, sandboxID string, generation int64, policy core.NetworkPolicy) error {
 	sb, err := c.store.GetSandbox(ctx, sandboxID)
 	if err != nil {
@@ -329,14 +352,14 @@ func (c *Controller) UpdateNetwork(ctx context.Context, sandboxID string, genera
 	if err != nil {
 		return err
 	}
-	if resolved.Mode == core.NetworkNone {
-		return fmt.Errorf("%w: sandbox %s has no network to update", ErrNetworkNotAllowed, sandboxID)
-	}
-	if err := c.store.SetNetworkPolicy(ctx, sandboxID, generation, resolved); err != nil {
-		return err
+	c.mu.Lock()
+	_, attached := c.proxied[sandboxID]
+	c.mu.Unlock()
+	if !attached {
+		return fmt.Errorf("%w: sandbox %s", ErrNoEgress, sandboxID)
 	}
 	if err := c.egress.Update(sandboxID, resolved); err != nil {
 		return fmt.Errorf("pool: update egress of %s: %w", sandboxID, err)
 	}
-	return nil
+	return c.store.SetNetworkPolicy(ctx, sandboxID, generation, resolved)
 }

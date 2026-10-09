@@ -133,13 +133,9 @@ type idMappings struct {
 
 const (
 	cpuPeriodUsec = 100_000
-	// memoryHighPercent puts memory.high below memory.max so a sandbox is
-	// throttled into reclaim before it is OOM-killed.
-	memoryHighPercent = 90
 	// smallTmpfsBytes caps the two incidental tmpfs mounts (/run and
 	// /var/tmp); see BuildCreateSpec.
 	smallTmpfsBytes = 1 << 20
-	pageSize        = 4096
 )
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,200}$`)
@@ -305,11 +301,19 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 			// deliberately not used: it is per host user, so it would
 			// be shared by every sandbox of the pool.
 			Pids: pidsLimits{Limit: res.PidsLimit},
-			// memory.high throttles into reclaim before the hard limit,
-			// and memory.oom.group makes an OOM kill take the whole
-			// sandbox, not one process of a then half-dead tree.
+			// memory.oom.group makes an OOM kill take the whole sandbox,
+			// not one process of a then half-dead tree.
+			//
+			// memory.high is deliberately NOT set. With swap disabled
+			// (memory.swap.max is 0, see above) a sandbox above
+			// memory.high has nothing to reclaim but its own page cache,
+			// so the kernel only stalls its allocations: measured on
+			// kernel 7.0 with Podman 4.9.3, a Python process allocating
+			// without bound in a 256 MiB sandbox took 109 s to reach
+			// memory.max and be OOM-killed with memory.high at 90%, and
+			// 0.4 s without it. A memory bomb must die quickly, so the
+			// hard limit is the only memory control.
 			Unified: map[string]string{
-				"memory.high":      strconv.FormatInt(memoryHigh(res.MemoryBytes), 10),
 				"memory.oom.group": "1",
 			},
 		},
@@ -393,14 +397,4 @@ func cpuQuota(cpus float64) int64 {
 		q = 1000
 	}
 	return q
-}
-
-// memoryHigh is memoryHighPercent of the limit, rounded down to a page.
-func memoryHigh(limit int64) int64 {
-	h := limit / 100 * memoryHighPercent
-	h -= h % pageSize
-	if h < pageSize {
-		h = pageSize
-	}
-	return h
 }

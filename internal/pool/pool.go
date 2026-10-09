@@ -47,6 +47,9 @@ var (
 	// ErrNetworkNotAllowed: the claim asked for a network mode the
 	// template does not permit.
 	ErrNetworkNotAllowed = errors.New("pool: network mode not allowed by template")
+	// ErrNoEgress: the sandbox was claimed with network mode none, so it
+	// has no egress proxy whose policy could be updated.
+	ErrNoEgress = errors.New("pool: sandbox has no egress proxy attached")
 )
 
 // Backend is the isolation engine.
@@ -244,6 +247,7 @@ type Controller struct {
 	breakers  map[string]*breaker  // by template id
 	queues    map[string]*waitQueue
 	adopted   map[string]struct{} // WARM sandboxes inherited from an older epoch and probed
+	proxied   map[string]struct{} // sandboxes this process attached to the egress proxy
 	counts    map[string]map[core.State]int
 	templates []core.Template
 	lastGC    time.Time
@@ -271,6 +275,7 @@ func New(cfg Config) (*Controller, error) {
 		breakers:  map[string]*breaker{},
 		queues:    map[string]*waitQueue{},
 		adopted:   map[string]struct{}{},
+		proxied:   map[string]struct{}{},
 		counts:    map[string]map[core.State]int{},
 		m:         newCounters(),
 	}, nil
@@ -467,6 +472,7 @@ func (c *Controller) teardown(sb core.Sandbox) error {
 		c.mu.Lock()
 		delete(c.recycling, sb.ID)
 		delete(c.adopted, sb.ID)
+		delete(c.proxied, sb.ID)
 		c.mu.Unlock()
 	}()
 

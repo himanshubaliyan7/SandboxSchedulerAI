@@ -105,7 +105,7 @@ const wantCreateJSON = `{
     "cpu": {"quota": 150000, "period": 100000},
     "memory": {"limit": 536870912, "swap": 536870912},
     "pids": {"limit": 256},
-    "unified": {"memory.high": "483180544", "memory.oom.group": "1"}
+    "unified": {"memory.oom.group": "1"}
   },
   "r_limits": [{"type": "nofile", "hard": 4096, "soft": 4096}]
 }`

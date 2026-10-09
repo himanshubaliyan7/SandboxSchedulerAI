@@ -162,7 +162,7 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 	for file, want := range map[string]string{
 		"memory.max":       "268435456",
 		"memory.swap.max":  "0",
-		"memory.high":      fmt.Sprint(memoryHigh(res.MemoryBytes)),
+		"memory.high":      "max", // deliberately unset, see buildCreateSpec
 		"memory.oom.group": "1",
 		"cpu.max":          "50000 100000",
 		"pids.max":         "64",
@@ -428,6 +428,9 @@ while True:
 	t.Logf("Inspect after memory bomb: running=%v err=%v", i.Running, err)
 	if err == nil && i.Running {
 		t.Error("sandbox still running after OOM with memory.oom.group=1")
+	}
+	if err == nil && (!i.OOMKilled || i.ExitCode != sigkillExitCode) {
+		t.Errorf("Inspect after memory bomb: OOMKilled=%v ExitCode=%d, want true and %d", i.OOMKilled, i.ExitCode, sigkillExitCode)
 	}
 	// Known gap, asserted so that a Podman that starts reporting the
 	// kill shows up: on rootless 4.9.3 the scope and its counters are

@@ -407,37 +407,25 @@ func (s *Store) GetSandbox(ctx context.Context, id string) (core.Sandbox, error)
 	return sb, nil
 }
 
-// SandboxAccess is the per-sandbox credential and policy that live beside
-// the core.Sandbox fields.
+// SandboxAccess is the per-sandbox credential, policy and metadata that
+// live beside the core.Sandbox fields.
 type SandboxAccess struct {
 	Sandbox         core.Sandbox
 	AccessTokenHash []byte              // nil when no token was set at claim time
 	NetworkPolicy   *core.NetworkPolicy // nil before the claim
+	Metadata        map[string]string   // nil unless SetMetadata stored some
 }
 
-// GetSandboxAccess returns a row together with its access-token hash and
-// network policy.
+// GetSandboxAccess returns a row together with its access-token hash,
+// network policy and metadata.
 func (s *Store) GetSandboxAccess(ctx context.Context, id string) (SandboxAccess, error) {
-	var (
-		out    SandboxAccess
-		policy []byte
-	)
-	sb, err := scanSandbox(s.pool.QueryRow(ctx,
-		`SELECT `+sandboxCols+`, access_token_hash, network_policy FROM sandboxes WHERE id = $1`, id),
-		&out.AccessTokenHash, &policy)
+	out, err := scanSandboxAccess(s.pool.QueryRow(ctx,
+		`SELECT `+sandboxCols+`, access_token_hash, network_policy, metadata FROM sandboxes WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SandboxAccess{}, fmt.Errorf("%w: sandbox %s", ErrNotFound, id)
 	}
 	if err != nil {
 		return SandboxAccess{}, fmt.Errorf("store: get sandbox %s: %w", id, err)
-	}
-	out.Sandbox = sb
-	if len(policy) > 0 {
-		var np core.NetworkPolicy
-		if err := json.Unmarshal(policy, &np); err != nil {
-			return SandboxAccess{}, fmt.Errorf("store: decode network policy of %s: %w", id, err)
-		}
-		out.NetworkPolicy = &np
 	}
 	return out, nil
 }

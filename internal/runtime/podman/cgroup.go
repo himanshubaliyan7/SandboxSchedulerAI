@@ -15,8 +15,9 @@ import (
 )
 
 // ErrNotRunning is returned by Stats for an instance that exists but has
-// no cgroup any more because its processes are gone.
-var ErrNotRunning = errors.New("podman: instance is not running")
+// no cgroup any more because its processes are gone. It is the contract's
+// runtime.ErrNotRunning, so callers above the backend can test for it.
+var ErrNotRunning = runtime.ErrNotRunning
 
 // Stats implements runtime.Backend. It asks Podman only for the
 // container's cgroup path and then reads the cgroup v2 files directly:
@@ -30,7 +31,8 @@ var ErrNotRunning = errors.New("podman: instance is not running")
 // was the OOM killer. Because memory.oom.group=1 kills the whole sandbox
 // at once, a sandbox that died of OOM is reported here as ErrNotRunning,
 // not as OOMKills > 0. State.OOMKilled is still honoured for Podman
-// versions that set it.
+// versions that set it. Callers that get ErrNotRunning should Inspect the
+// instance: its ExitCode and OOMKilled say how it ended (see inspect).
 func (b *Backend) Stats(ctx context.Context, instanceID string) (runtime.Stats, error) {
 	_, st, err := b.inspect(ctx, instanceID)
 	if err != nil {

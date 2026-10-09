@@ -98,6 +98,25 @@ func (c *Client) DialWS(ctx context.Context, id string, from int64) (*WS, error)
 	return w, nil
 }
 
+// DialRawWS opens the process WebSocket and returns the bare connection
+// without reading from it: the first frame the caller reads is the
+// agent's OffsetFrame. It is for a gateway that relays agentapi frames to
+// its own client unchanged; everything else should use DialWS. The read
+// limit is already set for frames coming from the agent. ctx bounds the
+// dial only.
+func (c *Client) DialRawWS(ctx context.Context, id string, from int64) (*websocket.Conn, error) {
+	u := procURL(id, "/ws?from="+strconv.FormatInt(from, 10))
+	conn, resp, err := websocket.Dial(ctx, u, &websocket.DialOptions{HTTPClient: c.http})
+	if err != nil {
+		if resp != nil && resp.StatusCode >= 400 {
+			return nil, responseError(resp)
+		}
+		return nil, err
+	}
+	conn.SetReadLimit(wsReadLimit)
+	return conn, nil
+}
+
 // Offset is the offset of the next output byte Recv will return; pass it
 // as from to resume after a disconnect.
 func (w *WS) Offset() int64 {

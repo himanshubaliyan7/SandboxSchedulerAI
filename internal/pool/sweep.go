@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
 )
 
@@ -117,8 +118,32 @@ func (c *Controller) oomOr(ctx context.Context, sb core.Sandbox, fallback core.T
 		return fallback, nil
 	}
 	stats, err := c.backend.Stats(ctx, sb.InstanceID)
-	if err != nil || stats.OOMKills == 0 {
+	if err == nil && stats.OOMKills > 0 {
+		return core.ReasonOOMKilled, map[string]any{"oom_kills": stats.OOMKills, "would_have_been": string(fallback)}
+	}
+	if err == nil || !errors.Is(err, runtime.ErrNotRunning) {
 		return fallback, nil
 	}
-	return core.ReasonOOMKilled, map[string]any{"oom_kills": stats.OOMKills, "would_have_been": string(fallback)}
+	// The instance is dead and took its counters with it; ask the backend
+	// how it ended.
+	inst, err := c.backend.Inspect(ctx, sb.InstanceID)
+	if err != nil || inst.Running {
+		return fallback, nil
+	}
+	return deathReason(inst, fallback)
+}
+
+// deathReason is the termination reason of a sandbox whose instance is no
+// longer running: oom_killed when the backend has evidence of an OOM
+// kill, otherwise fallback. The exit code is recorded either way, so the
+// evidence travels with the verdict.
+func deathReason(inst runtime.Instance, fallback core.TerminationReason) (core.TerminationReason, map[string]any) {
+	data := map[string]any{"cause": "instance_not_running", "exit_code": inst.ExitCode}
+	if !inst.OOMKilled {
+		return fallback, data
+	}
+	if fallback != core.ReasonInstanceLost {
+		data["would_have_been"] = string(fallback)
+	}
+	return core.ReasonOOMKilled, data
 }

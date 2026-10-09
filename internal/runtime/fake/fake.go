@@ -53,9 +53,10 @@ type Backend struct {
 }
 
 type entry struct {
-	inst   runtime.Instance
-	stats  runtime.Stats
-	paused bool
+	inst      runtime.Instance
+	stats     runtime.Stats
+	paused    bool
+	statsGone bool // Stats returns runtime.ErrNotRunning
 }
 
 var _ runtime.Backend = (*Backend)(nil)
@@ -180,6 +181,23 @@ func (b *Backend) StopInstance(instanceID string) bool {
 	e, ok := b.instances[instanceID]
 	if ok {
 		e.inst.Running = false
+	}
+	return ok
+}
+
+// KillInstance leaves the instance listed but not running, with the given
+// exit code and OOM verdict, and with its counters gone: Stats then
+// returns runtime.ErrNotRunning, like a dead container whose cgroup was
+// removed.
+func (b *Backend) KillInstance(instanceID string, exitCode int, oomKilled bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.instances[instanceID]
+	if ok {
+		e.inst.Running = false
+		e.inst.ExitCode = exitCode
+		e.inst.OOMKilled = oomKilled
+		e.statsGone = true
 	}
 	return ok
 }
@@ -372,6 +390,9 @@ func (b *Backend) Stats(ctx context.Context, instanceID string) (runtime.Stats, 
 	e, ok := b.instances[instanceID]
 	if !ok {
 		return runtime.Stats{}, runtime.ErrNotFound
+	}
+	if e.statsGone {
+		return runtime.Stats{}, runtime.ErrNotRunning
 	}
 	return e.stats, nil
 }

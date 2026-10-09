@@ -1,0 +1,1107 @@
+openapi: 3.0.3
+info:
+  title: SandboxSchedulerAI API
+  version: "1.0.0"
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  description: |
+    REST API of `sbxd`, the single-node warm-pool sandbox scheduler. This
+    document describes exactly what `internal/api` implements.
+
+    ## Conventions
+
+    * All JSON bodies are UTF-8. Request bodies are limited to 1 MiB (file
+      uploads and stdin writes to the server's `--max-upload-size`, default
+      256 MiB). Unknown fields in a JSON request body are rejected with
+      `400 bad_request`.
+    * Timestamps are RFC 3339 with up to nanosecond precision. Durations
+      are integers in milliseconds and their field names end in `_ms`.
+    * Byte strings inside JSON (`data`, `stdout`, `stderr`) are standard
+      base64 with padding.
+    * Every response carries `X-Request-Id`. A caller may supply its own in
+      the request header `X-Request-Id` (at most 64 characters from
+      `[A-Za-z0-9._-]`); anything else is replaced by a generated id.
+    * Every error, including 404 and 405 for unknown routes, is the JSON
+      envelope `{"error": {"code", "message", "request_id", "details"}}`.
+      `code` is stable and meant for programs; `message` is for people.
+    * A sandbox that belongs to another tenant, or to nobody (a warm
+      sandbox), is indistinguishable from one that does not exist: `404
+      not_found`. There is no `403`.
+    * A sandbox id looks like `sb-0123456789abcdef`. A command id (`pid`)
+      is an opaque string issued by the in-sandbox agent; it is not a
+      kernel pid.
+
+    ## Credentials
+
+    * **Tenant API key** (`sbx_<prefix>_<secret>`): `X-API-Key: <key>` or
+      `Authorization: Bearer <key>`. Valid on every route under `/v1`.
+    * **Sandbox access token** (`sbt_<64 hex>`, 256 random bits): returned
+      once by `POST /v1/sandboxes`, stored only as a SHA-256 hash. Valid
+      only on the data-plane routes (commands and files) of the sandbox it
+      was issued for. Send it as `X-Access-Token: <token>`, as
+      `Authorization: Bearer <token>`, as the query parameter `token`, or,
+      on a WebSocket, as the subprotocol entry `sbx.token.<token>`. With a
+      token and no API key, a wrong token and an unknown sandbox are both
+      `401 unauthorized`.
+
+    ## Rate limits and quota
+
+    Each tenant has two independent token buckets sized from its tenant
+    row (`rate_per_sec`, `burst`): one for `POST /v1/sandboxes` and one for
+    every other authenticated request (requests made with a sandbox token
+    count against the owning tenant). An empty bucket is `429
+    rate_limited` with `Retry-After` in seconds and `details.class`
+    (`create` or `default`). A tenant at its concurrent-sandbox quota gets
+    `429 quota_exceeded` from `POST /v1/sandboxes`; an empty warm pool is
+    `503 pool_empty`. Both carry `Retry-After`.
+
+    ## Sandbox lifetime
+
+    Three independent timers end a sandbox, each with its own `reason`:
+    the template's idle timeout (`idle_timeout`), the sandbox's maximum
+    lifetime (`max_lifetime`, set at create with `timeout_ms` and changed
+    with `POST /v1/sandboxes/{id}/timeout`, never beyond the template's
+    limit), and the per-command `timeout_ms` (which ends the command, not
+    the sandbox). "Activity" for the idle timer is any data-plane request
+    for the sandbox and any output delivered to an attached stream or
+    WebSocket; control-plane requests are not activity. Activity is
+    recorded at most once per `--touch-interval` (default 5 s).
+
+    A used sandbox is never reused: `DELETE`, a timer or a failure destroys
+    the container and its storage. After a server restart every session of
+    the previous process is ended with reason `host_drain`.
+
+    ## Streaming a command (NDJSON)
+
+    `POST .../commands?wait=stream` and `GET .../commands/{pid}/stream`
+    answer `200` with `Content-Type: application/x-ndjson`: one
+    `StreamEvent` JSON object per line, flushed within 20 ms. `offset` is a
+    single byte counter per command across stdout, stderr and PTY output.
+    A client that has processed an output event resumes with
+    `from = offset + len(data)`. The stream ends after the `exit` event, or
+    after an `error` event if it cannot continue (the sandbox terminated,
+    or the server is shutting down). `keepalive` events arrive every 25 s
+    while a command is silent. If `from` is older than the agent's 1 MiB
+    replay buffer, the first event is `truncated` with `dropped` bytes and
+    output resumes at `offset`. A slow reader never slows the command: it
+    receives `truncated` events instead.
+
+    ## PTY and interactive I/O (WebSocket)
+
+    `GET .../commands/{pid}/ws?from=N` upgrades to a WebSocket. The gateway
+    relays the in-sandbox agent's protocol frame for frame. Every message
+    is **binary**; its first byte is the channel, the rest is the payload:
+
+    | Channel | Direction        | Payload |
+    |--------:|------------------|---------|
+    | 0 | client to server | stdin bytes (PTY: `0x03` is Ctrl+C, `0x04` is Ctrl+D) |
+    | 1 | server to client | stdout bytes; all output of a PTY command |
+    | 2 | server to client | stderr bytes (pipe mode only) |
+    | 3 | server to client | JSON `WSStatusFrame`: the last frame, followed by a normal close (1000) |
+    | 4 | client to server | JSON `{"cols":N,"rows":N}`: resize the PTY |
+    | 5 | client to server | JSON `{"signal":"SIGINT"}`: signal the process group |
+    | 6 | client to server | JSON `{"offset":N}`: acknowledge output up to `offset` (flow control) |
+    | 7 | either           | opaque ping payload, echoed on channel 8 |
+    | 8 | either           | pong |
+    | 9 | server to client | JSON `{"offset":N,"dropped":M}`: always the first frame; again after a truncation |
+
+    * Output frames carry no offset: the client counts bytes from the last
+      channel-9 frame. Reattach with `from=<that count>` to continue
+      without loss; the command keeps running while no client is attached.
+    * A frame from the server is at most 32769 bytes (1 + 32768). Some
+      WebSocket libraries default to a smaller read limit; raise it. A
+      frame from the client may be at most 1 MiB + 1.
+    * Flow control is optional and end to end. Until the first channel-6
+      frame the command is never paused. After it, the agent stops reading
+      from the command once more than 100000 bytes are unacknowledged and
+      resumes below 10000, so acknowledge every frame or in steps smaller
+      than 10000 bytes. The gateway keeps no queue.
+    * Subprotocols: the server selects `sbx.v1` when offered. A browser
+      passes the token as `new WebSocket(url, ["sbx.v1", "sbx.token." + token])`.
+      Any `Origin` is accepted, because authentication never relies on
+      cookies.
+    * The server sends WebSocket pings every 25 s. Close codes: 1000 after
+      the status frame; 1001 with reason `sandbox terminated` or `server
+      shutting down`; on a broken agent connection a channel-3 frame with
+      `error` precedes a 1001 close. An unknown `pid` or bad credentials
+      fail the HTTP handshake with the usual error envelope.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Default listen address of `sbxd serve`
+tags:
+  - name: sandboxes
+    description: Control plane. Tenant API key only.
+  - name: commands
+    description: Data plane. Tenant API key or the sandbox's access token. The sandbox must be `running`.
+  - name: files
+    description: Data plane. Tenant API key or the sandbox's access token. The sandbox must be `running`.
+  - name: templates
+  - name: operations
+    description: Unauthenticated endpoints for probes and scraping.
+security:
+  - ApiKey: []
+  - BearerKey: []
+paths:
+  /v1/sandboxes:
+    post:
+      tags: [sandboxes]
+      operationId: createSandbox
+      summary: Claim a warm sandbox
+      description: |
+        Assigns a pre-created sandbox of the template to the tenant and
+        returns it `running`. If the pool is empty the request waits for
+        the server's `--claim-wait` (default 5 s) before answering `503
+        pool_empty`. Counts against the tenant's `create` rate bucket.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSandboxRequest" }
+      responses:
+        "201":
+          description: The sandbox, with its access token (shown only here).
+          headers:
+            Location: { schema: { type: string }, description: "`/v1/sandboxes/{id}`" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreatedSandbox" }
+        "400":
+          description: "`bad_request`, `invalid_timeout` (with `details.max_timeout_ms`) or `network_not_allowed` (the mode is looser than the template's)."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`template_not_found`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429":
+          description: "`rate_limited` or `quota_exceeded`."
+          headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "503":
+          description: "`pool_empty` (no warm sandbox within the wait) or `shutting_down`."
+          headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    get:
+      tags: [sandboxes]
+      operationId: listSandboxes
+      summary: List the tenant's sandboxes
+      description: Newest assignment first.
+      parameters:
+        - name: state
+          in: query
+          description: |
+            Comma-separated states to include (`assigned`, `running`,
+            `paused`, `recycling`, `destroyed`, `failed`, `unknown`), or
+            `all`. Default: `assigned,running,paused`. Destroyed sandboxes
+            are kept for 7 days.
+          schema: { type: string }
+        - name: template_id
+          in: query
+          schema: { type: string }
+        - name: metadata
+          in: query
+          description: "`key=value`; repeatable. Only sandboxes whose metadata contains every pair are returned."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sandboxes]
+                properties:
+                  sandboxes: { type: array, items: { $ref: "#/components/schemas/Sandbox" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/sandboxes/{id}:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }]
+    get:
+      tags: [sandboxes]
+      operationId: getSandbox
+      summary: Get a sandbox
+      description: Also works for a sandbox that has terminated; `state` and `reason` then say how.
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Sandbox" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [sandboxes]
+      operationId: deleteSandbox
+      summary: Kill and destroy a sandbox
+      description: |
+        Synchronous: when it returns, the container has been killed
+        (SIGKILL, no grace period) and removed with all of its storage.
+        Idempotent: deleting a sandbox that is already terminated is `204`.
+      responses:
+        "204": { description: Destroyed (reason `released`). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/sandboxes/{id}/timeout:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }]
+    post:
+      tags: [sandboxes]
+      operationId: setSandboxTimeout
+      summary: Set the remaining lifetime
+      description: |
+        Sets `expires_at` to now + `timeout_ms`, which may shorten or
+        extend the sandbox's life. The result is silently capped at
+        `started_at` + the template's `max_lifetime_ms`; read `expires_at`
+        in the response for the effective value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [timeout_ms]
+              additionalProperties: false
+              properties:
+                timeout_ms: { type: integer, format: int64, minimum: 1, description: Remaining lifetime from now. }
+      responses:
+        "200": { description: The updated sandbox., content: { application/json: { schema: { $ref: "#/components/schemas/Sandbox" } } } }
+        "400":
+          description: "`invalid_timeout` (not positive) or `bad_request`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/sandboxes/{id}/network:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }]
+    put:
+      tags: [sandboxes]
+      operationId: setSandboxNetwork
+      summary: Replace the egress policy of a live sandbox
+      description: |
+        Takes effect before the call returns: later requests use the new
+        policy, and established connections it does not permit are closed.
+        The mode may be the template's or stricter. `none` locks the
+        sandbox down (the proxy refuses everything) and can be reverted by
+        another update. A sandbox that was created with mode `none` has no
+        proxy and cannot be given one (`409 network_not_attached`). Only a
+        tenant API key may call this: the sandbox token cannot change the
+        policy that confines it.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NetworkPolicy" } } }
+      responses:
+        "200": { description: The updated sandbox., content: { application/json: { schema: { $ref: "#/components/schemas/Sandbox" } } } }
+        "400":
+          description: "`bad_request` (malformed policy) or `network_not_allowed` (looser than the template)."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`sandbox_not_running` or `network_not_attached`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/sandboxes/{id}/events:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }]
+    get:
+      tags: [sandboxes]
+      operationId: listSandboxEvents
+      summary: The sandbox's event log
+      description: |
+        Every state change since the sandbox was assigned to the tenant,
+        and one `command_started` and one `command_finished` event (the
+        execution record) per command started through this API, oldest
+        first. Available after the sandbox has terminated.
+      parameters:
+        - name: type
+          in: query
+          description: Return only events of this type.
+          schema: { type: string, example: command_finished }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events: { type: array, items: { $ref: "#/components/schemas/Event" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/sandboxes/{id}/stats:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }]
+    get:
+      tags: [sandboxes]
+      operationId: getSandboxStats
+      summary: Resource counters of a live sandbox
+      description: Read from the sandbox's cgroup at the time of the call.
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Stats" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`sandbox_not_running`, or `sandbox_terminated` if the instance turned out to be dead."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/templates:
+    get:
+      tags: [templates]
+      operationId: listTemplates
+      summary: List templates
+      description: Templates are managed with `sbxd admin template`; tenants can only read them.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templates]
+                properties:
+                  templates: { type: array, items: { $ref: "#/components/schemas/Template" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/sandboxes/{id}/commands:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }]
+    post:
+      tags: [commands]
+      operationId: startCommand
+      summary: Start a command
+      description: |
+        Starts a process in the sandbox as uid 1000 with the session
+        environment (the `env` given at create, plus proxy variables when
+        the sandbox has a network), in `/workspace` unless `cwd` is set.
+        Without `pty` the command runs in pipe mode: separate stdout and
+        stderr, and stdin is `/dev/null` unless `stdin` is true. With
+        `pty` it runs on a pseudo-terminal: one merged output stream,
+        resizable.
+
+        `wait` selects the response:
+
+        * absent or `false`: `201` with the `Command` as soon as it has
+          started. Follow it with the stream or WebSocket route.
+        * `true`: `200` with a `WaitResult` when the command has exited.
+          stdout and stderr are each cut at 1 MiB (`truncated`).
+        * `stream`: `200` NDJSON; a `start` event, then the events of the
+          stream route from offset 0, ending with `exit`.
+
+        The command keeps running if the client disconnects; reconnect
+        with the stream route.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      parameters:
+        - name: wait
+          in: query
+          schema: { type: string, enum: ["false", "true", "stream"], default: "false" }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/StartCommandRequest" } } }
+      responses:
+        "200":
+          description: With `wait=true`, a `WaitResult`; with `wait=stream`, an NDJSON stream of `StreamEvent`.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/WaitResult" } }
+            application/x-ndjson: { schema: { $ref: "#/components/schemas/StreamEvent" } }
+        "201":
+          description: Started (no `wait`).
+          headers:
+            Location: { schema: { type: string }, description: "`/v1/sandboxes/{id}/commands/{pid}`" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Command" } } }
+        "400":
+          description: "`bad_request`, or from the agent: `command_not_found`, `exec_format`, `bad_cwd`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`permission_denied` (the file is not executable by the sandbox user)."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`sandbox_not_running`, `sandbox_terminated`, or `tag_in_use`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500":
+          description: "`start_failed` or `pty_failed` from the agent (for example the pids limit is exhausted), or `internal`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+    get:
+      tags: [commands]
+      operationId: listCommands
+      summary: List the sandbox's commands
+      description: Running and exited commands, in start order. Includes commands started inside the sandbox through the agent only if they were started with this API.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [commands]
+                properties:
+                  commands: { type: array, items: { $ref: "#/components/schemas/Command" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/commands/{pid}:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
+    get:
+      tags: [commands]
+      operationId: getCommand
+      summary: Get a command
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Command" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/CommandNotFound" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/commands/{pid}/stream:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
+    get:
+      tags: [commands]
+      operationId: streamCommand
+      summary: Stream a command's output (NDJSON; replay then live)
+      description: See "Streaming a command" in the introduction. Reconnectable at any time, also after the command has exited, for as long as the sandbox lives.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/From" }]
+      responses:
+        "200":
+          description: One `StreamEvent` per line until `exit` or `error`.
+          content: { application/x-ndjson: { schema: { $ref: "#/components/schemas/StreamEvent" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/CommandNotFound" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/commands/{pid}/stdin:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
+    post:
+      tags: [commands]
+      operationId: writeStdin
+      summary: Write to a command's stdin
+      description: The raw request body is streamed to stdin (pipe mode started with `stdin: true`, or a PTY). Returns when the command has accepted all of it.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      requestBody:
+        required: true
+        content: { application/octet-stream: { schema: { type: string, format: binary } } }
+      responses:
+        "204": { description: Written. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/CommandNotFound" }
+        "409":
+          description: "`stdin_closed` (not started with `stdin`, or already closed), `process_exited`, or `sandbox_not_running`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/commands/{pid}/close-stdin:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
+    post:
+      tags: [commands]
+      operationId: closeStdin
+      summary: Close a command's stdin (EOF; pipe mode only)
+      description: On a PTY, send Ctrl+D (`0x04`) to stdin instead.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      responses:
+        "204": { description: Closed. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/CommandNotFound" }
+        "409":
+          description: "`is_a_pty`, `stdin_closed`, `process_exited` or `sandbox_not_running`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/commands/{pid}/signal:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
+    post:
+      tags: [commands]
+      operationId: signalCommand
+      summary: Signal a command's process group
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/SignalRequest" } } }
+      responses:
+        "204": { description: Sent. }
+        "400":
+          description: "`bad_signal` or `bad_request`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/CommandNotFound" }
+        "409":
+          description: "`process_exited` or `sandbox_not_running`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/commands/{pid}/resize:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
+    post:
+      tags: [commands]
+      operationId: resizeCommand
+      summary: Resize a command's PTY
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/PTYSize" } } }
+      responses:
+        "204": { description: Resized. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/CommandNotFound" }
+        "409":
+          description: "`not_a_pty`, `process_exited` or `sandbox_not_running`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/commands/{pid}/ws:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
+    get:
+      tags: [commands]
+      operationId: attachCommand
+      summary: Attach a WebSocket to a command (PTY or pipe mode)
+      description: See "PTY and interactive I/O" in the introduction for the framing. Works for pipe-mode commands too (stdout on channel 1, stderr on channel 2).
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }, { WSSubprotocolToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/From"
+        - name: Sec-WebSocket-Protocol
+          in: header
+          description: "Optional. Offer `sbx.v1`; add `sbx.token.<access token>` to authenticate from a browser."
+          schema: { type: string, example: "sbx.v1, sbx.token.sbt_0123..." }
+      responses:
+        "101": { description: Switching protocols. Binary frames as described in the introduction. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/CommandNotFound" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+
+  /v1/sandboxes/{id}/files:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/FilePath" }]
+    get:
+      tags: [files]
+      operationId: readFile
+      summary: Download a file
+      description: Streamed. `Content-Length` is the file size. If the transfer fails midway the connection is aborted, so a short body is never a complete file.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      responses:
+        "200":
+          description: The file's bytes.
+          content: { application/octet-stream: { schema: { type: string, format: binary } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/PermissionDenied" }
+        "404": { $ref: "#/components/responses/FileNotFound" }
+        "409":
+          description: "`is_directory` or `sandbox_not_running`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+    put:
+      tags: [files]
+      operationId: writeFile
+      summary: Upload a file
+      description: |
+        The raw body becomes the file. Parent directories are created; the
+        file appears atomically when the upload is complete; an existing
+        file is replaced. The work directory is a size-capped tmpfs: an
+        upload that does not fit is `507 no_space`.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      parameters:
+        - name: mode
+          in: query
+          description: Octal permission bits.
+          schema: { type: string, pattern: "^[0-7]{3,4}$", default: "0644" }
+      requestBody:
+        required: true
+        content: { application/octet-stream: { schema: { type: string, format: binary } } }
+      responses:
+        "204": { description: Written. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/PermissionDenied" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`is_directory` (the path is a directory) or `sandbox_not_running`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "507":
+          description: "`no_space`: the sandbox's writable storage is full."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    delete:
+      tags: [files]
+      operationId: deleteFile
+      summary: Delete a file, or a directory and everything in it
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      responses:
+        "204": { description: Deleted. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/PermissionDenied" }
+        "404": { $ref: "#/components/responses/FileNotFound" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/files/list:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }]
+    get:
+      tags: [files]
+      operationId: listFiles
+      summary: List a directory
+      description: Sorted by name; not recursive.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      parameters:
+        - name: path
+          in: query
+          description: Directory to list. Default is the work directory.
+          schema: { type: string, default: "." }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files]
+                properties:
+                  files: { type: array, items: { $ref: "#/components/schemas/FileInfo" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/PermissionDenied" }
+        "404": { $ref: "#/components/responses/FileNotFound" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+  /v1/sandboxes/{id}/files/mkdir:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/FilePath" }]
+    post:
+      tags: [files]
+      operationId: makeDirectory
+      summary: Create a directory and any missing parents
+      description: Succeeds if the directory already exists.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      responses:
+        "204": { description: Created or already present. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/PermissionDenied" }
+        "409": { $ref: "#/components/responses/NotRunning" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "507":
+          description: "`no_space`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: healthz
+      summary: Liveness
+      security: []
+      responses:
+        "200":
+          description: The process is serving.
+          content: { application/json: { schema: { type: object, properties: { status: { type: string, enum: [ok] } } } } }
+  /readyz:
+    get:
+      tags: [operations]
+      operationId: readyz
+      summary: Readiness
+      description: Checks Postgres and the Podman socket.
+      security: []
+      responses:
+        "200":
+          description: Ready.
+          content: { application/json: { schema: { type: object, properties: { status: { type: string, enum: [ready] } } } } }
+        "503":
+          description: "`not_ready` or `shutting_down`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+  /metrics:
+    get:
+      tags: [operations]
+      operationId: metrics
+      summary: Prometheus metrics (text exposition format 0.0.4)
+      description: |
+        Not authenticated; expose the listener accordingly. Series:
+        `sbx_http_requests_total{method,route,code}`,
+        `sbx_http_request_duration_seconds{method,route}` (histogram),
+        `sbx_http_active_streams{kind}` (`ndjson`, `wait`, `ws`),
+        `sbx_http_rate_limited_total{class}`, `sbx_api_sessions`,
+        `sbx_pool_sandboxes{template,state}`, `sbx_pool_warm_target{template}`,
+        `sbx_pool_inflight_creates{template}`, `sbx_pool_claim_waiters{template}`,
+        `sbx_pool_create_breaker_open{template}`, `sbx_pool_claims_total{result}`,
+        `sbx_pool_claims_waited_total`, `sbx_pool_claim_wait_seconds` (histogram),
+        `sbx_pool_releases_total`, `sbx_pool_creates_total`,
+        `sbx_pool_create_failures_total`, `sbx_pool_destroyed_total`,
+        `sbx_pool_orphans_destroyed_total`, `sbx_pool_instances_lost_total`,
+        `sbx_pool_adopted_total`, `sbx_pool_reconcile_failures_total`,
+        `sbx_pool_terminations_total{reason}`,
+        `sbx_pool_last_refill_timestamp_seconds`,
+        `sbx_pool_last_reconcile_timestamp_seconds`,
+        `sbx_egress_requests_total{verdict}` (`allowed`, `denied`, `error`),
+        `sbx_egress_decisions_total{verdict,reason}`,
+        `sbx_egress_bytes_total{direction}`.
+      security: []
+      responses:
+        "200":
+          description: Metrics.
+          content: { text/plain: { schema: { type: string } } }
+
+components:
+  securitySchemes:
+    ApiKey: { type: apiKey, in: header, name: X-API-Key, description: Tenant API key. }
+    BearerKey: { type: http, scheme: bearer, description: "Tenant API key as a bearer token." }
+    AccessToken: { type: apiKey, in: header, name: X-Access-Token, description: "Sandbox access token (data-plane routes of that sandbox only)." }
+    BearerToken: { type: http, scheme: bearer, description: "Sandbox access token as a bearer token (recognised by its `sbt_` prefix)." }
+    QueryToken: { type: apiKey, in: query, name: token, description: "Sandbox access token in the URL, for clients that cannot set headers." }
+    WSSubprotocolToken: { type: apiKey, in: header, name: Sec-WebSocket-Protocol, description: "`sbx.v1, sbx.token.<access token>`." }
+  headers:
+    RetryAfter:
+      description: Whole seconds to wait before retrying.
+      schema: { type: integer, minimum: 1 }
+  parameters:
+    SandboxID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, example: sb-0123456789abcdef }
+    Pid:
+      name: pid
+      in: path
+      required: true
+      description: Command id from `Command.pid`.
+      schema: { type: string }
+    From:
+      name: from
+      in: query
+      description: Offset of the first output byte wanted. A value beyond the end means "from now".
+      schema: { type: integer, format: int64, minimum: 0, default: 0 }
+    FilePath:
+      name: path
+      in: query
+      required: true
+      description: Absolute, or relative to the work directory `/workspace`.
+      schema: { type: string }
+  responses:
+    BadRequest:
+      description: "`bad_request`."
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Unauthorized:
+      description: "`unauthorized`: missing or invalid credentials."
+      headers: { WWW-Authenticate: { schema: { type: string, example: 'Bearer realm="sbx"' } } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    NotFound:
+      description: "`not_found`: no such sandbox for this tenant."
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    CommandNotFound:
+      description: "`not_found` (sandbox) or `process_not_found` (pid)."
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    FileNotFound:
+      description: "`not_found` (sandbox) or `file_not_found` (path)."
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    PermissionDenied:
+      description: "`permission_denied`: the sandbox user may not access the path."
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    NotRunning:
+      description: |
+        `sandbox_not_running`: the sandbox is not in state `running`;
+        `details.state` and `details.reason` say why. `sandbox_terminated`
+        (same details) when the sandbox died while the request was being
+        served.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    TooLarge:
+      description: "`payload_too_large`."
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    RateLimited:
+      description: "`rate_limited`; `details.class` names the bucket."
+      headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    AgentUnavailable:
+      description: "`agent_unavailable`: the in-sandbox agent did not answer although the sandbox is running. Retry."
+      headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error: { $ref: "#/components/schemas/Error" }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable. Gateway codes: `bad_request`, `unauthorized`,
+            `not_found`, `template_not_found`, `process_not_found`,
+            `file_not_found`, `method_not_allowed`, `conflict`,
+            `sandbox_not_running`, `sandbox_terminated`,
+            `network_not_allowed`, `network_not_attached`,
+            `invalid_timeout`, `payload_too_large`, `rate_limited`,
+            `quota_exceeded`, `pool_empty`, `shutting_down`, `not_ready`,
+            `agent_unavailable`, `timeout`, `not_implemented`, `internal`.
+            Agent codes passed through on command and file routes:
+            `bad_cwd`, `bad_signal`, `command_not_found`, `exec_format`,
+            `conflict`, `is_a_pty`, `not_a_pty`, `is_directory`,
+            `process_exited`, `stdin_closed`, `tag_in_use`,
+            `permission_denied`, `no_space`, `io_error`, `pty_failed`,
+            `start_failed`, `too_large`.
+          example: sandbox_not_running
+        message: { type: string }
+        request_id: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+          description: "Code-specific. `state` and `reason` for `sandbox_not_running` and `sandbox_terminated`; `class` for `rate_limited`; `max_timeout_ms` for `invalid_timeout`."
+    SandboxState:
+      type: string
+      enum: [assigned, running, paused, recycling, destroyed, failed, unknown]
+      description: |
+        `assigned` (transient, being initialised), `running`, `paused`
+        (reserved; no route pauses a sandbox yet), `failed` and `unknown`
+        (transient, on the way to destruction), `recycling` (being
+        destroyed), `destroyed` (terminal).
+    TerminationReason:
+      type: string
+      enum: [released, idle_timeout, max_lifetime, oom_killed, instance_lost, deadline_exceeded, host_drain, error, create_failed, warm_ttl, template_changed, orphan]
+      description: |
+        Why the sandbox ended. Seen by tenants: `released` (deleted),
+        `idle_timeout`, `max_lifetime`, `oom_killed` (the memory limit was
+        hit; the whole sandbox is killed), `instance_lost` (the container
+        died or vanished for another reason), `deadline_exceeded`
+        (initialisation timed out), `host_drain` (the server was stopped
+        or restarted), `error`.
+    NetworkPolicy:
+      type: object
+      additionalProperties: false
+      description: Egress policy. Deny always wins over allow; loopback, link-local, cloud metadata, private ranges and the host's own addresses are always denied.
+      properties:
+        mode:
+          type: string
+          enum: [none, allowlist, full]
+          description: "`none`: no egress. `allowlist`: only the listed destinations. `full`: any public destination. Omitted means the template's mode."
+        allow_domains:
+          type: array
+          items: { type: string }
+          description: Exact hostnames, or `*.example.com` (any depth of subdomain, not the apex).
+        allow_cidrs:
+          type: array
+          items: { type: string }
+          description: Permits IP-literal targets only; does not make a hostname acceptable.
+        deny_cidrs:
+          type: array
+          items: { type: string }
+          description: Added to the built-in deny set.
+    CreateSandboxRequest:
+      type: object
+      required: [template_id]
+      additionalProperties: false
+      properties:
+        template_id: { type: string }
+        timeout_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Maximum lifetime of the sandbox. At most the template's `max_lifetime_ms`; 0 or absent means the template's.
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: Environment of every command in the sandbox. At most 256 variables and 64 KiB.
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+          description: Free-form labels, returned with the sandbox and usable as a list filter. At most 64 entries and 16 KiB.
+        network: { $ref: "#/components/schemas/NetworkPolicy" }
+    Sandbox:
+      type: object
+      required: [id, template_id, template_version, state, created_at]
+      properties:
+        id: { type: string }
+        template_id: { type: string }
+        template_version: { type: integer, format: int64 }
+        state: { $ref: "#/components/schemas/SandboxState" }
+        reason: { $ref: "#/components/schemas/TerminationReason" }
+        created_at: { type: string, format: date-time, description: When the container was created (before it was claimed). }
+        started_at: { type: string, format: date-time, description: When it was assigned to the tenant. }
+        last_activity_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, description: When the maximum lifetime ends. Absent if the template has none. }
+        network: { $ref: "#/components/schemas/NetworkPolicy" }
+        metadata: { type: object, additionalProperties: { type: string } }
+    CreatedSandbox:
+      allOf:
+        - $ref: "#/components/schemas/Sandbox"
+        - type: object
+          required: [access_token]
+          properties:
+            access_token: { type: string, description: "`sbt_` + 64 hex digits. Returned only by this call.", example: "sbt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+    Event:
+      type: object
+      required: [id, type, at]
+      properties:
+        id: { type: integer, format: int64, description: Increasing. }
+        type:
+          type: string
+          description: "`claimed`, `transition`, `command_started`, `command_finished`."
+        from_state: { $ref: "#/components/schemas/SandboxState" }
+        to_state: { $ref: "#/components/schemas/SandboxState" }
+        reason: { $ref: "#/components/schemas/TerminationReason" }
+        at: { type: string, format: date-time }
+        data:
+          type: object
+          additionalProperties: true
+          description: |
+            `command_started`: `pid`, `cmd`, `args` (first 4 KiB; then
+            `args_truncated`), `pty`, `tag`, `cwd`, `timeout_ms`, `stdin`.
+            `command_finished`: `pid`, `cmd`, `args`, `pty`, `tag`,
+            `duration_ms`, `stdout_bytes`, `stderr_bytes`,
+            `uncounted_bytes` (output the recorder could not attribute),
+            and either `exit_code`, `reason` (`exited`, `killed`,
+            `timeout`, `oom`) and `signal`, or `reason:
+            "sandbox_terminated"` with `sandbox_reason` when the sandbox
+            ended under the command. The environment is never recorded.
+            A `transition` to `failed` carries the evidence, for example
+            `{"cause": "instance_not_running", "exit_code": 137}`.
+    Stats:
+      type: object
+      required: [memory_bytes, oom_kills, cpu_usage_usec, cpu_throttled_periods, cpu_throttled_usec, pids_current, pids_limit_hits, memory_high_hits]
+      properties:
+        memory_bytes: { type: integer, format: int64 }
+        oom_kills: { type: integer, format: int64 }
+        cpu_usage_usec: { type: integer, format: int64 }
+        cpu_throttled_periods: { type: integer, format: int64 }
+        cpu_throttled_usec: { type: integer, format: int64 }
+        pids_current: { type: integer, format: int64 }
+        pids_limit_hits: { type: integer, format: int64, description: Forks refused by the pids limit (a fork bomb shows here). }
+        memory_high_hits: { type: integer, format: int64 }
+    Template:
+      type: object
+      required: [id, version, image, runtime, resources, network, idle_timeout_ms, max_lifetime_ms]
+      properties:
+        id: { type: string }
+        version: { type: integer, format: int64 }
+        image: { type: string }
+        runtime: { type: string, example: crun }
+        resources:
+          type: object
+          required: [cpus, memory_bytes, pids_limit, workdir_bytes, tmp_bytes, nofile_limit]
+          properties:
+            cpus: { type: number }
+            memory_bytes: { type: integer, format: int64 }
+            pids_limit: { type: integer, format: int64 }
+            workdir_bytes: { type: integer, format: int64, description: Size of `/workspace` (tmpfs, counted in `memory_bytes`). }
+            tmp_bytes: { type: integer, format: int64, description: Size of `/tmp`. }
+            nofile_limit: { type: integer, format: int64 }
+        network: { type: string, enum: [none, allowlist, full], description: The widest mode a sandbox of this template may ask for. }
+        idle_timeout_ms: { type: integer, format: int64, description: 0 means none. }
+        max_lifetime_ms: { type: integer, format: int64, description: 0 means none. }
+    PTYSize:
+      type: object
+      required: [cols, rows]
+      additionalProperties: false
+      properties:
+        cols: { type: integer, minimum: 1, maximum: 65535 }
+        rows: { type: integer, minimum: 1, maximum: 65535 }
+    SignalRequest:
+      type: object
+      required: [signal]
+      additionalProperties: false
+      properties:
+        signal: { type: string, enum: [SIGINT, SIGTERM, SIGKILL, SIGHUP, SIGQUIT] }
+    StartCommandRequest:
+      type: object
+      required: [cmd]
+      additionalProperties: false
+      properties:
+        cmd: { type: string, description: Executable name (looked up in PATH) or path. No shell is involved; use `sh -c` for one. }
+        args: { type: array, items: { type: string } }
+        env: { type: object, additionalProperties: { type: string }, description: Added to the session environment for this command. }
+        cwd: { type: string, description: Default `/workspace`. }
+        timeout_ms: { type: integer, format: int64, minimum: 0, description: "Wall-clock limit; on expiry the process group is SIGKILLed and the exit reason is `timeout`. 0 means none." }
+        stdin: { type: boolean, default: false, description: Keep stdin open (pipe mode). }
+        tag: { type: string, description: Optional name, unique among the sandbox's running commands. }
+        pty: { $ref: "#/components/schemas/PTYSize" }
+    ExitStatus:
+      type: object
+      required: [exit_code, reason]
+      properties:
+        exit_code: { type: integer, description: "The exit code; -1 if the command was ended by a signal." }
+        signal: { type: string, example: SIGKILL }
+        reason:
+          type: string
+          enum: [exited, killed, timeout, oom]
+          description: "`exited`: returned by itself. `killed`: ended by a signal. `timeout`: the per-command limit. `oom`: killed by the OOM killer while the sandbox survived."
+    Command:
+      type: object
+      required: [pid, cmd, pty, started_at, next_offset]
+      properties:
+        pid: { type: string }
+        tag: { type: string }
+        cmd: { type: string }
+        args: { type: array, items: { type: string } }
+        pty: { type: boolean }
+        started_at: { type: string, format: date-time }
+        exit: { $ref: "#/components/schemas/ExitStatus" }
+        next_offset: { type: integer, format: int64, description: Offset the next output byte will get, i.e. total output bytes so far. }
+    WaitResult:
+      allOf:
+        - $ref: "#/components/schemas/Command"
+        - type: object
+          required: [stdout, stderr, truncated, exit]
+          properties:
+            stdout: { type: string, format: byte, description: Base64. All output of a PTY command is here. }
+            stderr: { type: string, format: byte }
+            truncated: { type: boolean, description: Output was cut at the server's limit or lost from the replay buffer. }
+    StreamEvent:
+      type: object
+      required: [type, offset]
+      description: One line of an NDJSON stream.
+      properties:
+        type:
+          type: string
+          enum: [start, stdout, stderr, pty, exit, truncated, keepalive, error]
+          description: |
+            `start`: first line of `?wait=stream`, with `command`.
+            `stdout`, `stderr`, `pty`: output, with `data` at `offset`.
+            `truncated`: `dropped` bytes before `offset` are lost.
+            `keepalive`: nothing happened; `offset` is the current end.
+            `exit`: last line, with `exit`; `offset` is the total output size.
+            `error`: last line when the stream cannot continue, with `error`.
+        offset: { type: integer, format: int64 }
+        data: { type: string, format: byte, description: Base64, at most 32768 bytes decoded. }
+        dropped: { type: integer, format: int64 }
+        exit: { $ref: "#/components/schemas/ExitStatus" }
+        command: { $ref: "#/components/schemas/Command" }
+        error: { $ref: "#/components/schemas/Error" }
+    WSStatusFrame:
+      type: object
+      description: Payload of the channel-3 WebSocket frame. Exactly one member is set.
+      properties:
+        exit: { $ref: "#/components/schemas/ExitStatus" }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, description: "For example `bad_frame`, `stdin_overflow` (agent), `sandbox_terminated`, `agent_unavailable` (gateway)." }
+            message: { type: string }
+    FileInfo:
+      type: object
+      required: [name, path, size, mode, is_dir, mod_time]
+      properties:
+        name: { type: string }
+        path: { type: string, description: Absolute path inside the sandbox. }
+        size: { type: integer, format: int64 }
+        mode: { type: string, description: Octal permission bits., example: "0644" }
+        is_dir: { type: boolean }
+        mod_time: { type: string, format: date-time }

@@ -118,6 +118,29 @@ func (m *MemStore) NetworkPolicy(sandboxID string) *core.NetworkPolicy {
 
 // --- internals -------------------------------------------------------------
 
+// AccessTokenHash returns the access-token hash stored by the claim.
+func (m *MemStore) AccessTokenHash(sandboxID string) []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r := m.find(sandboxID); r != nil {
+		return r.token
+	}
+	return nil
+}
+
+// Update applies f to a stored row under the store's lock and reports
+// whether the row exists. It is for fakes layered on top of MemStore that
+// need a write this type does not model.
+func (m *MemStore) Update(sandboxID string, f func(*core.Sandbox)) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.find(sandboxID)
+	if r != nil {
+		f(&r.sb)
+	}
+	return r != nil
+}
+
 func (m *MemStore) find(id string) *memRow {
 	for _, r := range m.rows {
 		if r.sb.ID == id {

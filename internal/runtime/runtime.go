@@ -37,6 +37,10 @@ const (
 var (
 	ErrNotFound    = errors.New("runtime: instance not found")
 	ErrUnsupported = errors.New("runtime: operation not supported by this backend")
+	// ErrNotRunning is returned by Stats for an instance that still
+	// exists but whose processes are gone, so it has no counters left to
+	// read. Inspect then says how it ended (Instance.ExitCode, OOMKilled).
+	ErrNotRunning = errors.New("runtime: instance is not running")
 )
 
 // Capabilities describes what a backend can do. Backends are not uniform
@@ -76,6 +80,14 @@ type Instance struct {
 	TemplateID string
 	Running    bool
 	CreatedAt  time.Time
+	// ExitCode and OOMKilled describe how an instance that is no longer
+	// running ended. They are zero while Running, and best effort
+	// otherwise: List may leave OOMKilled unset where only Inspect can
+	// tell. OOMKilled means the backend has evidence, possibly indirect
+	// (see the backend's documentation), that the kernel OOM killer ended
+	// the instance.
+	ExitCode  int
+	OOMKilled bool
 }
 
 // Stats are the per-sandbox signals used for termination reasons and

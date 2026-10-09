@@ -139,10 +139,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 			}
 			handled[row.ID], changed = true, true
 		case !inst.Running && (row.State == core.StateWarm || row.State == core.StateAssigned || row.State == core.StateRunning):
-			reason, data := c.oomOr(ctx, row, core.ReasonInstanceLost)
-			if data == nil {
-				data = map[string]any{"cause": "instance_not_running"}
-			}
+			reason, data := c.diedOf(ctx, inst)
 			c.lose(ctx, row, reason, data)
 			handled[row.ID], changed = true, true
 		}
@@ -176,6 +173,57 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		c.Kick()
 	}
 	return nil
+}
+
+// diedOf says why an instance that List reported as not running ended.
+// List may not know about an OOM kill, so the instance is inspected.
+func (c *Controller) diedOf(ctx context.Context, inst runtime.Instance) (core.TerminationReason, map[string]any) {
+	if stats, err := c.backend.Stats(ctx, inst.ID); err == nil && stats.OOMKills > 0 {
+		return core.ReasonOOMKilled, map[string]any{"cause": "instance_not_running", "oom_kills": stats.OOMKills}
+	}
+	if full, err := c.backend.Inspect(ctx, inst.ID); err == nil && !full.Running {
+		inst = full
+	}
+	return deathReason(inst, core.ReasonInstanceLost)
+}
+
+// CheckInstance looks at one tenant-owned sandbox's instance right now,
+// without waiting for the next reconcile pass, and if the instance is
+// gone or no longer running fails the sandbox with instance_lost or
+// oom_killed and recycles it. It reports whether the sandbox was lost.
+// The request path calls it when the in-sandbox agent stops answering, so
+// that a sandbox killed by the OOM killer is reported as such within
+// milliseconds. It is fenced by generation like every other transition.
+func (c *Controller) CheckInstance(ctx context.Context, sandboxID string, generation int64) (lost bool, err error) {
+	row, err := c.store.GetSandbox(ctx, sandboxID)
+	if err != nil {
+		return false, err
+	}
+	if row.Generation != generation {
+		return false, fmt.Errorf("%w: sandbox %s", ErrStaleGeneration, sandboxID)
+	}
+	switch row.State {
+	case core.StateAssigned, core.StateRunning, core.StatePaused:
+	default:
+		return false, nil
+	}
+	if row.InstanceID == "" || c.busyRow(row) {
+		return false, nil
+	}
+	inst, err := c.backend.Inspect(ctx, row.InstanceID)
+	switch {
+	case errors.Is(err, runtime.ErrNotFound):
+		c.lose(ctx, row, core.ReasonInstanceLost, map[string]any{"cause": "no_instance"})
+	case err != nil:
+		return false, err
+	case inst.Running:
+		return false, nil
+	default:
+		reason, data := c.diedOf(ctx, inst)
+		c.lose(ctx, row, reason, data)
+	}
+	c.Kick()
+	return true, nil
 }
 
 // destroyOrphan destroys an instance that no live row accounts for.
