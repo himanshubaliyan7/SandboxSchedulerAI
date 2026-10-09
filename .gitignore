@@ -1,0 +1,12 @@
+/bin/
+/dist/
+*.test
+*.out
+.env
+.env.*
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
