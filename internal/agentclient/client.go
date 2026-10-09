@@ -16,8 +16,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
 )
@@ -33,8 +36,7 @@ type Client struct {
 func New(socketPath string) *Client {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", socketPath)
+			return dialUnix(ctx, socketPath)
 		},
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 16,
@@ -43,6 +45,26 @@ func New(socketPath string) *Client {
 	}
 	// No client-wide timeout: streams are long-lived. Use contexts.
 	return &Client{socket: socketPath, http: &http.Client{Transport: tr}}
+}
+
+// maxSunPath is the longest path connect(2) accepts in sockaddr_un
+// (108 bytes including the terminating NUL).
+const maxSunPath = 107
+
+// dialUnix connects to a Unix socket. Host run directories can be deeper
+// than sockaddr_un allows, so a path that does not fit is reached through
+// a descriptor of its directory instead.
+func dialUnix(ctx context.Context, path string) (net.Conn, error) {
+	var d net.Dialer
+	if len(path) <= maxSunPath {
+		return d.DialContext(ctx, "unix", path)
+	}
+	dirfd, err := unix.Open(filepath.Dir(path), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &net.OpError{Op: "dial", Net: "unix", Err: fmt.Errorf("open %s: %w", filepath.Dir(path), err)}
+	}
+	defer unix.Close(dirfd)
+	return d.DialContext(ctx, "unix", fmt.Sprintf("/proc/self/fd/%d/%s", dirfd, filepath.Base(path)))
 }
 
 // SocketPath is the path this client dials.

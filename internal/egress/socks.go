@@ -164,11 +164,11 @@ func (c *conn) serveSOCKS(start time.Time) {
 	}
 	// The header deadline set in serve covers the whole handshake.
 	if err := readSocksGreeting(c.br); err != nil {
+		handshakeErr(err)
 		if errors.Is(err, errSocksNoAuth) {
 			_ = c.raw.SetWriteDeadline(time.Now().Add(errorWriteTimeout))
 			_, _ = c.raw.Write([]byte{socksVersion, socksAuthUnacceptable})
 		}
-		handshakeErr(err)
 		return
 	}
 	_ = c.raw.SetWriteDeadline(time.Now().Add(errorWriteTimeout))
@@ -177,6 +177,7 @@ func (c *conn) serveSOCKS(start time.Time) {
 	}
 	req, err := readSocksRequest(c.br)
 	if err != nil {
+		handshakeErr(err)
 		switch {
 		case errors.Is(err, errSocksCommand):
 			c.socksReply(socksCmdNotSupported)
@@ -185,20 +186,19 @@ func (c *conn) serveSOCKS(start time.Time) {
 		case errors.Is(err, errSocksFormat), errors.Is(err, errSocksVersion):
 			c.socksReply(socksGeneralFailure)
 		}
-		handshakeErr(err)
 		return
 	}
 	t, err := req.target()
 	if err != nil {
-		c.socksReply(socksNotAllowed)
 		c.sb.record(Decision{Protocol: proto, Port: req.port, Verdict: VerdictDenied, Reason: ReasonBadTarget, Detail: err.Error(), Duration: time.Since(start)})
+		c.socksReply(socksNotAllowed)
 		return
 	}
 	_ = c.raw.SetDeadline(time.Time{})
 	f, ref := c.open(proto, t, start)
 	if ref != nil {
-		c.socksReply(ref.socks)
 		c.sb.record(ref.decision(proto, t, start))
+		c.socksReply(ref.socks)
 		return
 	}
 	_ = c.raw.SetWriteDeadline(time.Now().Add(errorWriteTimeout))

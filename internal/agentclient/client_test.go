@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,5 +101,65 @@ func TestErrorsWithoutAgent(t *testing.T) {
 		if err == nil {
 			t.Fatal("Stream without an agent yielded an event")
 		}
+	}
+}
+
+// A host run directory deeper than sockaddr_un allows still works.
+func TestLongSocketPath(t *testing.T) {
+	short, err := os.MkdirTemp("", "sbx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(short)
+	a := agent.New(agent.Config{SocketPath: filepath.Join(short, runtime.AgentSocket), Workspace: short})
+	actx, stop := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- a.Serve(actx) }()
+	defer func() {
+		stop()
+		if err := <-served; err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	}()
+
+	long := filepath.Join(short, strings.Repeat("d", 60), strings.Repeat("e", 60))
+	if err := os.MkdirAll(filepath.Dir(long), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(short, long); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(agentclient.SocketPath(long)); n <= 108 {
+		t.Fatalf("path is only %d bytes", n)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := (agentclient.Sandboxes{}).WaitReady(ctx, long); err != nil {
+		t.Fatal(err)
+	}
+	c := agentclient.ForRunDir(long)
+	defer c.Close()
+	pi, err := c.Start(ctx, agentapi.StartRequest{Cmd: "echo", Args: []string{"hi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := c.DialWS(ctx, pi.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	var out []byte
+	for {
+		f, err := ws.Recv(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, f.Data...)
+		if f.Status != nil {
+			break
+		}
+	}
+	if string(out) != "hi\n" {
+		t.Fatalf("output = %q", out)
 	}
 }

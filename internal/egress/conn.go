@@ -76,12 +76,17 @@ func (c *idleConn) Write(p []byte) (int, error) {
 	if c.auto.Load() {
 		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
 	}
+	// Count before the write and correct afterwards, so the counter can
+	// never lag behind bytes the peer has already answered.
+	if c.wr != nil {
+		c.wr.Add(int64(len(p)))
+	}
 	n, err := c.Conn.Write(p)
+	if c.wr != nil && n < len(p) {
+		c.wr.Add(int64(n - len(p)))
+	}
 	if n > 0 {
 		c.act.touch()
-		if c.wr != nil {
-			c.wr.Add(int64(n))
-		}
 	}
 	return n, err
 }
@@ -127,9 +132,9 @@ func newConn(sb *sandbox, uc *net.UnixConn) *conn {
 // socket does not block, and no goroutine is spent on a flood.
 func (c *conn) rejectOverLimit() {
 	_ = c.raw.SetWriteDeadline(time.Now().Add(time.Second))
+	c.sb.record(Decision{Verdict: VerdictDenied, Reason: ReasonConnLimit, Detail: "too many concurrent connections"})
 	_, _ = io.WriteString(c.raw, httpErrorText(503, VerdictDenied, ReasonConnLimit, "too many concurrent connections"))
 	c.raw.Close()
-	c.sb.record(Decision{Verdict: VerdictDenied, Reason: ReasonConnLimit, Detail: "too many concurrent connections"})
 }
 
 func (c *conn) serve() {

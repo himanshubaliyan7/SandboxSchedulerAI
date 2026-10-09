@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -808,7 +809,10 @@ func TestHostHeaderMismatch(t *testing.T) {
 }
 
 func TestSNICheck(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "secret") }))
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "secret") }))
+	// Refused tunnels end the upstream handshake early; that is expected.
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
 	defer srv.Close()
 	port := portOf(t, srv.URL)
 	handshake := func(e *env, path, target, sni string) error {
@@ -1077,7 +1081,9 @@ func TestUpdateStricterClosesTunnels(t *testing.T) {
 	if status, reason, _, _ := connectStatus(t, path, "drop.test:"+port); status != 403 || reason != string(ReasonHostNotAllowed) {
 		t.Errorf("new tunnel after update: %d %q", status, reason)
 	}
-	d := e.waitDecision(func(d Decision) bool { return d.Host == "drop.test" && d.Reason == ReasonPolicyUpdated })
+	d := e.waitDecision(func(d Decision) bool {
+		return d.Protocol == "connect" && d.Host == "drop.test" && d.Reason == ReasonPolicyUpdated
+	})
 	if d.Verdict != VerdictAllowed || d.BytesUp != 3 {
 		t.Errorf("decision: %+v", d)
 	}

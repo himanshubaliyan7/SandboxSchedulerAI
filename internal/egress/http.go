@@ -142,8 +142,8 @@ func (c *conn) serveHTTP(start time.Time) {
 			_ = c.raw.SetReadDeadline(start.Add(c.m.cfg.HeaderTimeout))
 		}
 		fail := func(status int, reason Reason, detail string) {
-			c.httpError(status, VerdictError, reason, detail)
 			c.sb.record(Decision{Verdict: VerdictError, Reason: reason, Detail: detail, Duration: time.Since(start)})
+			c.httpError(status, VerdictError, reason, detail)
 		}
 		head, err := c.peekHead()
 		switch {
@@ -182,25 +182,25 @@ func (c *conn) handleConnect(req *http.Request, hosts []string, start time.Time)
 	const proto = "connect"
 	t, err := parseTarget(req.RequestURI, 0)
 	if err != nil {
-		c.httpError(400, VerdictDenied, ReasonBadTarget, "invalid CONNECT target")
 		c.sb.record(Decision{Protocol: proto, Verdict: VerdictDenied, Reason: ReasonBadTarget, Detail: err.Error(), Duration: time.Since(start)})
+		c.httpError(400, VerdictDenied, ReasonBadTarget, "invalid CONNECT target")
 		return
 	}
 	if req.ContentLength != 0 || len(req.TransferEncoding) > 0 {
-		c.httpError(400, VerdictError, ReasonBadRequest, "CONNECT must not have a body")
 		c.sb.record(Decision{Protocol: proto, Host: t.host, Port: t.port, Verdict: VerdictError, Reason: ReasonBadRequest, Detail: "CONNECT with a body", Duration: time.Since(start)})
+		c.httpError(400, VerdictError, ReasonBadRequest, "CONNECT must not have a body")
 		return
 	}
 	if len(hosts) == 1 && !hostHeaderAgrees(hosts[0], t, 0) {
 		ref := denied(ReasonHostMismatch, "Host header does not match the CONNECT target")
-		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		c.sb.record(ref.decision(proto, t, start))
+		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		return
 	}
 	f, ref := c.open(proto, t, start)
 	if ref != nil {
-		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		c.sb.record(ref.decision(proto, t, start))
+		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		return
 	}
 	_ = c.raw.SetWriteDeadline(time.Now().Add(errorWriteTimeout))
@@ -305,8 +305,8 @@ func (b *clientBody) Close() error {
 func (c *conn) handleRequest(req *http.Request, hosts []string, start time.Time) (keep bool) {
 	const proto = "http"
 	bad := func(detail string) bool {
-		c.httpError(400, VerdictError, ReasonBadRequest, detail)
 		c.sb.record(Decision{Protocol: proto, Verdict: VerdictError, Reason: ReasonBadRequest, Detail: detail, Duration: time.Since(start)})
+		c.httpError(400, VerdictError, ReasonBadRequest, detail)
 		return false
 	}
 	u := req.URL
@@ -320,20 +320,20 @@ func (c *conn) handleRequest(req *http.Request, hosts []string, start time.Time)
 	}
 	t, err := parseTarget(u.Host, 80)
 	if err != nil {
-		c.httpError(400, VerdictDenied, ReasonBadTarget, "invalid target host or port")
 		c.sb.record(Decision{Protocol: proto, Verdict: VerdictDenied, Reason: ReasonBadTarget, Detail: err.Error(), Duration: time.Since(start)})
+		c.httpError(400, VerdictDenied, ReasonBadTarget, "invalid target host or port")
 		return false
 	}
 	if len(hosts) == 1 && !hostHeaderAgrees(hosts[0], t, 80) {
 		ref := denied(ReasonHostMismatch, "Host header does not match the request URI")
-		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		c.sb.record(ref.decision(proto, t, start))
+		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		return false
 	}
 	f, ref := c.open(proto, t, start)
 	if ref != nil {
-		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		c.sb.record(ref.decision(proto, t, start))
+		c.httpError(ref.status, ref.verdict, ref.reason, ref.detail)
 		return false
 	}
 	defer f.finish()
