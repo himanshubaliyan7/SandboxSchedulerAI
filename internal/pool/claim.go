@@ -125,6 +125,9 @@ func (c *Controller) claimRow(ctx context.Context, tenantID string, tmpl core.Te
 		deadline <-chan time.Time
 		granted  bool // we were woken for a WARM sandbox and have not used the wake-up
 	)
+	if wait > 0 {
+		deadline = c.clock.After(wait) // the wait is measured from the start of the claim
+	}
 	for {
 		if granted || wait <= 0 || c.waiting(tmpl.ID) == 0 {
 			sb, err = c.store.Claim(ctx, params)
@@ -148,9 +151,6 @@ func (c *Controller) claimRow(ctx context.Context, tenantID string, tmpl core.Te
 			return core.Sandbox{}, waited, fmt.Errorf("%w: template %s: wait queue is full", ErrPoolEmpty, tmpl.ID)
 		}
 		waited = true
-		if deadline == nil {
-			deadline = c.clock.After(wait)
-		}
 		// The refill pass creates for queued claims and wakes them if a
 		// sandbox turned WARM between our failed claim and the enqueue.
 		c.Kick()

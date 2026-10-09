@@ -415,6 +415,17 @@ func (c *Controller) isBusy(id string) bool {
 	return creating || recycling
 }
 
+// busyRow is isBusy for a row read from the store. An in-flight create
+// only shields a row that is still CREATING: once the row says WARM or
+// later the create is over, even if its goroutine has not yet returned.
+func (c *Controller) busyRow(sb core.Sandbox) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, creating := c.creating[sb.ID]
+	_, recycling := c.recycling[sb.ID]
+	return recycling || (creating && sb.State == core.StateCreating)
+}
+
 // recycle moves a row from its current state to RECYCLING with a reason
 // (an empty reason keeps the one the row carries) and tears the instance
 // down. A failed teardown is logged, not returned: the row stays

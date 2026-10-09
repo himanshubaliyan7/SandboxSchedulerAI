@@ -149,19 +149,44 @@ func TestControllerOnPostgres(t *testing.T) {
 	}
 	warmSettled(2)
 
-	// Restart: the warm rows in Postgres are re-adopted, nothing is recreated.
+	// Restart: the warm rows in Postgres are re-adopted, nothing is
+	// recreated. The controller serves every template in the database, and
+	// other test packages may have templates there at the same time, so
+	// everything below looks only at this test's template.
+	warmOf := func() map[string]string {
+		rows, err := st.ListActiveByHost(ctx, hostID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, r := range rows {
+			if r.TemplateID == tmpl.ID && r.State == core.StateWarm {
+				out[r.ID] = r.InstanceID
+			}
+		}
+		return out
+	}
 	c.Stop()
-	creates := be.Counters().Creates
+	before := warmOf()
+	if len(before) != 2 {
+		t.Fatalf("%d warm rows before restart, want 2", len(before))
+	}
 	c2 := newController()
 	if err := c2.Start(ctx); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
-	if m := c2.Metrics(); m.Adopted != 2 {
-		t.Fatalf("adopted %d warm sandboxes after restart, want 2", m.Adopted)
+	if m := c2.Metrics(); m.Adopted < 2 {
+		t.Fatalf("adopted %d warm sandboxes after restart, want at least this template's 2", m.Adopted)
 	}
 	warmSettled(2)
-	if got := be.Counters().Creates; got != creates {
-		t.Fatalf("restart created %d sandboxes", got-creates)
+	after := warmOf()
+	for id, inst := range before {
+		if after[id] != inst {
+			t.Fatalf("warm sandbox %s was not re-adopted: before %v, after %v", id, before, after)
+		}
+		if be.WasDestroyed(inst) {
+			t.Fatalf("instance %s of an adoptable warm sandbox was destroyed", inst)
+		}
 	}
 	d, err := c2.Claim(ctx, tn.ID, tmpl.ID, pool.ClaimOptions{})
 	if err != nil {

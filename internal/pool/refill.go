@@ -167,7 +167,10 @@ func (c *Controller) startCreate(ctx context.Context, tmpl core.Template) error 
 		unregister()
 		return fmt.Errorf("insert creating row: %w", err)
 	}
-	if !c.goAsync(func() { defer unregister(); c.runCreate(cctx, sb, tmpl) }) {
+	// The kick comes after unregistering: a pass that still counted this
+	// create as in flight would start nothing under RefillRate, and no
+	// later event would wake the loop before the next interval.
+	if !c.goAsync(func() { c.runCreate(cctx, sb, tmpl); unregister(); c.Kick() }) {
 		unregister()
 		// Stopping: do not leave the row for the next start-up to find.
 		dctx, dcancel := c.cleanupCtx()

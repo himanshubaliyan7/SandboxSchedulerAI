@@ -527,7 +527,10 @@ func TestCreateFailureCleansUpAndBreakerEngages(t *testing.T) {
 	}
 
 	// After the 1s backoff exactly one probe is allowed; it fails and the backoff doubles.
+	// (The explicit Kick stands in for the loop's interval tick, which on a
+	// fake clock only fires if the loop was already waiting when time moved.)
 	h.clock.Advance(time.Second)
+	h.c.Kick()
 	eventually(t, "probe create to fail", func() bool { return len(h.inState(core.StateDestroyed)) == 4 })
 	for i := 0; i < 20; i++ {
 		_ = h.c.Refill(ctxBg())
@@ -543,6 +546,7 @@ func TestCreateFailureCleansUpAndBreakerEngages(t *testing.T) {
 	// The backend recovers: the next probe succeeds, the breaker closes, the pool fills.
 	h.be.SetCreateError(nil)
 	h.clock.Advance(time.Second)
+	h.c.Kick()
 	h.settled(3)
 	if tm := h.c.Metrics().Templates[tmplID]; tm.BreakerOpen || tm.ConsecutiveCreateFailures != 0 {
 		t.Fatalf("breaker did not close: %+v", tm)
@@ -686,13 +690,18 @@ func TestTimersFireWithTheRightReason(t *testing.T) {
 		h.settled(3)
 		sb := h.claim()
 		// Keep it active so only the lifetime cap can end it.
-		for i := 0; i < 7; i++ {
+		for i := 0; i < 6; i++ {
 			h.clock.Advance(9 * time.Minute)
 			if err := h.c.Touch(ctxBg(), sb.ID, sb.Generation); err != nil {
 				t.Fatalf("touch %d: %v (row %+v)", i, err, h.get(sb.ID))
 			}
 		}
-		_ = h.c.Sweep(ctxBg()) // 63 minutes in
+		_ = h.c.Sweep(ctxBg()) // 54 minutes in, active throughout
+		if got := h.get(sb.ID); got.State != core.StateRunning {
+			t.Fatalf("recycled before the lifetime cap: %+v", got)
+		}
+		h.clock.Advance(7 * time.Minute) // 61 minutes; idle for only 7
+		_ = h.c.Sweep(ctxBg())
 		eventually(t, "sandbox to be destroyed", func() bool { return h.get(sb.ID).State == core.StateDestroyed })
 		if got := h.get(sb.ID); got.Reason != core.ReasonMaxLifetime {
 			t.Fatalf("reason = %q, want max_lifetime", got.Reason)
@@ -1013,20 +1022,26 @@ func TestRestartWithExistingWarmRows(t *testing.T) {
 	if sb.ID != warm[0].ID || sb.Generation != 1 {
 		t.Fatalf("claimed %+v, want adopted %s", sb, warm[0].ID)
 	}
-	// Its instance still carries the old epoch and generation 0; the
-	// reconciler must accept that for a claimed row too.
-	if err := h.c.Reconcile(ctxBg()); err != nil {
+	// Its instance still carries the old epoch label. This process adopted
+	// and claimed it, so the reconciler must not drain it as an old-epoch
+	// session, however often it runs.
+	for i := 0; i < 3; i++ {
+		if err := h.c.Reconcile(ctxBg()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := h.get(sb.ID); got.State != core.StateRunning {
+		t.Fatalf("a sandbox adopted and claimed in this epoch was disturbed: %+v", got)
+	}
+	if h.be.WasDestroyed(sb.InstanceID) {
+		t.Fatal("instance of the adopted, claimed sandbox was destroyed")
+	}
+	// It still ends normally.
+	if err := h.c.Release(ctxBg(), sb.ID, sb.Generation, ""); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.get(sb.ID); got.State != core.StateDestroyed || got.Reason != core.ReasonHostDrain {
-		// Documented behaviour: a session on an old-epoch instance is
-		// only safe within the epoch that adopted and claimed it. This
-		// process claimed it itself, so it must stay.
-		if got.State != core.StateRunning {
-			t.Fatalf("claimed adopted sandbox: %+v", got)
-		}
-	} else {
-		t.Fatalf("a sandbox claimed in this epoch was drained as old-epoch: %+v", got)
+	if got := h.get(sb.ID); got.State != core.StateDestroyed || got.Reason != core.ReasonReleased {
+		t.Fatalf("released adopted sandbox: %+v", got)
 	}
 }
 

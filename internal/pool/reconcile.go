@@ -56,6 +56,11 @@ func createGeneration(sb core.Sandbox) int64 {
 //     longer enforced would be worse than ending it. It also includes
 //     CREATING and ASSIGNED rows, whose owner died mid-operation.
 //
+// Adoption is remembered for the life of this process, so an adopted
+// sandbox that is later claimed here is treated like any other session of
+// this epoch even though its instance label still names the old one. (It
+// would be drained by the next restart, like every session.)
+//
 // An instance is never adopted as WARM on the strength of its labels
 // alone; the row must say WARM with the matching generation.
 //
@@ -108,7 +113,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 			c.destroyOrphan(ctx, inst, "no_live_row")
 			continue
 		}
-		if c.isBusy(row.ID) {
+		if c.busyRow(row) {
 			hasInstance[row.ID] = true
 			continue
 		}
@@ -122,7 +127,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 			continue // handled with the rows below
 		}
 		switch {
-		case inst.AgentEpoch != c.cfg.AgentEpoch:
+		case inst.AgentEpoch != c.cfg.AgentEpoch && !c.isAdopted(row.ID):
 			if row.State == core.StateWarm && inst.Running {
 				if c.adopt(ctx, row) {
 					continue
@@ -144,7 +149,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 
 	for _, row := range rows {
-		if handled[row.ID] || c.isBusy(row.ID) {
+		if handled[row.ID] || c.busyRow(row) {
 			continue
 		}
 		switch row.State {
@@ -216,15 +221,16 @@ func (c *Controller) lose(ctx context.Context, row core.Sandbox, reason core.Ter
 	}
 }
 
+func (c *Controller) isAdopted(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.adopted[id]
+	return ok
+}
+
 // adopt probes a WARM instance inherited from an older agent epoch once
 // and remembers the verdict for the life of this process.
 func (c *Controller) adopt(ctx context.Context, row core.Sandbox) bool {
-	c.mu.Lock()
-	_, done := c.adopted[row.ID]
-	c.mu.Unlock()
-	if done {
-		return true
-	}
 	pctx, cancel := c.withTimeout(ctx, c.cfg.AdoptProbeTimeout)
 	err := c.agent.WaitReady(pctx, c.RunDir(row.ID))
 	cancel()
