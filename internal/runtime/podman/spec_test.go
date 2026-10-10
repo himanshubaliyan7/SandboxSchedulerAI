@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
 func testCfg(t *testing.T, mutate func(*Config)) Config {

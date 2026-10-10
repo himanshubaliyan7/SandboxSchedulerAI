@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // This file holds what the API layer needs on top of the pool

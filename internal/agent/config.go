@@ -16,8 +16,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
 // AgentVersion is reported by GET /health.

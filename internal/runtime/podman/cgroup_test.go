@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
 func writeFiles(t *testing.T, dir string, files map[string]string) {

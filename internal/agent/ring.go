@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
+import "github.com/himanshubaliyan7/warmbox/internal/agentapi"
 
 // ring is a bounded replay buffer for one process. It stores the last
 // `limit` bytes of output in a circular byte buffer together with a list

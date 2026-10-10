@@ -9,7 +9,7 @@ package main
 import (
 	"os"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agent"
+	"github.com/himanshubaliyan7/warmbox/internal/agent"
 )
 
 func main() {

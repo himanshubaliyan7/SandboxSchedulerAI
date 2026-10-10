@@ -22,7 +22,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
 )
 
 // Client talks to one agent. It is safe for concurrent use.

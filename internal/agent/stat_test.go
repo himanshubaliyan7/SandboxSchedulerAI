@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
 )
 
 func wantAgentError(t *testing.T, err error, status int, code string) {

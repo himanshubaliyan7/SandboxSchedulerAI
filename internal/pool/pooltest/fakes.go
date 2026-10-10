@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // FakeAgent is a pool.AgentConn. By default every call succeeds at once.

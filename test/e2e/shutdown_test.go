@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
 // activeRows returns the host's sandbox rows that are not terminal, by id.

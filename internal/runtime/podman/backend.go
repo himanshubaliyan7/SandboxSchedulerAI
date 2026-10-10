@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
 // Backend implements runtime.Backend on one rootless Podman service.

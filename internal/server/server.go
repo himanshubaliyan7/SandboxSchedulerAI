@@ -20,15 +20,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/api"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/egress"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/pool"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/preflight"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime/podman"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/api"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/egress"
+	"github.com/himanshubaliyan7/warmbox/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/preflight"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman"
+	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
 // Shutdown policies: what a graceful stop (SIGTERM, SIGINT) leaves behind.

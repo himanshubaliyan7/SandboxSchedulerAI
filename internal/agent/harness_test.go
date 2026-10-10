@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
 )
 
 // The suite runs the agent in one of two ways:

@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
 // session is the gateway's in-memory state for one running sandbox: the

@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 const templateCols = `id, version, image, runtime, cpus, memory_bytes, pids_limit, workdir_bytes, tmp_bytes,

@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
 )
 
 func fileURL(route, path string, extra url.Values) string {

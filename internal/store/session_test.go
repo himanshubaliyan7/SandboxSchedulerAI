@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 func TestSessionMetadataLifetimeAndListing(t *testing.T) {

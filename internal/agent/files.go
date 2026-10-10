@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
 )
 
 // The file routes operate on the sandbox's own filesystem with the

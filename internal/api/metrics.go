@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // latencyBuckets are the upper bounds, in seconds, of the request

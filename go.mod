@@ -1,4 +1,4 @@
-module github.com/himanshubaliyan7/SandboxSchedulerAI
+module github.com/himanshubaliyan7/warmbox
 
 go 1.27.2
 

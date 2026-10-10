@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/pool"
 )
 
 // Quiesce waits for the creates in flight and starts no new one, also

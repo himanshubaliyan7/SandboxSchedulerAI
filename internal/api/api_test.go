@@ -15,11 +15,11 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/api"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/pool"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/api"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
 func TestAuthentication(t *testing.T) {

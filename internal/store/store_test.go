@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // testStore opens the database named by SBX_TEST_DATABASE_URL, or skips.

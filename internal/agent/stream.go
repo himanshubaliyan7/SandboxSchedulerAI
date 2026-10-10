@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
 )
 
 // handleStream serves GET /processes/{id}/stream?from=N: replay from N,

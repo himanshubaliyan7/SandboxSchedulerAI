@@ -1,4 +1,4 @@
-# sbx: Python SDK for SandboxSchedulerAI
+# sbx: Python SDK for Warmbox
 
 Run LLM-generated code in warm, self-hosted sandboxes. The SDK talks to an
 `sbxd` server (see the repository root) and is shaped like E2B's Python SDK:

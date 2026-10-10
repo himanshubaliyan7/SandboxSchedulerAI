@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
 // ClaimOptions is what a claim may vary. The template itself is immutable.

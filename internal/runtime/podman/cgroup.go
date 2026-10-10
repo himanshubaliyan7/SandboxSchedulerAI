@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
 // ErrNotRunning is returned by Stats for an instance that exists but has

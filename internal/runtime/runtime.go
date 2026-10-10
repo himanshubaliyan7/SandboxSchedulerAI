@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // Labels every instance carries, so a host agent can rebuild its view from

@@ -1,4 +1,4 @@
-"""Python SDK for SandboxSchedulerAI.
+"""Python SDK for Warmbox.
 
 Run LLM-generated code in warm, self-hosted sandboxes::
 

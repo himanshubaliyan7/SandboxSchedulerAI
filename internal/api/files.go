@@ -7,8 +7,8 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
 )
 
 // File routes. Paths are interpreted by the in-sandbox agent: absolute,

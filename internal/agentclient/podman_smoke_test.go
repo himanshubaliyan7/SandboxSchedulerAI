@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
 // TestPodmanSmoke runs the static agent as PID 1 of a hardened rootless
@@ -44,7 +44,7 @@ func TestPodmanSmoke(t *testing.T) {
 	}
 	work := t.TempDir()
 	bin := filepath.Join(work, "sbx-agent")
-	build := exec.Command("go", "build", "-o", bin, "github.com/himanshubaliyan7/SandboxSchedulerAI/cmd/sbx-agent")
+	build := exec.Command("go", "build", "-o", bin, "github.com/himanshubaliyan7/warmbox/cmd/sbx-agent")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building the agent: %v\n%s", err, out)

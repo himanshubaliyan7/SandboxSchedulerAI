@@ -1,6 +1,6 @@
-# SandboxSchedulerAI
+# Warmbox
 
-A self-hostable scheduler for running LLM-generated code. It keeps a pool of
+Warmbox is a self-hostable scheduler for running LLM-generated code. It keeps a pool of
 pre-warmed, locked-down sandboxes on your own Linux box and hands one to an AI
 agent in a few milliseconds, then destroys it when the session ends.
 

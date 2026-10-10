@@ -14,7 +14,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/mcp"
+	"github.com/himanshubaliyan7/warmbox/internal/mcp"
 )
 
 func main() {

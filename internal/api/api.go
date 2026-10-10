@@ -27,11 +27,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/pool"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
 // Store is the part of the state store the API needs. *store.Store

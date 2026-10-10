@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // Deny categories reported in Decision.Detail.

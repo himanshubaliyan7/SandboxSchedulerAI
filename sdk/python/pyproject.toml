@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sbx"
-description = "Python SDK for SandboxSchedulerAI: run LLM-generated code in warm, self-hosted sandboxes"
+description = "Python SDK for Warmbox: run LLM-generated code in warm, self-hosted sandboxes"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

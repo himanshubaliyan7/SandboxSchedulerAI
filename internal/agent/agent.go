@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
+	"github.com/himanshubaliyan7/warmbox/internal/agentapi"
 )
 
 // Agent is one in-sandbox agent instance.

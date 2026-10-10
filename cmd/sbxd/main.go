@@ -27,7 +27,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/server"
+	"github.com/himanshubaliyan7/warmbox/internal/server"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".

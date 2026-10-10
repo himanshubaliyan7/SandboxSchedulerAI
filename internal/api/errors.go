@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/pool"
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
+	"github.com/himanshubaliyan7/warmbox/internal/agentclient"
+	"github.com/himanshubaliyan7/warmbox/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
 // Stable error codes of the public API. Codes the in-sandbox agent

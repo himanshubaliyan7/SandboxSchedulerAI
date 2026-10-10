@@ -1,7 +1,7 @@
 {
   "name": "sbx-sdk",
   "version": "0.1.0",
-  "description": "TypeScript SDK for SandboxSchedulerAI (sbxd): run LLM-generated code in warm-pool sandboxes. E2B-shaped API, zero runtime dependencies.",
+  "description": "TypeScript SDK for Warmbox (sbxd): run LLM-generated code in warm-pool sandboxes. E2B-shaped API, zero runtime dependencies.",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,

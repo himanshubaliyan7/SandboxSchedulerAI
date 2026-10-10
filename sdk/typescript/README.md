@@ -1,6 +1,6 @@
 # sbx-sdk
 
-TypeScript SDK for [SandboxSchedulerAI](../../README.md) (`sbxd`): run
+TypeScript SDK for [Warmbox](../../README.md) (`sbxd`): run
 LLM-generated code in warm-pool sandboxes on your own machine. The API is
 shaped like E2B's (`Sandbox.create`, `sandbox.commands.run`, `sandbox.files`,
 `sandbox.pty`), so code written against E2B ports with small changes.

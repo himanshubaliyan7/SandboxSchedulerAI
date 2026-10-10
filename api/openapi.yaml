@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: SandboxSchedulerAI API
+  title: Warmbox API
   version: "1.1.0"
   license:
     name: Apache-2.0

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // Event is one row of the append-only events table.

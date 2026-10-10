@@ -3,7 +3,7 @@ package pool
 import (
 	"time"
 
-	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/core"
 )
 
 // claimWaitBuckets are the upper bounds, in seconds, of the claim-wait
