@@ -454,8 +454,9 @@ class FakeServer:
                 self.stream_requests.append((cmd.pid, 0))
                 if self.before_stream:
                     self.before_stream(cmd, len([s for s in self.stream_requests if s[0] == cmd.pid]))
-                start = {"type": "start", "offset": 0, "command": {**cmd.view(), "next_offset": 0}}
-                start["command"].pop("exit", None)
+                view = {**cmd.view(), "next_offset": 0}
+                view.pop("exit", None)
+                start: dict[str, Any] = {"type": "start", "offset": 0, "command": view}
                 return self.ndjson(cmd, [start, *cmd.events(0)])
             if wait == "true":
                 out = b"".join(d for k, d in cmd.output if k != "stderr")
@@ -579,7 +580,7 @@ class FakeServer:
 
 
 def not_running(sb: FakeSandbox) -> httpx.Response:
-    details = {"state": sb.state}
+    details: dict[str, Any] = {"state": sb.state}
     if sb.reason:
         details["reason"] = sb.reason
     return error(409, "sandbox_not_running", f"sandbox {sb.id} is {sb.state}", **details)

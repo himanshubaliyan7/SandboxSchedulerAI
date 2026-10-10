@@ -207,7 +207,8 @@ def test_info_running_kill(sandbox: Sandbox, server: FakeServer) -> None:
     assert sandbox.is_running() is False
     info = sandbox.get_info()
     assert info.state == "destroyed" and info.reason == "released"
-    assert sandbox.kill() is True  # idempotent on the server
+    assert sandbox.kill(wait=True) is True  # idempotent on the server
+    assert server.requests[-1].url.params["wait"] == "true"
     with pytest.raises(SandboxNotRunningError) as e:
         sandbox.commands.run("true")
     assert e.value.state == "destroyed" and e.value.reason == "released" and e.value.status_code == 409
@@ -219,6 +220,7 @@ def test_info_running_kill(sandbox: Sandbox, server: FakeServer) -> None:
 def test_kill_tolerates_an_asynchronous_delete(sandbox: Sandbox, server: FakeServer) -> None:
     server.delete_status = 202
     assert sandbox.kill() is True
+    assert "wait" not in server.requests[-1].url.params
     # The sandbox is still on its way out, in a state this SDK has no name for.
     assert (sandbox.get_info()).state == "recycling"
     assert sandbox.is_running() is False

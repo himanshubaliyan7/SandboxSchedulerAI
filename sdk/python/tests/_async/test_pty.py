@@ -40,10 +40,14 @@ def simple(output: bytes = b"hello\r\n", exit_code: int = 0) -> Any:
     return script
 
 
-async def test_create_attaches_and_delivers_output(sandbox: AsyncSandbox, server: FakeServer, ws: FakeWSServer) -> None:
+async def test_create_attaches_and_delivers_output(
+    sandbox: AsyncSandbox, server: FakeServer, ws: FakeWSServer
+) -> None:
     ws.scripts.append(simple(b"$ stty size\r\n24 80\r\n", exit_code=0))
     chunks: list[bytes] = []
-    handle = await sandbox.pty.create(80, 24, chunks.append, envs={"TERM": "xterm"}, cwd="/tmp", timeout=30, tag="tty")
+    handle = await sandbox.pty.create(
+        80, 24, chunks.append, envs={"TERM": "xterm"}, cwd="/tmp", timeout=30, tag="tty"
+    )
     result = await handle.wait()
     assert b"".join(chunks) == b"$ stty size\r\n24 80\r\n"
     assert (result.exit_code, result.reason, result.pid, result.truncated) == (0, "exited", "p1", False)
@@ -80,7 +84,10 @@ async def test_create_command_forms(sandbox: AsyncSandbox, server: FakeServer, w
         ws.scripts.append(simple())
         handle = await sandbox.pty.create(100, 30, lambda data: None, **kwargs)  # type: ignore[arg-type]
         await handle.wait()
-        assert json.loads(server.seen("POST", r"/commands$")[-1].content) == {**wanted, "pty": {"cols": 100, "rows": 30}}
+        assert json.loads(server.seen("POST", r"/commands$")[-1].content) == {
+            **wanted,
+            "pty": {"cols": 100, "rows": 30},
+        }
 
 
 async def test_input_resize_and_signal_frames(sandbox: AsyncSandbox, ws: FakeWSServer) -> None:
@@ -134,7 +141,7 @@ async def test_output_is_acknowledged_in_small_steps(sandbox: AsyncSandbox, ws: 
     steps = [b - a for a, b in zip([0, *acks], acks, strict=False)]
     assert max(steps) < 10_000 and min(steps) > 0
     assert total - acks[-1] < 10_000
-    assert [f for f in ws.sessions[0].frames if f[0] == 6][0] == b'\x06{"offset":9000}'
+    assert next(f for f in ws.sessions[0].frames if f[0] == 6) == b'\x06{"offset":9000}'
 
 
 async def test_large_frames_are_acknowledged_one_by_one(sandbox: AsyncSandbox, ws: FakeWSServer) -> None:
@@ -191,7 +198,9 @@ async def test_application_pings_are_answered(sandbox: AsyncSandbox, ws: FakeWSS
     assert ws.sessions[0].pongs == [b"ping-1"]
 
 
-async def test_reattach_after_a_dropped_connection(sandbox: AsyncSandbox, ws: FakeWSServer, sleeps: list[float]) -> None:
+async def test_reattach_after_a_dropped_connection(
+    sandbox: AsyncSandbox, ws: FakeWSServer, sleeps: list[float]
+) -> None:
     def first(conn: ServerConnection, session: WSSession) -> None:
         ws_offset(conn, 0)
         ws_output(conn, session, b"A" * 5000)
@@ -229,11 +238,18 @@ async def test_reattach_reports_lost_output(sandbox: AsyncSandbox, ws: FakeWSSer
     ws.scripts += [first, second]
     received: list[bytes] = []
     gaps: list[tuple[int, int]] = []
-    handle = await sandbox.pty.create(80, 24, received.append, on_truncated=lambda offset, n: gaps.append((offset, n)))
+    handle = await sandbox.pty.create(
+        80, 24, received.append, on_truncated=lambda offset, n: gaps.append((offset, n))
+    )
     result = await handle.wait()
     assert b"".join(received) == b"A" * 5000 + b"B" * 100 + b"C" * 10
     assert gaps == [(6000, 1000), (6600, 500)]
-    assert (result.truncated, result.dropped_bytes, handle.dropped_bytes, handle.offset) == (True, 1500, 1500, 6610)
+    assert (result.truncated, result.dropped_bytes, handle.dropped_bytes, handle.offset) == (
+        True,
+        1500,
+        1500,
+        6610,
+    )
 
 
 async def test_replayed_bytes_are_not_delivered_twice(sandbox: AsyncSandbox, ws: FakeWSServer) -> None:
@@ -260,7 +276,9 @@ async def test_reattach_learns_why_the_sandbox_is_gone(sandbox: AsyncSandbox, ws
     def first(conn: ServerConnection, session: WSSession) -> None:
         ws_offset(conn, 0)
         ws_output(conn, session, b"working...")
-        gone = envelope("sandbox_not_running", "sandbox is destroyed", state="destroyed", reason="max_lifetime")
+        gone = envelope(
+            "sandbox_not_running", "sandbox is destroyed", state="destroyed", reason="max_lifetime"
+        )
         ws.rejections.append((409, gone, {}))
         conn.close(1001, "sandbox terminated")
 
@@ -268,7 +286,12 @@ async def test_reattach_learns_why_the_sandbox_is_gone(sandbox: AsyncSandbox, ws
     handle = await sandbox.pty.create(80, 24, lambda data: None)
     with pytest.raises(sbx.SandboxNotRunningError) as e:
         await handle.wait()
-    assert (e.value.reason, e.value.state, e.value.status_code, e.value.request_id) == ("max_lifetime", "destroyed", 409, "req-test")
+    assert (e.value.reason, e.value.state, e.value.status_code, e.value.request_id) == (
+        "max_lifetime",
+        "destroyed",
+        409,
+        "req-test",
+    )
     assert handle.exit_code is None and handle.finished
 
 
@@ -300,7 +323,12 @@ async def test_reattach_retries_through_rate_limiting(sandbox: AsyncSandbox, ws:
 async def test_status_frame_with_an_error(sandbox: AsyncSandbox, ws: FakeWSServer) -> None:
     def script(conn: ServerConnection, session: WSSession) -> None:
         ws_offset(conn, 0)
-        conn.send(b"\x03" + json.dumps({"error": {"code": "sandbox_terminated", "message": "sandbox has terminated: oom_killed"}}).encode())
+        conn.send(
+            b"\x03"
+            + json.dumps(
+                {"error": {"code": "sandbox_terminated", "message": "sandbox has terminated: oom_killed"}}
+            ).encode()
+        )
         conn.close(1001, "sandbox_terminated")
 
     ws.scripts.append(script)
@@ -310,7 +338,9 @@ async def test_status_frame_with_an_error(sandbox: AsyncSandbox, ws: FakeWSServe
     assert len(ws.sessions) == 1  # a terminal frame is final: no re-attach
 
 
-async def test_handshake_errors_are_mapped(sandbox: AsyncSandbox, server: FakeServer, ws: FakeWSServer, sleeps: list[float]) -> None:
+async def test_handshake_errors_are_mapped(
+    sandbox: AsyncSandbox, server: FakeServer, ws: FakeWSServer, sleeps: list[float]
+) -> None:
     ws.rejections.append((404, envelope("process_not_found", "no such process"), {}))
     with pytest.raises(sbx.CommandNotFoundError) as e:
         await sandbox.pty.connect("p9", lambda data: None)
@@ -350,7 +380,9 @@ async def test_ws_url_is_derived_from_the_base_url(server: FakeServer) -> None:
         ("https://example.com/prefix/", "wss://example.com/prefix/v1/x"),
     ):
         assert sbx.ConnectionConfig.resolve(base_url=base).ws_url("/v1/x") == wanted
-    sb = await AsyncSandbox.create("python", api_key=API_KEY, base_url="http://h:1", transport=server.transport())
+    sb = await AsyncSandbox.create(
+        "python", api_key=API_KEY, base_url="http://h:1", transport=server.transport()
+    )
     assert sb.config.ws_url("/v1/x") == "ws://h:1/v1/x"
 
 

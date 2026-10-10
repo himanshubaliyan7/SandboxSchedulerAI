@@ -5,18 +5,17 @@ from __future__ import annotations
 import posixpath
 from builtins import list as List
 from collections.abc import AsyncIterator, Iterable, Mapping
-from typing import IO, Any, Literal, Union, overload
+from typing import Any, Literal, Union, overload
 
 import httpx
 
 from .._config import describe, seg
 from ..errors import ConflictError, PathNotFoundError, TransportError
-from ..models import EntryInfo, WriteEntry, WriteInfo
+from ..models import EntryInfo, FileData, WriteEntry, WriteInfo
 from .api import AsyncApiClient
 
 CHUNK = 64 * 1024
 
-FileData = Union[str, bytes, bytearray, memoryview, IO[bytes], IO[str]]
 #: What ``write_files`` accepts for one file.
 FileSpec = Union[WriteEntry, Mapping[str, Any], "tuple[str, FileData]"]
 

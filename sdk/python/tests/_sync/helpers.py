@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-from sbx._async._compat import sleep
+from sbx._sync._compat import sleep
 
 BASE_URL = "http://sbx.test"
 

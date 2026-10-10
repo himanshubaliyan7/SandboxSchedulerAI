@@ -31,7 +31,12 @@ CASES: list[tuple[int, str, dict[str, Any], type[sbx.SbxError]]] = [
     (409, "conflict", {}, sbx.ConflictError),
     (409, "is_directory", {}, sbx.ConflictError),
     (409, "tag_in_use", {}, sbx.ConflictError),
-    (409, "sandbox_not_running", {"state": "destroyed", "reason": "idle_timeout"}, sbx.SandboxNotRunningError),
+    (
+        409,
+        "sandbox_not_running",
+        {"state": "destroyed", "reason": "idle_timeout"},
+        sbx.SandboxNotRunningError,
+    ),
     (409, "sandbox_terminated", {"state": "failed", "reason": "oom_killed"}, sbx.SandboxTerminatedError),
     (413, "payload_too_large", {}, sbx.PayloadTooLargeError),
     (413, "too_large", {}, sbx.PayloadTooLargeError),
@@ -135,9 +140,13 @@ async def test_retries_are_bounded(server: FakeServer, sleeps: list[float]) -> N
 
 
 async def test_retries_can_be_switched_off(server: FakeServer, sleeps: list[float]) -> None:
-    server.inject("POST", r"^/v1/sandboxes$", error(429, "rate_limited", retry_after=3, **{"class": "create"}))
+    server.inject(
+        "POST", r"^/v1/sandboxes$", error(429, "rate_limited", retry_after=3, **{"class": "create"})
+    )
     with pytest.raises(sbx.RateLimitError) as e:
-        await AsyncSandbox.create("python", api_key=API_KEY, transport=server.transport(), retry=RetryPolicy.none())
+        await AsyncSandbox.create(
+            "python", api_key=API_KEY, transport=server.transport(), retry=RetryPolicy.none()
+        )
     assert (e.value.retry_after, e.value.limit_class) == (3.0, "create")
     assert sleeps == [] and len(server.requests) == 1
 
@@ -170,7 +179,9 @@ async def test_quota_exceeded_is_not_retried_by_default(server: FakeServer, slee
     assert sleeps == [5.0]
 
 
-async def test_what_is_retried_depends_on_the_call(sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]) -> None:
+async def test_what_is_retried_depends_on_the_call(
+    sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]
+) -> None:
     # Idempotent GET: 502, 503 and 429 are all retried.
     server.inject(
         "GET",
@@ -221,7 +232,9 @@ async def test_connection_errors(sandbox: AsyncSandbox, server: FakeServer, slee
 
 
 async def test_error_event_envelope_helper() -> None:
-    err = sbx.errors.error_from_envelope(envelope("sandbox_terminated", "gone", state="failed", reason="oom_killed"))
+    err = sbx.errors.error_from_envelope(
+        envelope("sandbox_terminated", "gone", state="failed", reason="oom_killed")
+    )
     assert isinstance(err, sbx.SandboxTerminatedError)
     assert (err.status_code, err.reason, err.request_id) == (None, "oom_killed", "req-test")
     assert isinstance(sbx.errors.error_from_envelope("garbage", status_code=503), sbx.ServiceUnavailableError)

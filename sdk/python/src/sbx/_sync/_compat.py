@@ -5,6 +5,7 @@ Hand-written counterpart of ``sbx/_async/_compat.py``.
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from collections.abc import Callable
@@ -60,5 +61,12 @@ def spawn(fn: Callable[[], None], name: str) -> Task:
     return Task(thread)
 
 
+# websockets 17.1 turned ``connect()`` into a context manager and added
+# ``legacy=True`` for a plain connection; older versions do not know the flag.
+_LEGACY: dict[str, Any] = {"legacy": True} if "legacy" in inspect.signature(_ws_connect).parameters else {}
+_connect: Any = _ws_connect
+
+
 def ws_connect(uri: str, **kwargs: Any) -> ClientConnection:
-    return _ws_connect(uri, **kwargs)
+    connection: ClientConnection = _connect(uri, **kwargs, **_LEGACY)
+    return connection

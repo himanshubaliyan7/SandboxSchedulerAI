@@ -11,7 +11,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import IO, Any, Union
+from typing import Any, Protocol, Union
 
 __all__ = [
     "CommandEvent",
@@ -20,6 +20,7 @@ __all__ = [
     "EntryInfo",
     "ExitEvent",
     "ExitStatus",
+    "FileData",
     "NetworkPolicy",
     "PtyOutputEvent",
     "SandboxEvent",
@@ -32,6 +33,16 @@ __all__ = [
     "WriteEntry",
     "WriteInfo",
 ]
+
+
+class Readable(Protocol):
+    """A file-like object: anything with ``read(n)`` returning ``bytes`` or ``str``."""
+
+    def read(self, n: int = ..., /) -> bytes | str: ...
+
+
+#: What ``files.write`` accepts as content.
+FileData = Union[str, bytes, bytearray, memoryview, Readable]
 
 _TS = re.compile(r"^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?\s*([Zz]|[+-]\d{2}:?\d{2})?$")
 
@@ -465,5 +476,5 @@ class WriteEntry:
     """One file for ``files.write_files``."""
 
     path: str
-    data: str | bytes | IO[bytes] | IO[str]
+    data: FileData
     mode: str | int | None = None

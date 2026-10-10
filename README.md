@@ -98,6 +98,7 @@ work; see `bench/RESULTS.md` for method and limits.
 | `internal/pool` | Pool controller, refill, timers, sweeper and reconciler |
 | `internal/agentapi`, `internal/agentclient` | Host-to-agent wire contract and client |
 | `internal/egress` | Allowlist egress proxy with resolve-once IP validation |
+| `sdk/python`, `sdk/typescript` | E2B-shaped client SDKs (`sbx`, `sbx-sdk`) |
 | `test/e2e` | End-to-end test against real Podman and Postgres (`make e2e`) |
 | `bench` | Benchmark harness and results |
 | `docs/research` | The research notes and build plan this design follows |

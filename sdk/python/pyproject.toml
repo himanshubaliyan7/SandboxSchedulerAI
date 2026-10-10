@@ -26,7 +26,7 @@ dependencies = [
     # directions and pluggable transports (used by the tests).
     "httpx>=0.27,<1",
     # WebSocket client with sync and async APIs, for the PTY path.
-    "websockets>=14,<18",
+    "websockets>=15,<18",
 ]
 
 [project.optional-dependencies]
@@ -68,7 +68,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["ASYNC", "B017", "E501"]
+"tests/**" = ["ASYNC", "B017", "E501", "SIM117"]
 
 [tool.pyright]
 include = ["src", "tests", "examples", "scripts"]

@@ -58,7 +58,9 @@ async def test_write_and_read_text_and_bytes(sandbox: AsyncSandbox, server: Fake
         await sandbox.files.write("x", 42)  # type: ignore[arg-type]
 
 
-async def test_write_streams_file_like_objects(sandbox: AsyncSandbox, server: FakeServer, tmp_path: os.PathLike[str]) -> None:
+async def test_write_streams_file_like_objects(
+    sandbox: AsyncSandbox, server: FakeServer, tmp_path: os.PathLike[str]
+) -> None:
     payload = os.urandom(300_000)  # several 64 KiB chunks
     info = await sandbox.files.write("up/a.bin", io.BytesIO(payload))
     assert info.size == len(payload)
@@ -83,7 +85,9 @@ async def test_write_streams_file_like_objects(sandbox: AsyncSandbox, server: Fa
     assert one.reads > 4 and server.sandbox().files["/workspace/up/d.bin"] == payload
 
 
-async def test_upload_retries_only_what_can_be_rewound(sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]) -> None:
+async def test_upload_retries_only_what_can_be_rewound(
+    sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]
+) -> None:
     payload = os.urandom(200_000)
     server.inject("PUT", r"/files$", error(429, "rate_limited", retry_after=1))
     await sandbox.files.write("a.bin", io.BytesIO(payload))
@@ -116,7 +120,9 @@ async def test_read_stream(sandbox: AsyncSandbox, server: FakeServer) -> None:
         await sandbox.files.read("missing.bin", format="stream")
 
 
-async def test_a_download_cut_short_is_an_error(sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]) -> None:
+async def test_a_download_cut_short_is_an_error(
+    sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]
+) -> None:
     def broken() -> httpx.Response:
         return httpx.Response(200, headers={"Content-Length": "10"}, stream=ChunkStream([b"abc"], fail=True))
 
@@ -144,10 +150,24 @@ async def test_write_files(sandbox: AsyncSandbox, server: FakeServer) -> None:
             {"path": "d.txt", "data": "D"},
         ]
     )
-    assert written == [WriteInfo("a.txt", 1), WriteInfo("b/b.bin", 2), WriteInfo("/tmp/c.txt", 3), WriteInfo("d.txt", 1)]
+    assert written == [
+        WriteInfo("a.txt", 1),
+        WriteInfo("b/b.bin", 2),
+        WriteInfo("/tmp/c.txt", 3),
+        WriteInfo("d.txt", 1),
+    ]
     fake = server.sandbox()
-    assert fake.files == {"/workspace/a.txt": b"A", "/workspace/b/b.bin": b"BB", "/tmp/c.txt": b"CCC", "/workspace/d.txt": b"D"}
-    assert (fake.modes["/workspace/a.txt"], fake.modes["/tmp/c.txt"], fake.modes["/workspace/d.txt"]) == ("0640", "0600", "0644")
+    assert fake.files == {
+        "/workspace/a.txt": b"A",
+        "/workspace/b/b.bin": b"BB",
+        "/tmp/c.txt": b"CCC",
+        "/workspace/d.txt": b"D",
+    }
+    assert (fake.modes["/workspace/a.txt"], fake.modes["/tmp/c.txt"], fake.modes["/workspace/d.txt"]) == (
+        "0640",
+        "0600",
+        "0644",
+    )
     assert await sandbox.files.write_files([]) == []
 
 

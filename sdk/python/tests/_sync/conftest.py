@@ -7,9 +7,9 @@ from collections.abc import Iterator
 
 import pytest
 
-import sbx._async.api
-import sbx._async.commands
-import sbx._async.pty
+import sbx._sync.api
+import sbx._sync.commands
+import sbx._sync.pty
 from sbx import Sandbox
 
 from ..fake import API_KEY, FakeServer, FakeWSServer
@@ -29,7 +29,7 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     def fake_sleep(seconds: float) -> None:
         calls.append(seconds)
 
-    for module in (sbx._async.api, sbx._async.commands, sbx._async.pty):
+    for module in (sbx._sync.api, sbx._sync.commands, sbx._sync.pty):
         monkeypatch.setattr(module, "sleep", fake_sleep)
     return calls
 

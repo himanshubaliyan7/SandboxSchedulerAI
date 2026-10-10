@@ -57,7 +57,13 @@ async def test_non_zero_exit_raises_like_e2b(sandbox: AsyncSandbox, server: Fake
     with pytest.raises(sbx.CommandExitError) as e:
         await sandbox.commands.run("false")
     err = e.value
-    assert (err.exit_code, err.stdout, err.stderr, err.reason, err.signal) == (3, "partial\n", "boom\n", "exited", None)
+    assert (err.exit_code, err.stdout, err.stderr, err.reason, err.signal) == (
+        3,
+        "partial\n",
+        "boom\n",
+        "exited",
+        None,
+    )
     assert err.result.error == "exit status 3" and not err.result.ok
     assert "code 3" in str(err) and "boom" in str(err)
     assert not isinstance(err, sbx.ApiError)
@@ -69,7 +75,12 @@ async def test_check_false_returns_the_result(sandbox: AsyncSandbox, server: Fak
     assert (result.exit_code, result.stderr) == (3, "boom\n")
     server.programs.append(program(exit_code=137, reason="killed", signal="SIGKILL"))
     result = await sandbox.commands.run("x", check=False)
-    assert (result.exit_code, result.reason, result.signal, result.error) == (137, "killed", "SIGKILL", "killed")
+    assert (result.exit_code, result.reason, result.signal, result.error) == (
+        137,
+        "killed",
+        "SIGKILL",
+        "killed",
+    )
 
 
 async def test_command_timeout(sandbox: AsyncSandbox, server: FakeServer) -> None:
@@ -89,6 +100,10 @@ async def test_start_failures(sandbox: AsyncSandbox) -> None:
     assert e.value.code == "command_not_found" and e.value.status_code == 400
     with pytest.raises(sbx.CommandStartError):
         await sandbox.commands.run("/no/such/binary", args=[], background=True)
+
+
+def idle(cmd: FakeCommand) -> None:
+    """A command that keeps running and prints nothing."""
 
 
 def chatty(cmd: FakeCommand) -> None:
@@ -130,7 +145,9 @@ async def test_chunk_boundaries_anywhere(sandbox: AsyncSandbox, server: FakeServ
     assert not result.truncated
 
 
-async def test_reconnect_resumes_at_the_offset(sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]) -> None:
+async def test_reconnect_resumes_at_the_offset(
+    sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]
+) -> None:
     server.programs.append(chatty)
     # Connection 1 (the POST) dies after "start" + 3 events and half a line;
     # connection 2 after one more event; connection 3 completes.
@@ -193,7 +210,9 @@ async def test_truncated_at_attach(sandbox: AsyncSandbox, server: FakeServer) ->
     assert server.stream_requests[-1] == ("p1", 2500)
 
 
-async def test_stream_gives_up_after_bounded_reconnects(sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]) -> None:
+async def test_stream_gives_up_after_bounded_reconnects(
+    sandbox: AsyncSandbox, server: FakeServer, sleeps: list[float]
+) -> None:
     server.programs.append(chatty)
     handle = await sandbox.commands.run("x", background=True)
     server.cuts = [0] * 50  # every connection dies before a complete line
@@ -245,12 +264,18 @@ async def test_keepalives_and_a_stream_that_ends_early(sandbox: AsyncSandbox, se
     assert server.stream_requests == [("p1", 0), ("p1", 1), ("p1", 1), ("p1", 2)]
 
 
-async def test_error_event_ends_the_stream_with_the_mapped_error(sandbox: AsyncSandbox, server: FakeServer) -> None:
+async def test_error_event_ends_the_stream_with_the_mapped_error(
+    sandbox: AsyncSandbox, server: FakeServer
+) -> None:
     handle = await sandbox.commands.run("x", background=True)
     lines = [
         {"type": "stdout", "offset": 0, "data": base64.b64encode(b"ok").decode()},
         {"type": "from_the_future", "offset": 2},
-        {"type": "error", "offset": 0, "error": envelope("sandbox_terminated", "gone", state="failed", reason="oom_killed")["error"]},
+        {
+            "type": "error",
+            "offset": 0,
+            "error": envelope("sandbox_terminated", "gone", state="failed", reason="oom_killed")["error"],
+        },
     ]
     body = b"".join(json.dumps(line).encode() + b"\n" for line in lines)
     server.inject("GET", r"/stream$", httpx.Response(200, stream=ChunkStream([body])))
@@ -302,7 +327,12 @@ async def test_background_handle(sandbox: AsyncSandbox, server: FakeServer) -> N
     assert await handle.kill() is False  # already exited
     with pytest.raises(sbx.CommandExitError) as x:
         await handle.wait()
-    assert (x.value.exit_code, x.value.reason, x.value.signal, x.value.stdout) == (137, "killed", "SIGKILL", "ready\n")
+    assert (x.value.exit_code, x.value.reason, x.value.signal, x.value.stdout) == (
+        137,
+        "killed",
+        "SIGKILL",
+        "ready\n",
+    )
     assert handle.exit_code == 137
     # wait() is repeatable and does not read the stream again.
     n = len(server.stream_requests)
@@ -366,7 +396,7 @@ async def test_pty_output_in_the_ndjson_stream(sandbox: AsyncSandbox, server: Fa
 
 
 async def test_list_get_connect_kill_by_pid(sandbox: AsyncSandbox, server: FakeServer) -> None:
-    server.programs += [program(stdout=b"first"), lambda cmd: None]
+    server.programs += [program(stdout=b"first"), idle]
     await sandbox.commands.run("echo first")
     await sandbox.commands.run("sleep", args=["60"], background=True, tag="sleeper", stdin=True)
     listed = await sandbox.commands.list()

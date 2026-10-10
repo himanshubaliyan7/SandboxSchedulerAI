@@ -393,15 +393,18 @@ class Sandbox:
             self._api.json("GET", self._path("/stats"), plane="control", idempotent=True)
         )
 
-    def kill(self) -> bool:
+    def kill(self, *, wait: bool = False) -> bool:
         """Kill the sandbox and destroy its storage.
 
         Returns ``True`` if the server accepted the request and ``False``
-        if there is no such sandbox. The container may still be on its way
-        out when this returns; poll :meth:`is_running` if that matters.
+        if there is no such sandbox. By default the call returns as soon as
+        the sandbox is fenced (unusable, no longer counted against the
+        quota); the container is removed in the background. ``wait=True``
+        asks the server to answer only after the container is gone.
         """
+        params = {"wait": "true"} if wait else None
         try:
-            self._api.request("DELETE", self._path(), plane="control", idempotent=True)
+            self._api.request("DELETE", self._path(), plane="control", params=params, idempotent=True)
         except NotFoundError:
             return False
         return True

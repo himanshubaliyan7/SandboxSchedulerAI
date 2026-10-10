@@ -140,7 +140,7 @@ def test_output_is_acknowledged_in_small_steps(sandbox: Sandbox, ws: FakeWSServe
     steps = [b - a for a, b in zip([0, *acks], acks, strict=False)]
     assert max(steps) < 10_000 and min(steps) > 0
     assert total - acks[-1] < 10_000
-    assert [f for f in ws.sessions[0].frames if f[0] == 6][0] == b'\x06{"offset":9000}'
+    assert next(f for f in ws.sessions[0].frames if f[0] == 6) == b'\x06{"offset":9000}'
 
 
 def test_large_frames_are_acknowledged_one_by_one(sandbox: Sandbox, ws: FakeWSServer) -> None:

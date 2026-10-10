@@ -103,6 +103,10 @@ def test_start_failures(sandbox: Sandbox) -> None:
         sandbox.commands.run("/no/such/binary", args=[], background=True)
 
 
+def idle(cmd: FakeCommand) -> None:
+    """A command that keeps running and prints nothing."""
+
+
 def chatty(cmd: FakeCommand) -> None:
     cmd.output += [
         ("stdout", b"one\n"),
@@ -389,7 +393,7 @@ def test_pty_output_in_the_ndjson_stream(sandbox: Sandbox, server: FakeServer) -
 
 
 def test_list_get_connect_kill_by_pid(sandbox: Sandbox, server: FakeServer) -> None:
-    server.programs += [program(stdout=b"first"), lambda cmd: None]
+    server.programs += [program(stdout=b"first"), idle]
     sandbox.commands.run("echo first")
     sandbox.commands.run("sleep", args=["60"], background=True, tag="sleeper", stdin=True)
     listed = sandbox.commands.list()
