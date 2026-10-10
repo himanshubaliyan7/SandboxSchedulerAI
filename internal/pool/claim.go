@@ -99,6 +99,11 @@ func (c *Controller) Claim(ctx context.Context, tenantID, templateID string, opt
 		c.countClaim(err, false, 0)
 		return core.Sandbox{}, err
 	}
+	if !c.runtimeEnabled(tmpl) {
+		err := fmt.Errorf("%w: template %s names %q", ErrRuntimeNotEnabled, tmpl.ID, tmpl.Runtime)
+		c.countClaim(err, false, 0)
+		return core.Sandbox{}, err
+	}
 	policy, err := resolvePolicy(tmpl, opts.Network)
 	if err != nil {
 		c.countClaim(err, false, 0)

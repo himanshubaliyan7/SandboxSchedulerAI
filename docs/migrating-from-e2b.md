@@ -90,7 +90,7 @@ sandbox than E2B. It is a weaker isolation boundary with a lighter footprint.
 | PTY | `sandbox.pty` | `sandbox.pty`, with a different `create` signature in Python. |
 | Files | `sandbox.files` | `sandbox.files`: `read`, `write`, `list`, `exists`, `get_info`, `make_dir`, `remove`. Python also has `write_files`. No `rename`, no `watch_dir`. |
 | Network policy | Internet on by default; `allow_internet_access`, `network={"allow_out", "deny_out"}`, `update_network` | Off by default. `network=NetworkPolicy(mode=..., allow_domains=[...])`, `update_network`. See below. |
-| Events and webhooks | A lifecycle events API and webhooks (listed in the documentation index; not read in detail) | `sandbox.events()` returns the sandbox's event log (`claimed`, `transition`, `command_started`, `command_finished`). Webhooks are on the roadmap; check the README for their current state. |
+| Events and webhooks | A lifecycle events API and webhooks (listed in the documentation index; not read in detail) | `sandbox.events()` returns the sandbox's event log (`claimed`, `transition`, `command_started`, `command_finished`). Lifecycle webhooks (`sandbox.created`, `sandbox.running`, `sandbox.terminated`, `sandbox.destroyed`, `command.started`, `command.finished`) push the same events to an HTTPS endpoint, signed and retried; see [`webhooks.md`](webhooks.md). |
 | Resource usage | `get_metrics` | `sandbox.stats()` (Python), `sandbox.getStats()` (TypeScript): cgroup counters. |
 | Port exposure | `get_host(port)` | No equivalent. |
 | Code interpreter | `e2b_code_interpreter`, `run_code` | No equivalent. |

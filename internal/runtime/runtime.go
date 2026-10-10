@@ -65,6 +65,12 @@ var (
 
 // Capabilities describes what a backend can do. Backends are not uniform
 // and callers must check instead of assuming.
+//
+// Pause and SharedKernel are the answer for the backend as a whole, and
+// so the pessimistic one when its runtimes differ: SharedKernel is true
+// as soon as one enabled runtime shares the host kernel, Pause only if
+// every one can pause. Runtimes has the answer per runtime, which is the
+// one that applies to a template.
 type Capabilities struct {
 	Pause         bool
 	Snapshot      bool
@@ -73,6 +79,21 @@ type Capabilities struct {
 	Rootless      bool
 	NetworkModes  []core.NetworkMode
 	RuntimeLabels []string // e.g. "crun", "runsc"
+	// Runtimes describes each enabled runtime (isolation tier), in the
+	// order of RuntimeLabels.
+	Runtimes []RuntimeInfo
+}
+
+// RuntimeInfo is what differs between the isolation tiers of one backend.
+type RuntimeInfo struct {
+	// Name is what a template's Runtime field says: "crun", "runsc".
+	Name string `json:"name"`
+	// SharedKernel is true when sandboxes of this runtime run directly on
+	// the host kernel (crun, runc), false when a kernel of their own
+	// stands in between (gVisor's user-space kernel, a microVM's guest).
+	SharedKernel bool `json:"shared_kernel"`
+	// Pause says whether Pause and Unpause work for this runtime.
+	Pause bool `json:"pause"`
 }
 
 // Spec is everything needed to create one instance.

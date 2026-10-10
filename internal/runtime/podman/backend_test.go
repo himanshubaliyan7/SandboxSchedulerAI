@@ -90,7 +90,7 @@ func libpodError(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(map[string]any{"cause": "root cause", "message": msg, "response": status})
 }
 
-const inspectRunning = `{"Id":"cid1","Created":"2026-10-09T10:00:00.5Z",
+const inspectRunning = `{"Id":"cid1","Created":"2026-10-09T10:00:00.5Z","OCIRuntime":"crun",
  "State":{"Status":"running","Running":true,"Paused":false,"OOMKilled":false,
           "CgroupPath":"/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-cid1.scope"},
  "Config":{"Labels":{"sbx.managed":"true","sbx.sandbox_id":"sb-123","sbx.generation":"4","sbx.agent_epoch":"epoch-9","sbx.template_id":"py312"}}}`
@@ -436,5 +436,94 @@ func TestErrorHandling(t *testing.T) {
 	}
 	if _, err := dead.List(context.Background()); err == nil {
 		t.Error("list on a missing socket succeeded")
+	}
+}
+
+// A Podman service runs every container with its default runtime and
+// ignores the one in the request. Create must notice.
+func TestCreateRefusesAnotherRuntimeThanAsked(t *testing.T) {
+	removed := false
+	f := &fakePodman{version: "4.9.3"}
+	f.handler = func(w http.ResponseWriter, r *http.Request, _ string) bool {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v4.9.3/libpod/containers/create":
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"Id":"cid1"}`)
+		case "POST /v4.9.3/libpod/containers/cid1/start":
+			w.WriteHeader(http.StatusNoContent)
+		case "GET /v4.9.3/libpod/containers/cid1/json":
+			io.WriteString(w, inspectRunning) // OCIRuntime: crun
+		case "DELETE /v4.9.3/libpod/containers/cid1":
+			removed = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			return false
+		}
+		return true
+	}
+	// The same fake stands in for both services.
+	var sock string
+	b := startFake(t, f, func(c *Config) {
+		sock = c.SocketPath
+		c.Runtimes = []string{"crun", "runsc"}
+		c.RuntimeSockets = map[string]string{"runsc": c.SocketPath}
+	})
+	spec := testSpec()
+	spec.Template.Runtime = "runsc"
+	_, err := b.Create(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), `OCI runtime "crun" although "runsc" was asked`) || !strings.Contains(err.Error(), sock) {
+		t.Fatalf("Create with the wrong runtime: %v", err)
+	}
+	if !removed {
+		t.Error("the container that ran with the wrong runtime was not removed")
+	}
+}
+
+// A second runtime needs a service of its own; creates go to it,
+// everything else to the default service.
+func TestCreateGoesToTheRuntimesService(t *testing.T) {
+	respond := func(rt string) func(http.ResponseWriter, *http.Request, string) bool {
+		return func(w http.ResponseWriter, r *http.Request, _ string) bool {
+			switch r.Method + " " + r.URL.Path {
+			case "POST /v4.9.3/libpod/containers/create":
+				w.WriteHeader(http.StatusCreated)
+				io.WriteString(w, `{"Id":"cid1"}`)
+			case "POST /v4.9.3/libpod/containers/cid1/start":
+				w.WriteHeader(http.StatusNoContent)
+			case "GET /v4.9.3/libpod/containers/cid1/json":
+				io.WriteString(w, strings.Replace(inspectRunning, `"OCIRuntime":"crun"`, `"OCIRuntime":"`+rt+`"`, 1))
+			default:
+				return false
+			}
+			return true
+		}
+	}
+	gv := &fakePodman{version: "4.9.3", handler: respond("runsc")}
+	gb := startFake(t, gv, nil)
+	def := &fakePodman{version: "4.9.3", handler: respond("runsc")}
+	b := startFake(t, def, func(c *Config) {
+		c.Runtimes = []string{"crun", "runsc"}
+		c.RuntimeSockets = map[string]string{"runsc": gb.Config().SocketPath}
+	})
+	spec := testSpec()
+	spec.Template.Runtime = "runsc"
+	if _, err := b.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	paths := func(f *fakePodman) string {
+		var out []string
+		for _, r := range f.requests() {
+			out = append(out, r.Method+" "+strings.TrimPrefix(r.Path, "/v4.9.3/libpod"))
+		}
+		return strings.Join(out, ",")
+	}
+	if got := paths(gv); got != "GET /_ping,POST /containers/create,POST /containers/cid1/start" {
+		t.Errorf("runsc service saw: %s", got)
+	}
+	if got := paths(def); got != "GET /_ping,GET /containers/cid1/json" {
+		t.Errorf("default service saw: %s", got)
+	}
+	if _, err := New(Config{SocketPath: "/s", Runtimes: []string{"crun", "runsc"}}); err == nil || !strings.Contains(err.Error(), "service of its own") {
+		t.Errorf("a second runtime without a service was accepted: %v", err)
 	}
 }

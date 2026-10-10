@@ -49,7 +49,7 @@ func newDatabase(t *testing.T, adminURL, name string) string {
 // sandboxes that are running, by sandbox id.
 func (e *env) containerIDs(t *testing.T) map[string]string {
 	t.Helper()
-	out := run(t, "podman", "ps", "--no-trunc", "--filter", "label=sbx.host_id="+e.hostID, "--filter", "status=running",
+	out := runPodman(t, "ps", "--no-trunc", "--filter", "label=sbx.host_id="+e.hostID, "--filter", "status=running",
 		"--format", `{{index .Labels "sbx.sandbox_id"}} {{.ID}}`)
 	ids := map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -79,11 +79,8 @@ func TestTwoServersShareOnePodman(t *testing.T) {
 	if adminURL == "" {
 		t.Fatal("SBX_E2E_DATABASE_URL is not set")
 	}
-	xdg := os.Getenv("XDG_RUNTIME_DIR")
-	if _, err := os.Stat(filepath.Join(xdg, "podman", "podman.sock")); xdg == "" || err != nil {
-		t.Fatalf("no Podman socket under XDG_RUNTIME_DIR=%q: %v", xdg, err)
-	}
-	if err := exec.Command("podman", "image", "exists", imgAlpine).Run(); err != nil {
+	xdg := e2eSetup(t)
+	if err := podmanCLI("image", "exists", imgAlpine).Run(); err != nil {
 		t.Fatalf("image %s is not pulled for this user", imgAlpine)
 	}
 	bin := buildBinaries(t)
@@ -181,7 +178,7 @@ func TestTwoServersShareOnePodman(t *testing.T) {
 	for _, s := range []*side{a, b} {
 		id := "sb-" + randHex(8)
 		orphans[s] = id
-		run(t, "podman", "run", "-d", "--name", "sbx-"+id, "--network", "none", "--label", "sbx.managed=true",
+		runPodman(t, "run", "-d", "--name", "sbx-"+id, "--network", "none", "--label", "sbx.managed=true",
 			"--label", "sbx.host_id="+s.hostID, "--label", "sbx.sandbox_id="+id, "--label", "sbx.generation=0", imgAlpine, "sleep", "600")
 	}
 	waitFor(t, "each server to reap its own orphan", 30*time.Second, func() bool {
@@ -189,7 +186,7 @@ func TestTwoServersShareOnePodman(t *testing.T) {
 	})
 	time.Sleep(7 * time.Second)
 	for s, id := range orphans {
-		if err := exec.Command("podman", "container", "exists", "sbx-"+id).Run(); err == nil {
+		if err := podmanCLI("container", "exists", "sbx-"+id).Run(); err == nil {
 			t.Errorf("server %s did not remove its orphan %s", s.hostID, id)
 		}
 	}

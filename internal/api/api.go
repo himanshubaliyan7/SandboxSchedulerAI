@@ -97,11 +97,19 @@ type Config struct {
 	// ValidatePolicy rejects a network policy the egress proxy would not
 	// accept (egress.ValidatePolicy). Nil accepts everything the pool does.
 	ValidatePolicy func(core.NetworkPolicy) error
+	// RuntimeInfo describes the isolation tier a template's runtime name
+	// stands for on this server (runtime.Capabilities.Runtimes); ok is
+	// false for a runtime the server has not enabled. It feeds
+	// shared_kernel in GET /v1/templates. Nil leaves the field out.
+	RuntimeInfo func(name string) (info runtime.RuntimeInfo, ok bool)
 	// Ready is the readiness probe behind GET /readyz. Nil means ready.
 	Ready func(ctx context.Context) error
 	// ExtraMetrics is called at the end of GET /metrics to append
 	// metrics owned by other components, in Prometheus text format.
 	ExtraMetrics func(w io.Writer)
+	// Webhooks serves the /v1/webhooks routes (webhooks.go). Nil leaves
+	// the routes in place, answering 501: the server runs without webhooks.
+	Webhooks Webhooks
 	// MetricsToken, when not empty, is required as a bearer token
 	// ("Authorization: Bearer <token>") by GET /metrics, on the main
 	// handler and on MetricsHandler alike. Empty means no authentication.
@@ -264,6 +272,7 @@ func (s *Server) routes() {
 	s.tenant("GET /v1/sandboxes/{id}/events", classDefault, s.handleEvents)
 	s.tenant("GET /v1/sandboxes/{id}/stats", classDefault, s.handleStats)
 	s.tenant("GET /v1/templates", classDefault, s.handleListTemplates)
+	s.webhookRoutes()
 
 	// Data plane: tenant API key or the sandbox's access token.
 	s.data("POST /v1/sandboxes/{id}/commands", s.handleStartCommand)

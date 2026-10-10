@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -24,6 +25,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman"
 )
 
 // Status is the outcome of one check.
@@ -129,6 +132,7 @@ const (
 	CheckKernel           = "kernel_version"
 	CheckPodman           = "podman_binary"
 	CheckPodmanSocket     = "podman_socket"
+	CheckPodmanService    = "podman_service" // replaces podman_socket when the server manages its own service
 	CheckCrun             = "crun"
 	CheckRunsc            = "runsc"
 	CheckKVM              = "kvm"
@@ -169,8 +173,29 @@ type Options struct {
 	// session ends.
 	RequireLinger bool
 	// RequireRunsc makes a missing runsc a failure (a pool uses the
-	// gVisor tier). By default it is informational.
+	// gVisor tier). By default it is informational. Listing runsc in
+	// Runtimes has the same effect.
 	RequireRunsc bool
+	// Runtimes are the OCI runtimes the server has enabled, each with an
+	// optional explicit path. Default: crun, looked up in PATH. An
+	// enabled runtime that cannot be used is a failure; runsc, when not
+	// enabled, is only reported.
+	Runtimes []Runtime
+
+	// ManagedPodman says the server starts its own Podman service with a
+	// generated configuration (keyring off, no default sysctls) instead of
+	// using an existing socket. The socket check is then replaced by a
+	// check that such a service can be started, and the kernel keyring
+	// quota no longer limits the number of sandboxes.
+	ManagedPodman bool
+	// SkipServiceProbe leaves out the trial start of a managed service
+	// (the server does: it is about to start the real one).
+	SkipServiceProbe bool
+	// ProbeService starts a throwaway managed Podman service, checks that
+	// it answers and stops it again; it returns the Libpod API version.
+	// Default: podman.StartService in a temporary directory under
+	// XDG_RUNTIME_DIR.
+	ProbeService func(ctx context.Context) (string, error)
 	// Thresholds; zero means the default.
 	MinSubIDs           int64  // default 65536
 	MinInotifyInstances int64  // default 1024
@@ -191,6 +216,12 @@ type Options struct {
 	// user's processes in /proc. It is only called when PlannedSandboxes
 	// is positive.
 	InotifyInUse func() (int64, error)
+}
+
+// Runtime is one enabled OCI runtime.
+type Runtime struct {
+	Name string
+	Path string // "" means: look Name up in PATH
 }
 
 // Controllers the pool user must (and should) have delegated.
@@ -250,6 +281,12 @@ func newEnv(ctx context.Context, opts Options) env {
 	if e.PingSocket == nil {
 		e.PingSocket = pingSocket
 	}
+	if e.ProbeService == nil {
+		e.ProbeService = func(ctx context.Context) (string, error) { return probeService(ctx, e.Getenv("XDG_RUNTIME_DIR")) }
+	}
+	if len(e.Runtimes) == 0 {
+		e.Runtimes = []Runtime{{Name: "crun"}}
+	}
 	if e.MinSubIDs == 0 {
 		e.MinSubIDs = 65536
 	}
@@ -295,7 +332,7 @@ func (e env) run() Report {
 		e.nofile(),
 		e.kernel(),
 		e.podman(),
-		e.podmanSocket(),
+		e.podmanService(),
 		e.crun(),
 		e.runsc(),
 		e.kvm(),
@@ -565,7 +602,8 @@ func inotifyInUse(uid int) (int64, error) {
 	return n, nil
 }
 
-const keyringFix = "set `keyring = false` under `[containers]` in ~/.config/containers/containers.conf and restart the Podman service " +
+const keyringFix = "let sbxd run its own Podman service (--podman-mode managed, the default without --podman-socket), which takes no keys; or " +
+	"set `keyring = false` under `[containers]` in ~/.config/containers/containers.conf and restart the Podman service " +
 	"(`systemctl --user restart podman.service`) so that containers stop taking a session keyring, " +
 	"or as root raise the quota: sysctl -w kernel.keys.maxkeys=<n> (persist it in /etc/sysctl.d); " +
 	"until then keep the sum of the templates' max_total below the room that is left"
@@ -589,6 +627,10 @@ func (e env) keys() Check {
 		return warn(CheckKeys, fmt.Sprintf("kernel.keys.maxkeys=%d; cannot read the user's usage from /proc/key-users: %v", maxKeys, errText(err)), "")
 	}
 	room := max(maxKeys-used, 0)
+	if e.ManagedPodman {
+		return ok(CheckKeys, fmt.Sprintf("kernel.keys.maxkeys=%d, %d in use by %s; sbxd's own Podman service runs with keyring = false, "+
+			"so sandboxes take no key and this quota does not limit them", maxKeys, used, e.userOrUID()))
+	}
 	if file := e.keyringDisabledIn(); file != "" {
 		return ok(CheckKeys, fmt.Sprintf("kernel.keys.maxkeys=%d, %d in use by %s; %s sets keyring = false, so sandboxes take no key "+
 			"(provided the Podman service was started after that was set)", maxKeys, used, e.userOrUID(), file))
@@ -749,6 +791,25 @@ func (e env) podman() Check {
 	return ok(CheckPodman, fmt.Sprintf("%s: version %s", path, ver))
 }
 
+// podmanService is the check of the Podman API the server will use: an
+// existing socket, or its own service.
+func (e env) podmanService() Check {
+	if !e.ManagedPodman {
+		return e.podmanSocket()
+	}
+	if e.SkipServiceProbe {
+		return info(CheckPodmanService, "managed: sbxd starts its own `podman system service` (keyring off, no default sysctls) under its run dir")
+	}
+	ctx, cancel := context.WithTimeout(e.ctx, 40*time.Second)
+	defer cancel()
+	ver, err := e.ProbeService(ctx)
+	if err != nil {
+		return fail(CheckPodmanService, "a private `podman system service` could not be started: "+errText(err),
+			"check `podman info` for this user; or use an existing service with --podman-socket (--podman-mode external)")
+	}
+	return ok(CheckPodmanService, "managed: a private `podman system service` with sbxd's configuration starts and answers (Libpod API "+ver+")")
+}
+
 func (e env) podmanSocket() Check {
 	socket := e.PodmanSocket
 	if socket == "" {
@@ -771,25 +832,81 @@ func (e env) podmanSocket() Check {
 	return ok(CheckPodmanSocket, fmt.Sprintf("%s: Libpod API %s", socket, ver))
 }
 
-func (e env) crun() Check {
-	path, err := e.LookPath("crun")
-	if err != nil {
-		return fail(CheckCrun, "crun not found in PATH (it is the default OCI runtime)", "install crun (apt install crun / dnf install crun)")
+// enabled returns the enabled runtime with the given name.
+func (e env) enabled(name string) (Runtime, bool) {
+	for _, r := range e.Runtimes {
+		if r.Name == name {
+			return r, true
+		}
 	}
-	return ok(CheckCrun, e.versioned(path))
+	return Runtime{}, false
 }
 
+// locate finds a runtime's binary: its explicit path, or PATH.
+func (e env) locate(r Runtime, name string) (string, error) {
+	if r.Path != "" {
+		if !e.exists(r.Path) {
+			return "", fmt.Errorf("%s does not exist", r.Path)
+		}
+		return r.Path, nil
+	}
+	return e.LookPath(name)
+}
+
+func (e env) crun() Check {
+	r, _ := e.enabled("crun")
+	path, err := e.locate(r, "crun")
+	if err != nil {
+		if r.Path != "" {
+			return fail(CheckCrun, "crun: "+err.Error(), "fix the path given for crun in --runtimes")
+		}
+		return fail(CheckCrun, "crun not found in PATH (it is the default OCI runtime)", "install crun (apt install crun / dnf install crun)")
+	}
+	return ok(CheckCrun, e.versioned(path)+"; enabled (sandboxes share the host kernel)")
+}
+
+// runsc: the gVisor tier. When it is enabled it must be usable: the
+// binary runs, and the user's systemd manager accepts a transient scope
+// with limits, which is how a gVisor sandbox gets its limits under a
+// rootless engine (see package runscshim).
 func (e env) runsc() Check {
-	path, err := e.LookPath("runsc")
+	r, isEnabled := e.enabled("runsc")
+	required := isEnabled || e.RequireRunsc
+	path, err := e.locate(r, "runsc")
 	if err != nil {
 		detail := "runsc (gVisor) not found: the hardened no-KVM tier is unavailable; crun sandboxes share the host kernel"
-		fix := "install gVisor (https://gvisor.dev/docs/user_guide/install/) and register it under [engine.runtimes] in containers.conf"
-		if e.RequireRunsc {
+		if r.Path != "" {
+			detail = "runsc (gVisor): " + err.Error()
+		}
+		fix := "install gVisor (https://gvisor.dev/docs/user_guide/install/) and enable it with --runtimes crun,runsc=/path/to/runsc"
+		if required {
 			return fail(CheckRunsc, detail, fix)
 		}
 		return info(CheckRunsc, detail)
 	}
-	return ok(CheckRunsc, e.versioned(path))
+	out, err := e.Run(e.ctx, path, "--version")
+	version, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	if err != nil {
+		detail := fmt.Sprintf("%s --version failed: %v", path, err)
+		if required {
+			return fail(CheckRunsc, detail, "check that the file is a runsc binary for this architecture and is executable")
+		}
+		return info(CheckRunsc, detail)
+	}
+	found := path + ": " + strings.TrimSpace(version)
+	if !isEnabled {
+		return info(CheckRunsc, found+"; not enabled (enable the gVisor tier with --runtimes crun,runsc)")
+	}
+	sdrun, err := e.LookPath("systemd-run")
+	if err != nil {
+		return fail(CheckRunsc, found+"; enabled, but systemd-run is not in PATH: a gVisor sandbox gets its resource limits from a transient systemd scope",
+			"install systemd-run (it is part of systemd)")
+	}
+	if out, err := e.Run(e.ctx, sdrun, "--user", "--scope", "--quiet", "--collect", "-p", "MemoryMax=67108864", "-p", "TasksMax=64", "--", "true"); err != nil {
+		return fail(CheckRunsc, fmt.Sprintf("%s; enabled, but the user's systemd manager refused a transient scope with limits: %v: %s", found, err, strings.TrimSpace(out)),
+			"run sbxd from a session with a systemd user manager (XDG_RUNTIME_DIR set, `systemctl --user status` works) and delegated cpu, memory and pids controllers")
+	}
+	return ok(CheckRunsc, found+"; enabled and usable (user-space kernel; limits through systemd scopes)")
 }
 
 // versioned returns "path: <first line of --version>".
@@ -834,6 +951,33 @@ func (e env) userOrUID() string {
 		return e.Username
 	}
 	return strconv.Itoa(e.UID)
+}
+
+// probeService is the default Options.ProbeService.
+func probeService(ctx context.Context, runtimeDir string) (string, error) {
+	if runtimeDir == "" {
+		return "", errors.New("XDG_RUNTIME_DIR is not set")
+	}
+	dir, err := os.MkdirTemp(runtimeDir, "sbx-pf-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	crun, err := exec.LookPath("crun")
+	if err != nil {
+		return "", err
+	}
+	socket := filepath.Join(dir, "podman.sock")
+	svc, err := podman.StartService(ctx, podman.ServiceConfig{
+		Dir: filepath.Join(dir, "podman"), SocketPath: socket,
+		Runtimes: []podman.OCIRuntime{{Name: "crun", Path: crun}},
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		return "", err
+	}
+	defer svc.Stop(context.WithoutCancel(ctx))
+	return pingSocket(ctx, socket)
 }
 
 // pingSocket is the default Options.PingSocket.

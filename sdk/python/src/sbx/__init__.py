@@ -20,6 +20,7 @@ from ._async import (
     AsyncPty,
     AsyncPtyHandle,
     AsyncSandbox,
+    AsyncWebhooks,
 )
 from ._config import ConnectionConfig, RetryPolicy
 from ._sync import (
@@ -30,6 +31,7 @@ from ._sync import (
     Pty,
     PtyHandle,
     Sandbox,
+    Webhooks,
 )
 from ._version import __version__
 from .errors import (
@@ -82,8 +84,18 @@ from .models import (
     WriteEntry,
     WriteInfo,
 )
+from .webhooks import (
+    WEBHOOK_EVENT_TYPES,
+    Webhook,
+    WebhookDelivery,
+    WebhookEvent,
+    WebhookTestResult,
+    WebhookVerificationError,
+    verify_webhook,
+)
 
 __all__ = [
+    "WEBHOOK_EVENT_TYPES",
     "AgentUnavailableError",
     "ApiError",
     "AsyncCommandHandle",
@@ -93,6 +105,7 @@ __all__ = [
     "AsyncPty",
     "AsyncPtyHandle",
     "AsyncSandbox",
+    "AsyncWebhooks",
     "AuthenticationError",
     "CommandEvent",
     "CommandExitError",
@@ -144,7 +157,14 @@ __all__ = [
     "TemplateNotFoundError",
     "TransportError",
     "TruncatedEvent",
+    "Webhook",
+    "WebhookDelivery",
+    "WebhookEvent",
+    "WebhookTestResult",
+    "WebhookVerificationError",
+    "Webhooks",
     "WriteEntry",
     "WriteInfo",
     "__version__",
+    "verify_webhook",
 ]

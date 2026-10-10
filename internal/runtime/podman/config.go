@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
 // UsernsMode selects how container UIDs map to host UIDs. It is one fixed
@@ -109,6 +111,22 @@ type Config struct {
 	// It also drives Capabilities().SharedKernel.
 	Runtimes []string
 
+	// RuntimeSockets maps each runtime other than DefaultRuntime to the
+	// API socket of a Podman service whose default OCI runtime it is.
+	//
+	// A Podman service runs every container it creates with its own
+	// default runtime: the create request has an "oci_runtime" field, but
+	// Podman 4.9.3 ignores it (pkg/specgen/generate never reads it; only
+	// the global --runtime option and containers.conf select a runtime).
+	// A second tier therefore needs a second service, and sandboxes of a
+	// runtime are created and started through that runtime's service.
+	// Everything else (inspect, list, remove, pause) goes through the
+	// default service, which works because the services share one
+	// container store and one runtime table. A runtime listed in Runtimes
+	// without a socket here cannot be used and is rejected by New, and
+	// Create checks that Podman really used the runtime that was asked.
+	RuntimeSockets map[string]string
+
 	// UsernsMode is the fixed user-namespace mapping; see UsernsMode.
 	// Default UsernsKeepID.
 	UsernsMode UsernsMode
@@ -133,6 +151,16 @@ type Config struct {
 	// ShmBytes caps /dev/shm. Default 16 MiB. It is charged to the memory
 	// cgroup like the other tmpfs mounts.
 	ShmBytes int64
+
+	// OOMEvidenceDirs are the working directories of the Podman services
+	// that start this backend's containers, and nobody else's (managed
+	// services: Service.WorkDir). When set, an exited container is
+	// reported as OOM-killed only if conmon left its "oom" file in one of
+	// them around the time the container ended, and the backend consumes
+	// those files (call Close when done). When empty, exit code 137 alone
+	// is taken as an OOM kill. They must never be directories other
+	// programs use.
+	OOMEvidenceDirs []string
 
 	// CgroupRoot is where cgroup v2 is mounted; injectable for tests.
 	// Default /sys/fs/cgroup.
@@ -186,6 +214,12 @@ func (cfg Config) withDefaults() (Config, error) {
 	if !found {
 		return cfg, fmt.Errorf("podman: DefaultRuntime %q is not in Runtimes %v", cfg.DefaultRuntime, cfg.Runtimes)
 	}
+	for _, r := range cfg.Runtimes {
+		if r != cfg.DefaultRuntime && cfg.RuntimeSockets[r] == "" {
+			return cfg, fmt.Errorf("podman: runtime %q has no service of its own (RuntimeSockets): one Podman service runs one OCI runtime, "+
+				"so a second runtime needs a second service; sbxd starts one per runtime in managed mode", r)
+		}
+	}
 	switch cfg.UsernsMode {
 	case "":
 		cfg.UsernsMode = UsernsKeepID
@@ -233,6 +267,15 @@ var isolatedRuntimes = map[string]bool{
 	"runsc": true, // gVisor: user-space kernel
 	"krun":  true, // libkrun microVM
 	"kata":  true, // Kata Containers VM
+}
+
+// RuntimeInfo describes one OCI runtime as this backend runs it.
+//
+// Pause: crun freezes the container's cgroup. runsc pauses the sandbox
+// from inside the sentry (`runsc pause`), which Podman drives the same
+// way; both were checked on Podman 4.9.3 (integration tests).
+func RuntimeInfo(ociRuntime string) runtime.RuntimeInfo {
+	return runtime.RuntimeInfo{Name: ociRuntime, SharedKernel: SharedKernel(ociRuntime), Pause: true}
 }
 
 // SharedKernel reports whether sandboxes run by the given OCI runtime share

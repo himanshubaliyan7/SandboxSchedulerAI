@@ -528,10 +528,17 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, tenant stor
 
 // TemplateView is what a tenant may know about a template.
 type TemplateView struct {
-	ID            string         `json:"id"`
-	Version       int64          `json:"version"`
-	Image         string         `json:"image"`
-	Runtime       string         `json:"runtime"`
+	ID      string `json:"id"`
+	Version int64  `json:"version"`
+	Image   string `json:"image"`
+	// Runtime is the isolation tier: "crun" (a hardened container on the
+	// host kernel) or "runsc" (gVisor: a user-space kernel between the
+	// sandbox and the host).
+	Runtime string `json:"runtime"`
+	// SharedKernel says whether sandboxes of this template run directly
+	// on the host kernel. It is omitted when the server cannot say (the
+	// template names a runtime the server has not enabled).
+	SharedKernel  *bool          `json:"shared_kernel,omitempty"`
 	Resources     core.Resources `json:"resources"`
 	Network       string         `json:"network"`
 	IdleTimeoutMs int64          `json:"idle_timeout_ms"`
@@ -547,8 +554,14 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request, _ s
 	}
 	out := make([]TemplateView, 0, len(templates))
 	for _, t := range templates {
-		out = append(out, TemplateView{ID: t.ID, Version: t.Version, Image: t.Image, Runtime: t.Runtime, Resources: t.Resources,
-			Network: string(t.Network), IdleTimeoutMs: t.Timeouts.Idle.Milliseconds(), MaxLifetimeMs: t.Timeouts.MaxLifetime.Milliseconds()})
+		v := TemplateView{ID: t.ID, Version: t.Version, Image: t.Image, Runtime: t.Runtime, Resources: t.Resources,
+			Network: string(t.Network), IdleTimeoutMs: t.Timeouts.Idle.Milliseconds(), MaxLifetimeMs: t.Timeouts.MaxLifetime.Milliseconds()}
+		if s.cfg.RuntimeInfo != nil {
+			if info, ok := s.cfg.RuntimeInfo(t.Runtime); ok {
+				v.SharedKernel = &info.SharedKernel
+			}
+		}
+		out = append(out, v)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"templates": out})
 	return nil

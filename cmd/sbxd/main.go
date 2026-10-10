@@ -27,6 +27,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman/runscshim"
 	"github.com/himanshubaliyan7/warmbox/internal/server"
 )
 
@@ -62,6 +64,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdPreflight(args[1:], stdout, stderr)
 	case "admin":
 		err = cmdAdmin(args[1:], stdout, stderr)
+	case "runsc-shim":
+		// Not for people: Podman runs this, through a generated wrapper,
+		// as the OCI runtime of the gVisor tier.
+		return runscshim.Main(args[1:], stderr)
 	case "version", "--version", "-version":
 		fmt.Fprintln(stdout, "sbxd", version)
 	case "help", "-h", "--help":
@@ -188,6 +194,7 @@ func cmdServe(args []string, stderr io.Writer) error {
 		permitPrivate       string
 		maxUpload           string
 		corsOrigins         string
+		runtimes, runscArgs string
 	)
 	fs.StringVar(&cfg.DatabaseURL, "database-url", envStr("SBX_DATABASE_URL", ""), "Postgres URL [SBX_DATABASE_URL] (required)")
 	fs.StringVar(&cfg.Listen, "listen", envStr("SBX_LISTEN", "127.0.0.1:8080"), "API listen address [SBX_LISTEN]")
@@ -199,8 +206,16 @@ func cmdServe(args []string, stderr io.Writer) error {
 		"path of the static sbx-agent binary [SBX_AGENT_BINARY] (default: sbx-agent next to sbxd)")
 	fs.StringVar(&cfg.RunDir, "run-dir", envStr("SBX_RUN_DIR", server.DefaultRunDir()),
 		"directory for per-sandbox sockets; keep it short [SBX_RUN_DIR]")
+	fs.StringVar(&cfg.PodmanMode, "podman-mode", envStr("SBX_PODMAN_MODE", ""),
+		"managed: sbxd starts and supervises its own Podman service under the run dir, with its own configuration "+
+			"(no kernel key per sandbox, no default sysctls); external: use an existing Podman socket [SBX_PODMAN_MODE] "+
+			"(default managed, or external when --podman-socket is given)")
 	fs.StringVar(&cfg.PodmanSocket, "podman-socket", envStr("SBX_PODMAN_SOCKET", ""),
-		"Podman API socket [SBX_PODMAN_SOCKET] (default $XDG_RUNTIME_DIR/podman/podman.sock)")
+		"Podman API socket of an existing service; implies --podman-mode external [SBX_PODMAN_SOCKET] "+
+			"(default in external mode: $XDG_RUNTIME_DIR/podman/podman.sock)")
+	addRuntimeFlags(fs, &runtimes)
+	fs.StringVar(&runscArgs, "runsc-flags", envStr("SBX_RUNSC_FLAGS", ""),
+		"extra runsc flags for the gVisor tier, space-separated, e.g. \"--platform=kvm\" [SBX_RUNSC_FLAGS]")
 	fs.StringVar(&cfg.HostID, "host-id", envStr("SBX_HOST_ID", ""),
 		"identity of this scheduler: the host_id of its rows and the sbx.host_id label of its containers; it only touches "+
 			"what carries it, so keep it stable across restarts and unique per server [SBX_HOST_ID] "+
@@ -222,6 +237,7 @@ func cmdServe(args []string, stderr io.Writer) error {
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", envDuration("SBX_SHUTDOWN_TIMEOUT", 30*time.Second), "budget of a graceful stop [SBX_SHUTDOWN_TIMEOUT]")
 	fs.StringVar(&permitPrivate, "egress-permit-private-cidrs", envStr("SBX_EGRESS_PERMIT_PRIVATE_CIDRS", ""),
 		"comma-separated private ranges sandboxes may reach when their policy allows it [SBX_EGRESS_PERMIT_PRIVATE_CIDRS]")
+	finishWebhookFlags := webhookFlags(fs, &cfg.Webhooks)
 	fs.StringVar(&maxUpload, "max-upload-size", envStr("SBX_MAX_UPLOAD_SIZE", "256m"), "largest file upload or stdin write, e.g. 64m, 1g [SBX_MAX_UPLOAD_SIZE]")
 	fs.DurationVar(&cfg.TouchInterval, "touch-interval", envDuration("SBX_TOUCH_INTERVAL", 0),
 		"debounce of the activity timestamp; keep it well below the shortest idle timeout (default 5s) [SBX_TOUCH_INTERVAL]")
@@ -244,6 +260,11 @@ func cmdServe(args []string, stderr io.Writer) error {
 		return err
 	}
 	cfg.Logger = logger
+	finishWebhookFlags()
+	if cfg.Runtimes, err = podman.ParseRuntimes(runtimes); err != nil {
+		return fmt.Errorf("--runtimes: %w", err)
+	}
+	cfg.RunscFlags = strings.Fields(runscArgs)
 	if cfg.MaxUploadBytes, err = parseSize(maxUpload); err != nil {
 		return fmt.Errorf("--max-upload-size: %w", err)
 	}
@@ -265,10 +286,22 @@ func cmdServe(args []string, stderr io.Writer) error {
 	return server.Run(ctx, cfg)
 }
 
+// addRuntimeFlags registers --runtimes, shared by serve, preflight and
+// the admin commands that must agree with the server about it.
+func addRuntimeFlags(fs *flag.FlagSet, runtimes *string) {
+	fs.StringVar(runtimes, "runtimes", envStr("SBX_RUNTIMES", ""),
+		"OCI runtimes (isolation tiers) templates may use, comma-separated, each with an optional path: "+
+			"crun,runsc or crun,runsc=/opt/gvisor/runsc [SBX_RUNTIMES] (default crun)")
+}
+
 func cmdPreflight(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("sbxd preflight", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	socket := fs.String("podman-socket", envStr("SBX_PODMAN_SOCKET", ""), "Podman API socket [SBX_PODMAN_SOCKET]")
+	mode := fs.String("podman-mode", envStr("SBX_PODMAN_MODE", ""),
+		"check for a server in this mode: managed (the default without --podman-socket) or external [SBX_PODMAN_MODE]")
+	socket := fs.String("podman-socket", envStr("SBX_PODMAN_SOCKET", ""), "Podman API socket of an existing service; implies external mode [SBX_PODMAN_SOCKET]")
+	var runtimes string
+	addRuntimeFlags(fs, &runtimes)
 	linger := fs.Bool("require-linger", envBool("SBX_REQUIRE_LINGER", false), "treat missing lingering as a failure [SBX_REQUIRE_LINGER]")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	if err := parse(fs, args); err != nil {
@@ -276,7 +309,15 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	report := server.Preflight(ctx, *socket, *linger)
+	enabled, err := podman.ParseRuntimes(runtimes)
+	if err != nil {
+		return fmt.Errorf("--runtimes: %w", err)
+	}
+	report, err := server.PreflightWith(ctx, server.PreflightConfig{PodmanMode: *mode, PodmanSocket: *socket,
+		Runtimes: enabled, RequireLinger: *linger, ProbeService: true})
+	if err != nil {
+		return err
+	}
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")

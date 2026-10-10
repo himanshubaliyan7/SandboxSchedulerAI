@@ -44,6 +44,12 @@ var (
 	ErrInvalidTransition = store.ErrInvalidTransition
 	// ErrStopped: the controller is stopped or stopping.
 	ErrStopped = errors.New("pool: controller stopped")
+	// ErrRuntimeNotEnabled is returned by Claim for a template whose
+	// runtime (isolation tier) the backend has not enabled. Such a
+	// template can only appear while the server runs (the server refuses
+	// to start with one); its pool is not filled and its claims fail at
+	// once instead of waiting for creates that cannot succeed.
+	ErrRuntimeNotEnabled = errors.New("pool: the template's runtime is not enabled on this server")
 	// ErrNetworkNotAllowed: the claim asked for a network mode the
 	// template does not permit.
 	ErrNetworkNotAllowed = errors.New("pool: network mode not allowed by template")
@@ -265,14 +271,17 @@ type Controller struct {
 	creating  map[string]*createOp // in-flight creates by sandbox id
 	recycling map[string]struct{}  // in-flight teardowns by sandbox id
 	breakers  map[string]*breaker  // by template id
-	queues    map[string]*waitQueue
-	adopted   map[string]struct{} // WARM sandboxes inherited from an older epoch and probed
-	proxied   map[string]struct{} // sandboxes this process attached to the egress proxy
-	foreign   map[string]struct{} // instance ids of other host ids already reported in the log
-	counts    map[string]map[core.State]int
-	templates []core.Template
-	lastGC    time.Time
-	m         counters
+	// runtimeWarned is the version of each template already reported as
+	// naming a runtime that is not enabled; only Refill touches it.
+	runtimeWarned map[string]int64
+	queues        map[string]*waitQueue
+	adopted       map[string]struct{} // WARM sandboxes inherited from an older epoch and probed
+	proxied       map[string]struct{} // sandboxes this process attached to the egress proxy
+	foreign       map[string]struct{} // instance ids of other host ids already reported in the log
+	counts        map[string]map[core.State]int
+	templates     []core.Template
+	lastGC        time.Time
+	m             counters
 }
 
 type createOp struct {
@@ -290,16 +299,17 @@ func New(cfg Config) (*Controller, error) {
 		cfg: cfg, clock: cfg.Clock, store: cfg.Store, backend: cfg.Backend, agent: cfg.Agent, egress: cfg.Egress,
 		log:     cfg.Logger.With("component", "pool", "host", cfg.HostID, "epoch", cfg.AgentEpoch),
 		rootCtx: ctx, cancel: cancel,
-		kick:      make(chan struct{}, 1),
-		creating:  map[string]*createOp{},
-		recycling: map[string]struct{}{},
-		breakers:  map[string]*breaker{},
-		queues:    map[string]*waitQueue{},
-		adopted:   map[string]struct{}{},
-		proxied:   map[string]struct{}{},
-		foreign:   map[string]struct{}{},
-		counts:    map[string]map[core.State]int{},
-		m:         newCounters(),
+		kick:          make(chan struct{}, 1),
+		creating:      map[string]*createOp{},
+		recycling:     map[string]struct{}{},
+		breakers:      map[string]*breaker{},
+		runtimeWarned: map[string]int64{},
+		queues:        map[string]*waitQueue{},
+		adopted:       map[string]struct{}{},
+		proxied:       map[string]struct{}{},
+		foreign:       map[string]struct{}{},
+		counts:        map[string]map[core.State]int{},
+		m:             newCounters(),
 	}, nil
 }
 

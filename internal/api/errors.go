@@ -30,6 +30,7 @@ const (
 	CodeSandboxNotRunning  = "sandbox_not_running"
 	CodeSandboxTerminated  = "sandbox_terminated"
 	CodeNetworkNotAllowed  = "network_not_allowed"
+	CodeRuntimeNotEnabled  = "runtime_not_enabled"
 	CodeNetworkNotAttached = "network_not_attached"
 	CodeInvalidTimeout     = "invalid_timeout"
 	CodePayloadTooLarge    = "payload_too_large"
@@ -109,6 +110,9 @@ func toError(err error) *Error {
 			Message: "the tenant's concurrent sandbox quota is exhausted; delete a sandbox first", RetryAfter: 5 * time.Second}
 	case errors.Is(err, pool.ErrNetworkNotAllowed):
 		return errf(http.StatusBadRequest, CodeNetworkNotAllowed, "the template does not allow the requested network mode")
+	case errors.Is(err, pool.ErrRuntimeNotEnabled):
+		return errf(http.StatusServiceUnavailable, CodeRuntimeNotEnabled,
+			"the template names an isolation runtime this server has not enabled; the operator must enable it (--runtimes) or change the template")
 	case errors.Is(err, pool.ErrStopped):
 		return &Error{Status: http.StatusServiceUnavailable, Code: CodeShuttingDown,
 			Message: "the server is shutting down", RetryAfter: 5 * time.Second}

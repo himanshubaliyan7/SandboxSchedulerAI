@@ -60,11 +60,8 @@ func TestShutdownPolicies(t *testing.T) {
 	if adminURL == "" {
 		t.Fatal("SBX_E2E_DATABASE_URL is not set")
 	}
-	xdg := os.Getenv("XDG_RUNTIME_DIR")
-	if _, err := os.Stat(filepath.Join(xdg, "podman", "podman.sock")); xdg == "" || err != nil {
-		t.Fatalf("no Podman socket under XDG_RUNTIME_DIR=%q: %v", xdg, err)
-	}
-	if err := exec.Command("podman", "image", "exists", imgAlpine).Run(); err != nil {
+	xdg := e2eSetup(t)
+	if err := podmanCLI("image", "exists", imgAlpine).Run(); err != nil {
 		t.Fatalf("image %s is not pulled for this user", imgAlpine)
 	}
 	bin := buildBinaries(t)

@@ -54,7 +54,7 @@ sandbox is, and a large part of Daytona's surface has no equivalent.
 | Per-sandbox resources (`Resources(cpu=, memory=, disk=)`), `resize` | Fixed per template. |
 | `os_user`, running as root in the sandbox, `sudo`, `apt install` at runtime | Not available. Every process is uid 1000 with no capabilities on a read-only root filesystem. |
 | Dashboard, organisations, OIDC login, audit logs | None. Administration is the `sbxd admin` command line; tenants and API keys are the only identities. |
-| Webhooks (`sandbox.created`, `sandbox.state.updated`, ...) | On the roadmap; check the README for their current state. Today there is a per-sandbox event log you poll. |
+| Webhooks (`sandbox.created`, `sandbox.state.updated`, ...) | Lifecycle webhooks: `sandbox.created`, `sandbox.running`, `sandbox.terminated`, `sandbox.destroyed`, `command.started`, `command.finished`, signed (Standard Webhooks) and retried; see [`webhooks.md`](webhooks.md). There is no single `sandbox.state.updated`: each transition has its own type. The per-sandbox event log you can poll is still there. |
 | More than one runner, regions, GPU sandboxes | Single node only. No GPUs. |
 | `pip install daytona`, `npm install @daytona/sdk` | The Warmbox SDKs are not on PyPI or npm yet. Install them from a checkout. |
 | Go, Ruby and Java SDKs | Python and TypeScript only. The REST API is documented in [`api/openapi.yaml`](../api/openapi.yaml). |
@@ -101,7 +101,7 @@ away".
 | Files | `sandbox.fs.upload_file`, `download_file`, `list_files`, `get_file_info`, `create_folder`, `delete_file` | `sandbox.files.write`, `read`, `list`, `get_info`, `make_dir`, `remove`, `exists` |
 | Network policy | `network_block_all`, `network_allow_list` (IPv4 CIDRs), `domain_allow_list`; `update_network_settings` | `network=NetworkPolicy(mode=, allow_domains=, allow_cidrs=, deny_cidrs=)`; `update_network`. Off by default. See below. |
 | Preview of a port | `get_preview_link(port)` | No equivalent. |
-| Events and webhooks | Webhooks: `sandbox.created`, `sandbox.state.updated`, `snapshot.*`, `volume.*` | `sandbox.events()` returns the sandbox's event log (`claimed`, `transition`, `command_started`, `command_finished`). No webhooks in the documented API today. |
+| Events and webhooks | Webhooks: `sandbox.created`, `sandbox.state.updated`, `snapshot.*`, `volume.*` | `sandbox.events()` returns the sandbox's event log (`claimed`, `transition`, `command_started`, `command_finished`). Lifecycle webhooks for sandbox and command events ([`webhooks.md`](webhooks.md)); nothing for snapshots or volumes, which Warmbox does not have. |
 | Delete | `sandbox.delete()` / `daytona.delete(sandbox)` | `sandbox.kill()` |
 | Self-hosting components | The services in `docker/docker-compose.yaml`: API, proxy, runner, SSH gateway, Postgres, Redis, Dex, a registry and its UI, MinIO, MailDev, Jaeger, an OpenTelemetry collector, PgAdmin | `sbxd`, `sbx-agent`, Postgres, rootless Podman. |
 

@@ -357,7 +357,36 @@ func (p *Process) killLocked(sig syscall.Signal) error {
 		// The group is not there yet or any more; try the leader.
 		err = syscall.Kill(p.pid, sig)
 	}
+	if sig == syscall.SIGKILL && err == nil {
+		go sweepGroup(p.pid)
+	}
 	return err
+}
+
+// sweepGroup keeps SIGKILLing a process group until it is empty.
+//
+// On Linux one kill(-pgid, SIGKILL) takes every member, because the
+// signal and fork are serialised. Under gVisor that was seen not to hold:
+// after the timeout of a fork bomb, dozens of its shells were still alive
+// and forking (`runsc ps`), so the sandbox stayed at its process limit
+// and no further command could start. Members that slipped through are
+// still in the group, so the kill is repeated until the group is gone.
+//
+// The group id cannot be reused while the group has a member, and the
+// sweep ends at the first ESRCH, so the only way to hit another group is
+// a process allocator that wraps around to this very id within one
+// interval of the group emptying. The sweep is bounded in any case.
+func sweepGroup(pgid int) {
+	const (
+		interval = 5 * time.Millisecond
+		budget   = 5 * time.Second
+	)
+	for deadline := time.Now().Add(budget); time.Now().Before(deadline); {
+		time.Sleep(interval)
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+			return // ESRCH: nobody left (or EPERM: not ours any more)
+		}
+	}
 }
 
 // kill SIGKILLs the process group if the process is still running.

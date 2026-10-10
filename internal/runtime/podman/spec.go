@@ -22,7 +22,10 @@ import (
 //
 // Two things a sandbox gets from the Podman service cannot be changed from
 // this request, on v4.9 or on main; both are the service's containers.conf
-// (read when the service starts) and are reported by package preflight:
+// (read when the service starts). That is why sbxd runs a Podman service
+// of its own by default, with a generated file that sets both (Service,
+// ContainersConf); what follows describes a service it does not manage,
+// where package preflight can only report them:
 //
 //   - The session keyring. Libpod passes --no-new-keyring to the OCI
 //     runtime only when containers.conf has `keyring = false`
@@ -319,7 +322,9 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		// would be a second, unbounded copy on the host disk, and "none"
 		// is also one of the documented start-latency levers.
 		LogConfiguration: logConfig{Driver: "none"},
-		OCIRuntime:       ociRuntime,
+		// Sent for the record and for Podman versions that honour it;
+		// 4.9.3 does not, see Config.RuntimeSockets.
+		OCIRuntime: ociRuntime,
 
 		// VOLUME declarations in the image would otherwise become
 		// anonymous volumes: writable, uncapped host disk.
@@ -393,6 +398,10 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		Rlimits: []rlimit{{Type: "nofile", Hard: uint64(res.NofileLimit), Soft: uint64(res.NofileLimit)}},
 	}
 
+	if ociRuntime == RunscRuntime {
+		gvisorSpec(s, res)
+	}
+
 	// User namespace. For keep-id, nomap and host the idmappings object
 	// mirrors what the podman CLI sends for the same --userns value: the
 	// server derives the actual ranges from the service user's
@@ -455,6 +464,53 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		})
 	}
 	return s, nil
+}
+
+// gVisor host-task allowance: the pids.max of a runsc sandbox's cgroup; see
+// gvisorSpec.
+const (
+	gvisorTasksPerPid  = 4
+	gvisorTasksReserve = 256
+)
+
+// gvisorSpec adjusts the create request for the runsc tier. Everything
+// else in the hardened spec is sent unchanged; what gVisor does with each
+// part is listed here so that the differences from crun are in one place.
+//
+//   - Process limit. Under crun pids.max counts the sandbox's own tasks.
+//     Under gVisor the cgroup holds the sentry, and the sentry's host
+//     threads are not the sandbox's processes: an idle sandbox has about
+//     50, each sandbox process adds about two, and a sentry that cannot
+//     create a thread does not return EAGAIN to the application, it dies
+//     (measured: a fork bomb against pids.max=64 ended the whole sandbox).
+//     The limit a tenant sees is therefore enforced by gVisor itself, as
+//     RLIMIT_NPROC: the sentry counts tasks per user inside this one
+//     sandbox, so the reason this rlimit is useless under crun (it is per
+//     host user, shared by every sandbox) does not apply, and fork fails
+//     with EAGAIN at the limit as it does under crun. The cgroup's
+//     pids.max stays as a backstop for the sentry, sized well above what
+//     the rlimit lets the sandbox reach.
+//   - Memory, swap, CPU, memory.oom.group: applied to the sandbox's scope
+//     by the runsc shim (package runscshim), not by runsc; the values are
+//     the same. An OOM kill takes the sentry and with it the sandbox.
+//     The sentry is not told the limits (runsc learns them only from a
+//     cgroup it configured itself), so /proc/meminfo and nproc inside the
+//     sandbox show the host's totals.
+//   - Seccomp profile: runsc ignores an OCI seccomp profile unless it is
+//     run with --oci-seccomp. The host kernel is protected by the sentry's
+//     own filter, and inside the sandbox system calls are gVisor's
+//     implementation, which is the point of the tier. The profile is
+//     still sent, so an operator who adds that flag gets it applied.
+//   - tmpfs mounts are the sentry's own (size caps honoured, charged to
+//     the memory limit); /dev/shm and the two bind mounts are served by
+//     the gofer, and Unix sockets in the run dir cross the boundary
+//     because the shim passes --host-uds=all.
+//   - User namespace: the sentry and gofer run as the container's root,
+//     which keep-id maps to the user's first subordinate UID, not to the
+//     pool user as the sandbox process is under crun.
+func gvisorSpec(s *createSpec, res core.Resources) {
+	s.Rlimits = append(s.Rlimits, rlimit{Type: "nproc", Hard: uint64(res.PidsLimit), Soft: uint64(res.PidsLimit)})
+	s.ResourceLimits.Pids.Limit = res.PidsLimit*gvisorTasksPerPid + gvisorTasksReserve
 }
 
 func tmpfs(dest string, size int64, mode string, extra ...string) ociMount {

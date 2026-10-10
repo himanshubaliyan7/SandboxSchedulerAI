@@ -4,6 +4,7 @@ from .commands import AsyncCommandHandle, AsyncCommands
 from .files import AsyncFiles, AsyncFileStream
 from .pty import AsyncPty, AsyncPtyHandle
 from .sandbox import AsyncSandbox
+from .webhooks import AsyncWebhooks
 
 __all__ = [
     "AsyncCommandHandle",
@@ -13,4 +14,5 @@ __all__ = [
     "AsyncPty",
     "AsyncPtyHandle",
     "AsyncSandbox",
+    "AsyncWebhooks",
 ]

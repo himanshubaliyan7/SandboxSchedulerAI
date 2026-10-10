@@ -93,9 +93,20 @@ type Config struct {
 	// sockets) and the seccomp profile. Default $XDG_RUNTIME_DIR/sbx. It
 	// must be short: Unix socket paths are limited to 107 bytes.
 	RunDir string
-	// PodmanSocket is the Libpod API socket. Default
-	// $XDG_RUNTIME_DIR/podman/podman.sock.
+	// PodmanSocket is the Libpod API socket of an existing Podman service
+	// (PodmanExternal). Setting it selects external mode. In external
+	// mode an empty value means $XDG_RUNTIME_DIR/podman/podman.sock.
 	PodmanSocket string
+	// PodmanMode is PodmanManaged or PodmanExternal. Empty means managed,
+	// unless PodmanSocket is set. See the constants.
+	PodmanMode string
+	// Runtimes are the OCI runtimes (isolation tiers) templates may name,
+	// each with an optional path of its binary. Default: crun. A template
+	// whose runtime is not listed stops the server at start.
+	Runtimes []podman.OCIRuntime
+	// RunscFlags are extra runsc flags for the gVisor tier, for example
+	// "--platform=kvm"; they follow, and so override, runscshim.DefaultFlags.
+	RunscFlags []string
 	// HostID is this scheduler's identity: the host_id of its rows in the
 	// store and the sbx.host_id label of its containers. The pool
 	// controller only ever touches rows and containers that carry it, so
@@ -132,6 +143,9 @@ type Config struct {
 	// See api.Config.
 	CORSAllowedOrigins []string
 	CORSAllowAPIKey    bool
+
+	// Webhooks configures lifecycle webhooks; see WebhookConfig.
+	Webhooks WebhookConfig
 
 	// API settings; zero values take the api package's defaults.
 	MaxUploadBytes   int64
@@ -273,6 +287,15 @@ func (c *Config) defaults() error {
 	if err := runtime.ValidHostID(c.HostID); err != nil {
 		return fmt.Errorf("--host-id: %w", err)
 	}
+	if c.PodmanMode, err = ResolvePodmanMode(c.PodmanMode, c.PodmanSocket); err != nil {
+		return err
+	}
+	if c.Runtimes, err = normaliseRuntimes(c.Runtimes); err != nil {
+		return err
+	}
+	if c.PodmanMode == PodmanExternal && (len(c.Runtimes) != 1 || c.Runtimes[0].Path != "") {
+		return errExternalRuntimes(c.Runtimes)
+	}
 	switch c.ShutdownPolicy {
 	case "":
 		c.ShutdownPolicy = ShutdownDrain
@@ -322,7 +345,8 @@ func CheckAgentBinary(path string) (string, error) {
 	return abs, nil
 }
 
-// Preflight runs the host checks for cfg.
+// Preflight runs the host checks for a server that uses an existing
+// Podman socket. PreflightWith takes the full configuration.
 func Preflight(ctx context.Context, podmanSocket string, requireLinger bool) preflight.Report {
 	return preflight.Run(ctx, preflight.Options{PodmanSocket: podmanSocket, RequireLinger: requireLinger})
 }
@@ -345,7 +369,7 @@ func plannedSandboxes(templates []core.Template) (planned int64, uncapped []stri
 // kernel quota (kernel keys, inotify instances). It never fails the
 // start: the pool works up to the ceiling, and creates beyond it fail,
 // are retried and trip the circuit breaker like any other create error.
-func checkCapacity(ctx context.Context, log *slog.Logger, podmanSocket string, templates []core.Template) {
+func checkCapacity(ctx context.Context, log *slog.Logger, podmanSocket string, managed bool, templates []core.Template) {
 	planned, uncapped := plannedSandboxes(templates)
 	if len(uncapped) > 0 {
 		log.Warn("templates without max_total: their pools are bounded only by tenant quotas, so the host's per-user limits "+
@@ -354,7 +378,8 @@ func checkCapacity(ctx context.Context, log *slog.Logger, podmanSocket string, t
 	if planned == 0 {
 		return
 	}
-	report := preflight.Capacity(ctx, preflight.Options{PodmanSocket: podmanSocket, PlannedSandboxes: planned})
+	report := preflight.Capacity(ctx, preflight.Options{PodmanSocket: podmanSocket, PlannedSandboxes: planned,
+		ManagedPodman: managed, SkipServiceProbe: true})
 	for _, c := range report.Checks {
 		if c.Status == preflight.StatusWarn {
 			log.Warn("capacity warning", "check", c.Name, "detail", c.Detail, "remediation", c.Remediation)
@@ -377,7 +402,13 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.SkipPreflight {
 		log.Warn("preflight skipped")
 	} else {
-		report := Preflight(ctx, cfg.PodmanSocket, cfg.RequireLinger)
+		// In managed mode the service is not probed here: the real one is
+		// started below, and its failure is the better error.
+		report, err := PreflightWith(ctx, PreflightConfig{PodmanMode: cfg.PodmanMode, PodmanSocket: cfg.PodmanSocket,
+			Runtimes: cfg.Runtimes, RequireLinger: cfg.RequireLinger})
+		if err != nil {
+			return err
+		}
 		for _, c := range report.Checks {
 			switch c.Status {
 			case preflight.StatusFail:
@@ -402,14 +433,19 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer st.Close()
 
-	// The per-user kernel quotas that each running sandbox draws on can
-	// only be judged against the size of the pools, which is known now.
+	// A template that names a runtime this server has not enabled is a
+	// start-up error, not a pool that fails every create. The per-user
+	// kernel quotas that each running sandbox draws on can only be judged
+	// against the size of the pools, which is known now too.
+	templates, err := st.ListTemplates(ctx)
+	if err != nil {
+		return fmt.Errorf("read the templates: %w", err)
+	}
+	if err := CheckTemplateRuntimes(templates, podman.RuntimeNames(cfg.Runtimes)); err != nil {
+		return err
+	}
 	if !cfg.SkipPreflight {
-		if templates, err := st.ListTemplates(ctx); err != nil {
-			log.Warn("could not read the templates for the capacity check", "err", err)
-		} else {
-			checkCapacity(ctx, log, cfg.PodmanSocket, templates)
-		}
+		checkCapacity(ctx, log, cfg.PodmanSocket, cfg.PodmanMode == PodmanManaged, templates)
 	}
 
 	// 3. Run dir and seccomp profile.
@@ -446,13 +482,17 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer egressMgr.Close()
 
-	// 5. Isolation backend.
-	backend, err := podman.New(podman.Config{
-		SocketPath: cfg.PodmanSocket, SeccompProfilePath: seccomp, UsernsMode: podman.UsernsMode(cfg.UsernsMode),
-	})
+	// 5. Isolation backend: in managed mode a Podman service of our own
+	// (see podman.go), in both modes the backend on its socket. The
+	// service is stopped last, after the pool: sandboxes that stay (the
+	// warm pool, with the drain policy) do not need it to keep running.
+	pstack, err := startPodman(ctx, podmanParams{Mode: cfg.PodmanMode, Socket: cfg.PodmanSocket, RunDir: cfg.RunDir,
+		Runtimes: cfg.Runtimes, RunscFlags: cfg.RunscFlags, Seccomp: seccomp, UsernsMode: cfg.UsernsMode, Logger: log})
 	if err != nil {
 		return err
 	}
+	defer pstack.Close(context.Background())
+	backend := pstack.Backend
 	apiVersion, err := backend.Ping(ctx)
 	if err != nil {
 		return fmt.Errorf("podman socket %s: %w", backend.Config().SocketPath, err)
@@ -473,10 +513,21 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer ctrl.Stop()
 
+	// Webhook delivery. It only reads the event log, so it runs next to
+	// the controller and outlives it during a shutdown (see below).
+	hooks, err := startWebhooks(cfg.Webhooks, st, log)
+	if err != nil {
+		return err
+	}
+	defer hooks.abort()
+
 	// 7. API.
 	apiSrv, err := api.New(api.Config{
 		Store: st, Pool: ctrl, Stats: backend, ValidatePolicy: egress.ValidatePolicy, Logger: log,
-		ExtraMetrics: em.write, MetricsToken: cfg.MetricsToken, NoMetricsRoute: cfg.MetricsListen != "",
+		RuntimeInfo:  runtimeInfo(backend.Capabilities()),
+		Webhooks:     hooks.service(),
+		ExtraMetrics: func(w io.Writer) { em.write(w); hooks.writeMetrics(w) },
+		MetricsToken: cfg.MetricsToken, NoMetricsRoute: cfg.MetricsListen != "",
 		Ready: func(ctx context.Context) error {
 			if err := st.Ping(ctx); err != nil {
 				return fmt.Errorf("store: %w", err)
@@ -540,7 +591,8 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 	log.Info("sbxd listening", "addr", ln.Addr().String(), "host", cfg.HostID, "run_dir", cfg.RunDir,
-		"podman_api", apiVersion, "seccomp", orDefault(seccomp, SeccompDefault), "agent_binary", agentBinary,
+		"podman_api", apiVersion, "podman_mode", cfg.PodmanMode, "podman_socket", backend.Config().SocketPath,
+		"runtimes", podman.RuntimeNames(cfg.Runtimes), "seccomp", orDefault(seccomp, SeccompDefault), "agent_binary", agentBinary,
 		"shutdown_policy", cfg.ShutdownPolicy, "cors_origins", cfg.CORSAllowedOrigins)
 	if cfg.OnListen != nil {
 		cfg.OnListen(ln.Addr())
@@ -588,6 +640,9 @@ func Run(ctx context.Context, cfg Config) error {
 		dcancel()
 	}
 	ctrl.Stop()
+	// Last, so that the events of this very shutdown (host_drain) are
+	// offered to the webhooks before the process goes.
+	hooks.stop(sctx)
 	egressMgr.Close()
 	log.Info("sbxd stopped")
 	return nil
