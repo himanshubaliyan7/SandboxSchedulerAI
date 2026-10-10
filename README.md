@@ -179,7 +179,6 @@ Go 1.27+ and a Postgres database.
 
 ```sh
 make build                                   # bin/sbxd, bin/sbx-mcp and a static bin/sbx-agent
-systemctl --user enable --now podman.socket
 docker run -d --rm --name sbx-dev-pg -e POSTGRES_PASSWORD=sbx \
     -p 127.0.0.1:55432:5432 postgres:17-alpine
 export SBX_DATABASE_URL='postgres://postgres:sbx@127.0.0.1:55432/postgres?sslmode=disable'
@@ -326,8 +325,21 @@ a fixed choice:
 | Tier | Boundary | Needs KVM | State |
 |---|---|---|---|
 | Podman + crun, hardened | Shared host kernel | No | Default; tested |
-| Podman + runsc (gVisor) | User-space kernel | No | Next; the template field exists but the tier is not enabled or tested |
+| Podman + runsc (gVisor) | User-space kernel | No | Works; opt-in per server and per template; the whole test suite runs on it |
 | Firecracker | MicroVM with its own kernel | Yes | Planned |
+
+The gVisor tier is enabled with `--runtimes crun,runsc=/path/to/runsc` on the
+server and `--runtime runsc` on a template; both tiers then run side by side, and
+`GET /v1/templates` says for each template which runtime it is and whether its
+sandboxes share the host kernel. In a `runsc` sandbox the kernel that code talks
+to is gVisor's sentry (`uname -r` says `4.19.0-gvisor`); the host kernel is
+reached only through the sentry's own, much smaller, set of system calls. What
+that tier does not change: the sentry is still a process of the same host user,
+gVisor does not defend against hardware side channels, and it has run here on one
+machine, one gVisor release (20261005.0) and the systrap platform only. What it
+costs is in [Measured performance](#measured-performance); how it differs from
+the crun tier (no seccomp profile inside, process limit by rlimit, memory
+overhead inside the limit) is in [`docs/operations.md`](docs/operations.md).
 
 Other limits worth knowing:
 
@@ -335,8 +347,10 @@ Other limits worth knowing:
   TLS, so two sites behind one TLS endpoint can be confused (domain fronting).
   Allowlist narrow, single-purpose hostnames.
 - Any allowlisted host is a possible exfiltration target.
-- An out-of-memory kill is inferred from exit code 137 on Podman 4.9, so a
-  manual `kill -9` of a sandbox is reported the same way.
+- An out-of-memory kill is recognised by conmon's report within a few seconds of
+  a sandbox's death, so a `kill -9` from the host that coincides with another
+  sandbox's OOM kill is reported as one too. (With `--podman-socket` the old
+  rule applies: exit code 137 alone.)
 - Disk is bounded by size-capped tmpfs, which is charged to the memory limit.
 
 ## Measured performance
@@ -355,24 +369,53 @@ limits are in [`bench/RESULTS.md`](bench/RESULTS.md).
 | Memory bomb to reported `oom_killed` | 0.4-0.7 s |
 | Idle memory per sandbox | about 2.4-2.8 MB |
 
-The first density limit on a default host is not memory but the kernel keyring
-quota: about 190 sandboxes per user. `docs/operations.md` explains how to lift it.
+`sbxd` runs its own Podman service, whose sandboxes hold no kernel key, so the
+old ceiling of about 190 sandboxes per user is gone: 1,200 warm sandboxes ran on
+the same laptop (11 GB) with no failed create and 3.8 GB still available. See
+`docs/operations.md` for what limits a host next.
+
+### crun and gVisor side by side
+
+One server, two templates that differ only in `--runtime` (python:3.12-alpine,
+1 CPU, 256 MiB), same laptop, release-20261005.0 of gVisor on the systrap
+platform. A first measurement, not a benchmark: one machine, small samples, other
+work running.
+
+| Measurement | crun | runsc (gVisor) |
+|---|---|---|
+| Create to agent ready (p50, n=24, one at a time) | 130 ms | 203 ms |
+| Warm claim, `POST /v1/sandboxes` (p50 / p95, n=30) | 5.8 / 12.9 ms | 7.6 / 8.9 ms |
+| Claim to first output byte (p50, n=30) | 11.2 ms | 18.0 ms |
+| Idle host memory per warm sandbox (44 sandboxes) | 2.2 MB | 19 MB |
+| `python3 -c pass` (mean of 20) | 17.5 ms | 61 ms |
+| 30 stdlib imports, bytecode cached | 148 ms | 401 ms |
+| The same, uncached (first import in a sandbox) | 1.1 s | 3.9 s |
+| Shell loop, 500 x fork+exec of `/bin/true` | 0.31 s | 3.1 s |
+| 2,000 small files written, read and removed in `/workspace` | 61 ms | 386 ms |
+| 1,500 files read from the image | 22 ms | 282 ms |
+| Memory bomb to reported `oom_killed` | 0.35 s | 0.53 s |
+
+A claim costs the same on both tiers because it is a database pop; the price of
+gVisor is paid by the code that runs afterwards, most of all by process creation
+and file access, and by the 16 MiB or so of every sandbox's memory limit that
+its sentry uses.
 
 ## Roadmap
 
-Done so far: the benchmark spike, the single-node core and the MVP (API, agent,
-egress, SDKs, MCP server).
+Done so far: the benchmark spike, the single-node core, the MVP (API, agent,
+egress, SDKs, MCP server), a private Podman service per server, and the gVisor
+tier with first measurements.
 
 **Next: the hardened tier.** The goal is to make the "containers are not
 enough" objection answerable without changing the scheduler.
 
-1. Install gVisor, enable `--runtime runsc` templates in the server and run the
-   whole test suite on them; fix what breaks (the agent socket, the egress
-   bridge, cgroup delegation).
-2. Measure gVisor's cost on real agent workloads (interpreter start, imports,
-   `pip install`, fork-heavy shell) and publish it next to the crun numbers.
-3. Give `sbxd` its own private Podman service and config, which removes the
-   190-sandbox ceiling and two smaller Podman quirks.
+1. ~~Install gVisor, enable `--runtime runsc` templates in the server and run the
+   whole test suite on them~~ (done: `--runtimes`; see the threat model).
+2. Measure gVisor's cost on real agent workloads: a first table is above
+   (interpreter start, imports, fork-heavy shell, small files); `pip install`
+   and a proper benchmark with raw data are still to do.
+3. ~~Give `sbxd` its own private Podman service and config~~ (done: managed mode
+   is the default; see `docs/operations.md`).
 4. ~~Lifecycle webhooks~~ (done: [`docs/webhooks.md`](docs/webhooks.md)), and
    migration guides from archived Daytona and from self-hosted E2B.
 5. Re-run everything on Podman 6 and on a server-class host.
@@ -416,8 +459,14 @@ The reasoning behind this order is in
 
 ```sh
 make test     # unit tests; with SBX_TEST_DATABASE_URL also the store tests
-make e2e      # needs SBX_E2E_DATABASE_URL and the Podman socket
+make e2e      # needs SBX_E2E_DATABASE_URL; SBX_E2E_RUNTIME=runsc runs it on gVisor
 ```
+
+The Podman backend's integration tests and the end-to-end suite run once per
+tier: `SBX_TEST_RUNTIME=runsc SBX_TEST_RUNSC=/path/to/runsc go test ./internal/runtime/podman/`
+and `SBX_E2E_RUNTIME=runsc SBX_E2E_RUNSC=/path/to/runsc make e2e`. Both start
+their own Podman services; `SBX_E2E_PODMAN_MODE=external` runs the suite on your
+Podman socket instead (crun only).
 
 `.github/workflows/ci.yml` runs the Go checks (with a Postgres service) and both
 SDKs' checks on every push and pull request. The Podman integration tests and

@@ -19,6 +19,7 @@ import (
 	"github.com/himanshubaliyan7/warmbox/internal/api"
 	"github.com/himanshubaliyan7/warmbox/internal/core"
 	"github.com/himanshubaliyan7/warmbox/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
@@ -243,6 +244,11 @@ func TestSandboxLifecycleAndListing(t *testing.T) {
 	}
 	if bytes.Contains(tr.Body, []byte("warm_target")) {
 		t.Errorf("template view leaks pool sizing: %s", tr.Body)
+	}
+	// The harness does not say what its runtimes are, so the tier's
+	// kernel is not claimed either way.
+	if tl.Templates[0].Runtime != "crun" || tl.Templates[0].SharedKernel != nil {
+		t.Errorf("template tier: runtime=%q shared_kernel=%v", tl.Templates[0].Runtime, tl.Templates[0].SharedKernel)
 	}
 }
 
@@ -1038,4 +1044,33 @@ func TestCloseEndsStreams(t *testing.T) {
 		t.Fatal("Close did not return")
 	}
 	h.want(h.do("GET", "/readyz", nil), 503, api.CodeShuttingDown)
+}
+
+// GET /v1/templates says which isolation tier a template is, and whether
+// its sandboxes share the host kernel, from what the backend reports.
+func TestTemplateTierIsReported(t *testing.T) {
+	infos := map[string]runtime.RuntimeInfo{
+		"crun":  {Name: "crun", SharedKernel: true, Pause: true},
+		"runsc": {Name: "runsc", SharedKernel: false, Pause: true},
+	}
+	for _, tc := range []struct {
+		runtime string
+		want    string
+	}{{"crun", `"shared_kernel":true`}, {"runsc", `"shared_kernel":false`}, {"krun", ""}} {
+		h := newHarness(t, options{noStart: true,
+			template: func(tm *core.Template) { tm.Runtime = tc.runtime },
+			api: func(c *api.Config) {
+				c.RuntimeInfo = func(name string) (runtime.RuntimeInfo, bool) { i, ok := infos[name]; return i, ok }
+			}})
+		r := h.want(h.do("GET", "/v1/templates", nil, withKey(keyA)), 200, "")
+		if !bytes.Contains(r.Body, []byte(`"runtime":"`+tc.runtime+`"`)) {
+			t.Errorf("%s: %s", tc.runtime, r.Body)
+		}
+		if tc.want == "" && bytes.Contains(r.Body, []byte("shared_kernel")) {
+			t.Errorf("a runtime the server has not enabled got a shared_kernel claim: %s", r.Body)
+		}
+		if tc.want != "" && !bytes.Contains(r.Body, []byte(tc.want)) {
+			t.Errorf("%s: want %s in %s", tc.runtime, tc.want, r.Body)
+		}
+	}
 }

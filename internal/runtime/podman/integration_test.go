@@ -1,8 +1,11 @@
 package podman
 
-// Integration tests against a real rootless Podman service. They are
-// skipped unless the per-user API socket (or $SBX_PODMAN_SOCKET) answers
-// and the test images are already present locally:
+// Integration tests against real rootless Podman. By default they start
+// managed services of their own, as sbxd does (one per runtime), and run
+// on the tier named by SBX_TEST_RUNTIME (crun, or runsc with SBX_TEST_RUNSC
+// naming the gVisor binary); with SBX_PODMAN_SOCKET set they use that
+// external service instead. They are skipped when Podman is not there,
+// and need the test images to be present locally:
 //
 //	podman pull docker.io/library/alpine:3.20 docker.io/library/python:3.12-alpine
 //
@@ -602,11 +605,12 @@ print("python-ok")
 		t.Errorf("python checks did not complete:\n%s", out)
 	}
 	// Host-kernel attack surface. Under crun the seccomp profile refuses
-	// all three families. Under gVisor the calls never reach the host:
+	// all three families (as if they did not exist: ENOSYS). Under gVisor
+	// the calls never reach the host:
 	// AF_ALG does not exist in the sentry, packet sockets need a
 	// capability the sandbox does not have, and AF_NETLINK is the
 	// sentry's own (route) implementation, which is allowed.
-	wantFamilies := []string{"family 16 refused: EPERM", "family 17 refused: EPERM", "family 38 refused: EPERM"}
+	wantFamilies := []string{"family 16 refused: ENOSYS", "family 17 refused: ENOSYS", "family 38 refused: ENOSYS"}
 	if itGVisor() {
 		wantFamilies = []string{"family 16 allowed", "family 17 refused: EPERM", "family 38 refused: EAFNOSUPPORT"}
 	}

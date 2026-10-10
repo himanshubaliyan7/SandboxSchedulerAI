@@ -1278,3 +1278,29 @@ func TestStoreOutageDoesNotCrashLoops(t *testing.T) {
 	}
 	h.settled(3)
 }
+
+// A template that names a runtime the backend has not enabled gets no
+// pool and no waiting claims: it can never be created.
+func TestTemplateRuntimeNotEnabled(t *testing.T) {
+	h := newHarness(t, func(tm *core.Template) { tm.Runtime = "runsc" })
+	h.start()
+	h.c.Kick()
+	time.Sleep(50 * time.Millisecond)
+	if err := h.c.Refill(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(h.st.Sandboxes()); n != 0 {
+		t.Errorf("%d sandboxes were created for a template whose runtime is not enabled", n)
+	}
+	start := time.Now()
+	_, err := h.c.Claim(context.Background(), tenant, tmplID, pool.ClaimOptions{Wait: 5 * time.Second})
+	if !errors.Is(err, pool.ErrRuntimeNotEnabled) || time.Since(start) > time.Second {
+		t.Errorf("Claim: %v after %s, want ErrRuntimeNotEnabled at once", err, time.Since(start))
+	}
+	// Once the backend has the runtime, the pool fills.
+	caps := h.be.Capabilities()
+	caps.RuntimeLabels = []string{"crun", "runsc"}
+	h.be.SetCapabilities(caps)
+	h.c.Kick()
+	eventually(t, "the pool to fill once the runtime is enabled", func() bool { return len(h.inState(core.StateWarm)) == 3 })
+}

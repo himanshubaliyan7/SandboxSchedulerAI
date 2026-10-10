@@ -8,7 +8,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	goruntime "runtime"
 	"strconv"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -79,6 +81,8 @@ func serve(args []string, stderr io.Writer) int {
 	}
 	cfg.ReapAll = true
 
+	reserveThreads(threadReserve)
+
 	// PID 1 gets no default signal actions, so handle termination ourselves.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -90,4 +94,38 @@ func serve(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// threadReserve is how many OS threads the agent creates up front.
+const threadReserve = 12
+
+// reserveThreads makes the Go runtime create n OS threads now and keep
+// them. The agent shares the sandbox's task limit with the code it runs
+// (the cgroup's pids.max, or RLIMIT_NPROC under gVisor), and a Go program
+// that needs one more thread and cannot have it does not get an error to
+// handle: the runtime aborts ("failed to create new OS thread", exit
+// status 2). A fork bomb holds the sandbox at exactly that limit, and the
+// agent, PID 1, died of it in about 1 run of 30, taking the sandbox with
+// it. Threads the runtime already has are reused instead: it never gives
+// an idle one back. The reserve is what serving a command, its output and
+// its kill needs at once; it counts against the sandbox's pids limit from
+// the start, where the tenant can see it, instead of being taken at the
+// worst moment.
+func reserveThreads(n int) {
+	var started, release sync.WaitGroup
+	release.Add(1)
+	for i := 0; i < n; i++ {
+		started.Add(1)
+		go func() {
+			// Locked goroutines cannot share a thread, so n of them at
+			// once are n threads. Unlocking before returning hands the
+			// thread back to the scheduler instead of ending it.
+			goruntime.LockOSThread()
+			started.Done()
+			release.Wait()
+			goruntime.UnlockOSThread()
+		}()
+	}
+	started.Wait()
+	release.Done()
 }

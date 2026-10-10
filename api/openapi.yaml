@@ -312,7 +312,7 @@ paths:
           headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "503":
-          description: "`pool_empty` (no warm sandbox within the wait) or `shutting_down`."
+          description: "`pool_empty` (no warm sandbox within the wait), `shutting_down`, or `runtime_not_enabled` (the template names an isolation runtime the server has not enabled; an operator error, not worth retrying)."
           headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "504": { $ref: "#/components/responses/Timeout" }
@@ -1359,7 +1359,8 @@ components:
             `sandbox_not_running`, `sandbox_terminated`,
             `network_not_allowed`, `network_not_attached`,
             `invalid_timeout`, `payload_too_large`, `rate_limited`,
-            `quota_exceeded`, `pool_empty`, `shutting_down`, `not_ready`,
+            `quota_exceeded`, `pool_empty`, `runtime_not_enabled`,
+            `shutting_down`, `not_ready`,
             `agent_unavailable`, `timeout`, `not_implemented`,
             `idempotency_key_reused`, `origin_not_allowed`,
             `api_key_not_allowed`, `internal`.
@@ -1509,7 +1510,7 @@ components:
         cpu_throttled_periods: { type: integer, format: int64 }
         cpu_throttled_usec: { type: integer, format: int64 }
         pids_current: { type: integer, format: int64 }
-        pids_limit_hits: { type: integer, format: int64, description: Forks refused by the pids limit (a fork bomb shows here). }
+        pids_limit_hits: { type: integer, format: int64, description: "Forks refused by the pids limit (a fork bomb shows here). Always 0 for a `runsc` template: there the limit is enforced inside gVisor, and `pids_current` counts the host threads of the sandbox's kernel, not its processes." }
         memory_high_hits: { type: integer, format: int64 }
     Template:
       type: object
@@ -1518,7 +1519,20 @@ components:
         id: { type: string }
         version: { type: integer, format: int64 }
         image: { type: string }
-        runtime: { type: string, example: crun }
+        runtime:
+          type: string
+          example: crun
+          description: |
+            The isolation tier of the template's sandboxes: `crun` (a
+            hardened container on the host kernel) or `runsc` (gVisor: the
+            sandbox's system calls are served by a user-space kernel).
+        shared_kernel:
+          type: boolean
+          description: |
+            Whether sandboxes of this template run directly on the host
+            kernel: `true` for `crun`, `false` for `runsc`. Absent when the
+            template names a runtime this server has not enabled (such a
+            template cannot be used: creates answer `runtime_not_enabled`).
         resources:
           type: object
           required: [cpus, memory_bytes, pids_limit, workdir_bytes, tmp_bytes, nofile_limit]

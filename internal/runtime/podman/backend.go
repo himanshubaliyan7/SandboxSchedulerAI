@@ -33,9 +33,13 @@ type Backend struct {
 	// which keeps its /etc/subuid database in process-global state and is
 	// not thread-safe: on Podman 4.9.3 a burst of eight concurrent
 	// creates was seen to end the whole service with SIGSEGV inside
-	// subid_get_uid_ranges. The request takes a few milliseconds of the
-	// roughly 90 ms a sandbox start costs, so creating one at a time
-	// costs next to nothing, and starts still run in parallel.
+	// subid_get_uid_ranges, and, more often, to hand a container a wrong
+	// mapping, which then fails at start ("mount devpts: Invalid
+	// argument", "writing uid_map: Operation not permitted": at least 11 of 288
+	// creates at concurrency 8, none of 216 with this lock). The request
+	// is a small part of what a sandbox start costs, so creating one at
+	// a time changes nothing measurable (51 to 55 ms per sandbox at
+	// concurrency 8 either way), and starts still run in parallel.
 	createMu sync.Mutex
 }
 

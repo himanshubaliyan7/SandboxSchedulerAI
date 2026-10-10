@@ -5,8 +5,12 @@
 //
 // It is gated: set SBX_E2E=1 and SBX_E2E_DATABASE_URL to a Postgres URL
 // whose role may create databases (the test creates and drops its own).
-// It needs the Podman user socket and the images alpine:3.20 and
-// python:3.12-alpine, already pulled. For the egress checks it needs
+// It needs rootless Podman and the images alpine:3.20 and
+// python:3.12-alpine, already pulled. sbxd starts its own Podman service
+// (SBX_E2E_PODMAN_MODE=external uses the user's socket instead), and the
+// suite runs on one isolation tier at a time: SBX_E2E_RUNTIME=crun (the
+// default) or runsc, with SBX_E2E_RUNSC naming the gVisor binary; see
+// helpers_test.go. For the egress checks it needs
 // Docker (a container on the default bridge is the private upstream) or
 // SBX_E2E_UPSTREAM=<ip:port> of an HTTP server on a private address that
 // is not one of this host's own; without either those checks are skipped.
@@ -29,6 +33,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -353,12 +358,23 @@ func TestEndToEnd(t *testing.T) {
 		// what it allows (a user namespace, netlink, ptrace) is its own
 		// implementation, not the host's.
 		const probes = `
-import ctypes, errno, socket
+import ctypes, errno, os, socket, sys
 libc = ctypes.CDLL(None, use_errno=True)
+def fresh(fn):
+    # Each probe in a process of its own: under gVisor the first one
+    # (a new user namespace) succeeds and would hand the next ones the
+    # capabilities of that namespace.
+    sys.stdout.flush()
+    pid = os.fork()
+    if pid == 0:
+        fn(); sys.stdout.flush(); os._exit(0)
+    os.waitpid(pid, 0)
 def sc(name, nr, *args):
-    ctypes.set_errno(0)
-    r = libc.syscall(nr, *args, 0, 0, 0)
-    print(name, "ok" if r >= 0 else errno.errorcode.get(ctypes.get_errno()))
+    def probe():
+        ctypes.set_errno(0)
+        r = libc.syscall(nr, *args, 0, 0, 0)
+        print(name, "ok" if r >= 0 else errno.errorcode.get(ctypes.get_errno()))
+    fresh(probe)
 sc("unshare_user", 272, 0x10000000)
 sc("unshare_net", 272, 0x40000000)
 sc("bpf", 321, 0, 0)
@@ -368,11 +384,13 @@ sc("keyctl", 250, 0, 0)
 sc("mount", 165, 0, 0)
 sc("kexec_load", 246, 0, 0)
 sc("init_module", 175, 0, 0)
-for fam, name in ((38, "af_alg"), (17, "af_packet"), (16, "af_netlink")):
+def family(fam, name):
     try:
         socket.socket(fam, socket.SOCK_RAW, 0); print(name, "ok")
     except OSError as e:
         print(name, errno.errorcode.get(e.errno, e.errno))
+for fam, name in ((38, "af_alg"), (17, "af_packet"), (16, "af_netlink")):
+    fresh(lambda: family(fam, name))
 `
 		res = acme.exec(sb, map[string]any{"cmd": "python3", "args": []string{"-c", probes}})
 		got := string(res.Stdout)
@@ -559,14 +577,35 @@ for fam, name in ((38, "af_alg"), (17, "af_packet"), (16, "af_netlink")):
 			if st.PidsLimitHits != 0 || st.PidsCurrent > 64*4+256 {
 				t.Errorf("stats after the fork bomb on gVisor: %+v", st)
 			}
-			res := acme.exec(victim, shell(`ulimit -u; n=0; for i in $(seq 1 100); do sleep 3 & done 2>/dev/null; sleep 0.5; echo procs=$(ls /proc | grep -c '^[0-9]')`))
+			const forks = `
+import os, resource, signal, time
+print("nproc", resource.getrlimit(resource.RLIMIT_NPROC)[0])
+kids = []
+try:
+    for _ in range(200):
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(20); os._exit(0)
+        kids.append(pid)
+    print("forked", len(kids), "without a limit")
+except OSError as e:
+    print("fork failed after", len(kids), e.errno)
+for k in kids: os.kill(k, signal.SIGKILL)
+for k in kids: os.waitpid(k, 0)
+`
+			var res waitResult
+			waitFor(t, "the bombed gVisor sandbox to run a command again", 20*time.Second, func() bool {
+				r := acme.do("POST", "/v1/sandboxes/"+victim.ID+"/commands?wait=true", map[string]any{"cmd": "python3", "args": []string{"-c", forks}}, victim.AccessToken)
+				_ = json.Unmarshal(r.Body, &res)
+				return r.Status == 200 && strings.Contains(string(res.Stdout), "nproc")
+			})
 			out := string(res.Stdout)
-			var procs int
-			if i := strings.Index(out, "procs="); i >= 0 {
-				procs, _ = strconv.Atoi(strings.TrimSpace(out[i+len("procs="):]))
+			var n, eno int
+			if i := strings.Index(out, "fork failed after "); i >= 0 {
+				_, _ = fmt.Sscanf(out[i:], "fork failed after %d %d", &n, &eno)
 			}
-			if !strings.HasPrefix(out, "64\n") || procs == 0 || procs > 64 {
-				t.Errorf("process limit inside a gVisor sandbox: %q (want ulimit 64 and at most 64 processes)", out)
+			if !strings.HasPrefix(out, "nproc 64\n") || n == 0 || n >= 64 || eno != int(syscall.EAGAIN) {
+				t.Errorf("process limit inside a gVisor sandbox: %q (want RLIMIT_NPROC 64 and fork failing with EAGAIN below 64 children)", out)
 			}
 		}
 		t.Logf("fork bomb contained in %s: reason=%s pids_limit_hits=%d pids_current=%d", time.Since(start).Round(time.Millisecond), res.Exit.Reason, st.PidsLimitHits, st.PidsCurrent)

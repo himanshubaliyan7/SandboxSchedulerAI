@@ -3,6 +3,7 @@ package podman
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -215,6 +216,24 @@ func TestSpecVariants(t *testing.T) {
 	s, err := buildCreateSpec(cfg, spec)
 	if err != nil || s.OCIRuntime != "runsc" {
 		t.Errorf("runsc: runtime=%v err=%v", s, err)
+	}
+	// The gVisor tier: the sandbox's process limit becomes RLIMIT_NPROC
+	// and the cgroup's pids.max a backstop for the sentry; everything
+	// else is the crun spec.
+	if err == nil {
+		crunSpec, _ := buildCreateSpec(cfg, testSpec())
+		pids := testSpec().Template.Resources.PidsLimit
+		wantRlimits := append(append([]rlimit(nil), crunSpec.Rlimits...), rlimit{Type: "nproc", Hard: uint64(pids), Soft: uint64(pids)})
+		if !reflect.DeepEqual(s.Rlimits, wantRlimits) {
+			t.Errorf("runsc rlimits: %+v", s.Rlimits)
+		}
+		if s.ResourceLimits.Pids.Limit != pids*gvisorTasksPerPid+gvisorTasksReserve || crunSpec.ResourceLimits.Pids.Limit != pids {
+			t.Errorf("pids.max: runsc %d, crun %d", s.ResourceLimits.Pids.Limit, crunSpec.ResourceLimits.Pids.Limit)
+		}
+		s.Rlimits, s.ResourceLimits.Pids.Limit, s.OCIRuntime = crunSpec.Rlimits, pids, crunSpec.OCIRuntime
+		if !reflect.DeepEqual(s, crunSpec) {
+			t.Errorf("the runsc spec differs from the crun one in more than the process limit:\n%+v\n%+v", s, crunSpec)
+		}
 	}
 	spec.Template.Runtime = "runc"
 	if _, err := buildCreateSpec(cfg, spec); err == nil {

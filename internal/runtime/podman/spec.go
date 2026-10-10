@@ -22,7 +22,10 @@ import (
 //
 // Two things a sandbox gets from the Podman service cannot be changed from
 // this request, on v4.9 or on main; both are the service's containers.conf
-// (read when the service starts) and are reported by package preflight:
+// (read when the service starts). That is why sbxd runs a Podman service
+// of its own by default, with a generated file that sets both (Service,
+// ContainersConf); what follows describes a service it does not manage,
+// where package preflight can only report them:
 //
 //   - The session keyring. Libpod passes --no-new-keyring to the OCI
 //     runtime only when containers.conf has `keyring = false`
