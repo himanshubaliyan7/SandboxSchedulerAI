@@ -234,7 +234,7 @@ type tenantHandler func(w http.ResponseWriter, r *http.Request, tenant store.Ten
 
 // tenant registers a route that requires a tenant API key.
 func (s *Server) tenant(pattern string, class rateClass, h tenantHandler) {
-	s.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+	s.handle(pattern, func(w http.ResponseWriter, r *http.Request) {
 		key, _ := credentials(r)
 		if key == "" {
 			s.fail(w, r, errUnauthorized)
@@ -263,23 +263,50 @@ func (s *Server) tenant(pattern string, class rateClass, h tenantHandler) {
 type dataHandler func(w http.ResponseWriter, r *http.Request, sess *session) error
 
 // data registers a data-plane route under /v1/sandboxes/{id}. It accepts
-// a tenant API key or the access token of that one sandbox.
-func (s *Server) data(pattern string, h dataHandler) {
-	s.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
-		sess, err := s.authorizeData(r)
+// a tenant API key or the access token of that one sandbox. These are the
+// only routes that take part in CORS (see cors.go).
+func (s *Server) data(pattern string, h dataHandler) { s.dataRoute(pattern, h, false) }
+
+// dataWS is data for the WebSocket route: with handshake_errors=close a
+// refusal is delivered as a WebSocket close instead of an HTTP status.
+func (s *Server) dataWS(pattern string, h dataHandler) { s.dataRoute(pattern, h, true) }
+
+func (s *Server) dataRoute(pattern string, h dataHandler, ws bool) {
+	method, path, _ := strings.Cut(pattern, " ")
+	s.dataMethods[path] = append(s.dataMethods[path], method)
+	s.handle(pattern, func(w http.ResponseWriter, r *http.Request) {
+		crossOrigin, err := s.cors.apply(w, r)
+		var sess *session
+		if err == nil {
+			sess, err = s.authorizeData(r, crossOrigin && !s.cors.allowAPIKey)
+		}
 		if err == nil {
 			err = h(w, r, sess)
 		}
-		if err != nil {
-			s.fail(w, r, err)
+		if err == nil {
+			return
 		}
+		var apiErr *Error
+		originRefused := errors.As(err, &apiErr) && apiErr.Code == CodeOriginNotAllowed
+		if ws && !originRefused && wsCloseErrors(r) {
+			s.wsRefuse(w, r, err)
+			return
+		}
+		s.fail(w, r, err)
 	})
 }
 
-func (s *Server) authorizeData(r *http.Request) (*session, error) {
+// authorizeData resolves the caller and the sandbox of a data-plane
+// request. With noAPIKey (a cross-origin browser request, unless the
+// operator allowed it) a tenant API key is refused outright, valid or not.
+func (s *Server) authorizeData(r *http.Request, noAPIKey bool) (*session, error) {
 	ctx := r.Context()
 	id := r.PathValue("id")
 	key, token := credentials(r)
+	if key != "" && noAPIKey {
+		return nil, errf(http.StatusForbidden, CodeAPIKeyNotAllowed,
+			"a tenant API key is not accepted from a browser origin; use the sandbox access token")
+	}
 	var (
 		acc    store.SandboxAccess
 		tenant store.Tenant

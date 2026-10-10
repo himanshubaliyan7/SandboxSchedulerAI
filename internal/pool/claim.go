@@ -91,7 +91,7 @@ func resolvePolicy(tmpl core.Template, want *core.NetworkPolicy) (core.NetworkPo
 // ErrPoolEmpty, ErrNetworkNotAllowed, ErrStopped, ctx's error, or the
 // wrapped cause of a post-assignment failure.
 func (c *Controller) Claim(ctx context.Context, tenantID, templateID string, opts ClaimOptions) (core.Sandbox, error) {
-	if c.rootCtx.Err() != nil {
+	if c.rootCtx.Err() != nil || c.quiesced() {
 		return core.Sandbox{}, ErrStopped
 	}
 	tmpl, err := c.store.GetTemplate(ctx, templateID)

@@ -34,6 +34,13 @@ func (a *Agent) filePath(r *http.Request) (string, error) {
 // fileError maps a filesystem error to an API error:
 // missing -> 404, permission or read-only -> 403, wrong kind of object,
 // already exists or not empty -> 409, no space -> 507.
+//
+// The 409 "conflict" cases are: ENOTDIR (a component of the path, or the
+// directory to list, is a file), EEXIST (mkdir over a file; a write whose
+// parent directory cannot be created because a file is in the way),
+// ENOTEMPTY and EISDIR (a write renamed onto a directory that appeared
+// meanwhile). A read or write whose target is a directory is the more
+// specific 409 "is_directory".
 func fileError(err error) error {
 	var ae *apiError
 	if errors.As(err, &ae) {
@@ -194,16 +201,44 @@ func (a *Agent) handleFileList(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue // removed while listing
 		}
-		out = append(out, agentapi.FileInfo{
-			Name:    e.Name(),
-			Path:    filepath.Join(path, e.Name()),
-			Size:    fi.Size(),
-			Mode:    unixMode(fi.Mode()),
-			IsDir:   fi.IsDir(),
-			ModTime: fi.ModTime().UTC(),
-		})
+		out = append(out, fileInfo(filepath.Join(path, e.Name()), fi))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func fileInfo(path string, fi fs.FileInfo) agentapi.FileInfo {
+	return agentapi.FileInfo{
+		Name:    filepath.Base(path),
+		Path:    path,
+		Size:    fi.Size(),
+		Mode:    unixMode(fi.Mode()),
+		IsDir:   fi.IsDir(),
+		ModTime: fi.ModTime().UTC(),
+	}
+}
+
+// handleFileStat serves GET /files/stat?path=P: the FileInfo of one path,
+// or 404. A symbolic link is followed, so that is_dir and size describe
+// what a read or a listing of the path would find; a link whose target is
+// missing is described as the link itself rather than reported absent
+// (it is in its directory's listing, and a delete would remove it).
+func (a *Agent) handleFileStat(w http.ResponseWriter, r *http.Request) {
+	path, err := a.filePath(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	fi, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		if lfi, lerr := os.Lstat(path); lerr == nil {
+			fi, err = lfi, nil
+		}
+	}
+	if err != nil {
+		writeError(w, fileError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, fileInfo(path, fi))
 }
 
 // unixMode converts to the permission bits chmod(2) uses.
@@ -227,9 +262,46 @@ func (a *Agent) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
+	created, err := mkdirAll(path)
+	if err != nil {
 		writeError(w, fileError(err))
 		return
 	}
+	if created {
+		w.WriteHeader(http.StatusCreated)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// mkdirAll is os.MkdirAll that also reports whether this call made the
+// directory (false: it was already there). Two concurrent calls for the
+// same new path both succeed and exactly one of them reports true.
+func mkdirAll(path string) (created bool, err error) {
+	err = os.Mkdir(path, 0o755)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrExist):
+		fi, serr := os.Stat(path)
+		if serr == nil && fi.IsDir() {
+			return false, nil
+		}
+		return false, err // a file is in the way: EEXIST -> 409
+	case !errors.Is(err, fs.ErrNotExist):
+		return false, err
+	}
+	// A parent is missing: make them, then the directory itself.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			if fi, serr := os.Stat(path); serr == nil && fi.IsDir() {
+				return false, nil // somebody else made it meanwhile
+			}
+		}
+		return false, err
+	}
+	return true, nil
 }

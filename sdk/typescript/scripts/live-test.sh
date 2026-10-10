@@ -5,13 +5,17 @@
 #   scripts/live-test.sh            # build, start Postgres + sbxd, test, clean up
 #   scripts/live-test.sh --keep-pg  # leave the Postgres container running afterwards
 #
-# Two sbxd servers of one user must not run at the same time (they would
-# reconcile each other's containers away), so everything that touches Podman
-# runs under an exclusive flock, and the slow steps (compiling, starting
-# Postgres) run before the lock is taken.
+# The server is started with --shutdown-policy destroy, and the run fails if
+# a container of its host id is left after the SIGTERM.
+#
+# Everything that touches Podman runs under an exclusive flock. Servers are
+# scoped by host id, so the lock is not needed next to other servers; it
+# only keeps two runs of this script apart (they share a host id, a run dir
+# and a port). The slow steps (compiling, starting Postgres) run before it
+# is taken.
 #
 # Environment (all optional):
-#   SBX_PODMAN_LOCK   lock file shared by everyone using this Podman user
+#   SBX_PODMAN_LOCK   lock file (default $XDG_RUNTIME_DIR/sbx-podman.lock, else /tmp/sbx-podman.lock)
 #   SBX_LIVE_PORT     API port               (default 18082)
 #   SBX_LIVE_PG_PORT  Postgres host port     (default 55435)
 #   SBX_LIVE_IMAGE    sandbox image, already pulled (default docker.io/library/python:3.12-alpine)
@@ -20,7 +24,7 @@ set -euo pipefail
 
 SDK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPO_DIR=$(cd "$SDK_DIR/../.." && pwd)
-LOCK=${SBX_PODMAN_LOCK:-/tmp/claude-1000/-home-user-warmbox/00dddaa2-61cf-4bfd-a377-ebe4c5ac26b7/scratchpad/podman.lock}
+LOCK=${SBX_PODMAN_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/sbx-podman.lock}
 PORT=${SBX_LIVE_PORT:-18082}
 PG_PORT=${SBX_LIVE_PG_PORT:-55435}
 PG_NAME=sbx-ts-pg
@@ -55,7 +59,9 @@ locked() {
     local left
     left=$(podman ps -a -q --filter "label=sbx.host_id=$HOST_ID")
     if [[ -n $left ]]; then
-      echo "removing $(wc -w <<<"$left") leftover container(s) of host id $HOST_ID" >&2
+      # With --shutdown-policy destroy nothing should be left: report it as a failure, then clean up.
+      echo "ERROR: $(wc -w <<<"$left") container(s) of host id $HOST_ID left after the stop; removing them" >&2
+      status=1
       # shellcheck disable=SC2086
       podman rm -f -t 0 $left >/dev/null || true
     fi
@@ -82,7 +88,7 @@ locked() {
 
   log "starting sbxd on 127.0.0.1:$PORT"
   "$bin/sbxd" serve --listen "127.0.0.1:$PORT" --run-dir "$RUN_DIR" --host-id "$HOST_ID" \
-    --claim-wait 20s >"$WORK/sbxd.log" 2>&1 &
+    --claim-wait 20s --shutdown-policy destroy --cors-allowed-origins "http://app.sbx.test" >"$WORK/sbxd.log" 2>&1 &
   server_pid=$!
   local ready=""
   for _ in $(seq 1 300); do

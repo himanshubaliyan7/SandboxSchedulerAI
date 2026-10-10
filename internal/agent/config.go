@@ -31,8 +31,9 @@ const (
 	DefaultMaxExited        = 4096
 	DefaultMaxRetainedBytes = 64 << 20
 	// maxWSStdinQueue bounds stdin bytes accepted on one WebSocket that
-	// the process has not consumed yet.
-	maxWSStdinQueue = 1 << 20
+	// the process has not consumed yet. It is one full-size frame, so a
+	// frame of the maximum size is always accepted on an empty queue.
+	maxWSStdinQueue = agentapi.MaxClientPayloadBytes
 )
 
 // Config configures an Agent. The zero value of every field except

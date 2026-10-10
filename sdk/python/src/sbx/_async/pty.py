@@ -231,7 +231,17 @@ class AsyncPtyHandle:
         while True:
             try:
                 message = await ws.recv()
-            except (ConnectionClosed, OSError, EOFError):
+            except ConnectionClosed as e:
+                # The close code says whether re-attaching can work: a
+                # sandbox that is gone or a credential that is wrong is
+                # final, and needs no further request to find out.
+                rcvd = e.rcvd
+                final = wire.close_error(rcvd.code, rcvd.reason) if rcvd is not None else None
+                if final is not None:
+                    self._error = error_from_envelope(final)
+                    return True
+                return False
+            except (OSError, EOFError):
                 return False
             if isinstance(message, str):
                 continue  # the protocol is binary; ignore anything else
@@ -247,6 +257,10 @@ class AsyncPtyHandle:
                 if isinstance(exit_status, Mapping):
                     self._exit = ExitStatus.from_json(exit_status)
                 elif isinstance(error, Mapping):
+                    if error.get("code") in wire.TRANSIENT_STATUS_CODES:
+                        # The link behind the server broke, or the server is
+                        # stopping: the command may live on, so attach again.
+                        return False
                     self._error = error_from_envelope(error)
                 else:
                     self._error = ProtocolError("status frame with neither exit nor error")

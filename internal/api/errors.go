@@ -39,6 +39,10 @@ const (
 	CodeShuttingDown       = "shutting_down"
 	CodeAgentUnavailable   = "agent_unavailable"
 	CodeTimeout            = "timeout"
+	CodeNotImplemented     = "not_implemented"
+	CodeOriginNotAllowed   = "origin_not_allowed"
+	CodeAPIKeyNotAllowed   = "api_key_not_allowed"
+	CodeIdempotencyKeyUsed = "idempotency_key_reused"
 	CodeInternal           = "internal"
 )
 

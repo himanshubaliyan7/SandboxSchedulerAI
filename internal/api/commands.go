@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
@@ -64,7 +67,8 @@ type StartCommandRequest struct {
 // StreamEvent is one line of an NDJSON command stream. The gateway adds
 // two types to the agent's: "start", the first line of
 // POST .../commands?wait=stream, and "error", the last line of a stream
-// that could not be continued.
+// that could not be continued. Offset means nothing on those two (it is
+// always 0): a client must not move its position because of them.
 type StreamEvent struct {
 	Type    string       `json:"type"`
 	Offset  int64        `json:"offset"`
@@ -116,14 +120,20 @@ func (s *Server) handleStartCommand(w http.ResponseWriter, r *http.Request, sess
 	}
 	start := agentapi.StartRequest{Cmd: req.Cmd, Args: req.Args, Env: req.Env, Cwd: req.Cwd, PTY: req.PTY,
 		Stdin: req.Stdin, Tag: req.Tag, TimeoutMs: req.TimeoutMs}
+	idemKey := r.Header.Get(headerIdempotencyKey)
+	if idemKey != "" && !validIdempotencyKey(idemKey) {
+		return badRequest("%s must be 1 to %d characters from [A-Za-z0-9._:-]", headerIdempotencyKey, maxIdempotencyKeyLen)
+	}
 
 	ctx, cancel := s.opCtx(r)
-	info, err := sess.client.Start(ctx, start)
+	info, replayed, err := s.startOnce(ctx, sess, idemKey, start)
 	cancel()
 	if err != nil {
 		return s.agentFailure(sess, err, "")
 	}
-	s.watch(sess, info, start)
+	if replayed {
+		w.Header().Set(headerIdempotentReplayed, "true")
+	}
 
 	switch wait {
 	case "stream":
@@ -133,8 +143,126 @@ func (s *Server) handleStartCommand(w http.ResponseWriter, r *http.Request, sess
 		return s.waitCommand(w, r, sess, info)
 	}
 	w.Header().Set("Location", r.URL.Path+"/"+info.ID)
-	writeJSON(w, http.StatusCreated, commandView(info))
+	status := http.StatusCreated
+	if replayed {
+		status = http.StatusOK // nothing was created by this request
+	}
+	writeJSON(w, status, commandView(info))
 	return nil
+}
+
+// Idempotent command start.
+//
+// A start that carries an Idempotency-Key header is executed at most once
+// per sandbox and key: a second request with the same key and the same
+// body does not start anything, it answers for the command the first one
+// started (with the header Idempotent-Replayed: true), in whatever form
+// its own wait parameter asks for. So a client whose connection was cut
+// before it learned the pid can simply send the request again.
+//
+// The keys live in the gateway's session for the sandbox, in memory. That
+// is enough: a sandbox never outlives the server process that assigned it
+// (a restart ends every session with host_drain), so there is no later
+// process in which a retry could be mistaken for a new command. A start
+// that failed is forgotten, so the same key can be used to try again.
+const (
+	headerIdempotencyKey     = "Idempotency-Key"
+	headerIdempotentReplayed = "Idempotent-Replayed"
+	maxIdempotencyKeyLen     = 128
+	// maxIdempotencyKeys bounds the keys remembered per sandbox; beyond
+	// it the oldest are forgotten.
+	maxIdempotencyKeys = 1024
+)
+
+func validIdempotencyKey(k string) bool {
+	if k == "" || len(k) > maxIdempotencyKeyLen {
+		return false
+	}
+	for _, c := range k {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_', c == '.', c == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+type idemEntry struct {
+	hash [sha256.Size]byte
+	done chan struct{} // closed when info or err is set
+	info agentapi.ProcessInfo
+	err  error
+}
+
+type idemTable struct {
+	mu    sync.Mutex
+	m     map[string]*idemEntry
+	order []string
+}
+
+// startOnce starts a command, or with a key that was used before returns
+// the command that request started (replayed true).
+func (s *Server) startOnce(ctx context.Context, sess *session, key string, req agentapi.StartRequest) (agentapi.ProcessInfo, bool, error) {
+	if key == "" {
+		info, err := sess.client.Start(ctx, req)
+		if err == nil {
+			s.watch(sess, info, req)
+		}
+		return info, false, err
+	}
+	canon, err := json.Marshal(req) // map keys are sorted: equal requests give equal bytes
+	if err != nil {
+		return agentapi.ProcessInfo{}, false, err
+	}
+	hash := sha256.Sum256(canon)
+
+	t := &sess.idem
+	t.mu.Lock()
+	if e := t.m[key]; e != nil {
+		t.mu.Unlock()
+		if e.hash != hash {
+			return agentapi.ProcessInfo{}, false, errf(http.StatusConflict, CodeIdempotencyKeyUsed,
+				"this %s was already used for a different command", headerIdempotencyKey)
+		}
+		select {
+		case <-e.done:
+		case <-ctx.Done():
+			return agentapi.ProcessInfo{}, false, ctx.Err()
+		}
+		if e.err != nil {
+			return agentapi.ProcessInfo{}, false, e.err
+		}
+		// Answer with the command as it is now, not as it was at start.
+		if cur, err := sess.client.Get(ctx, e.info.ID); err == nil {
+			return cur, true, nil
+		}
+		return e.info, true, nil
+	}
+	e := &idemEntry{hash: hash, done: make(chan struct{})}
+	if t.m == nil {
+		t.m = map[string]*idemEntry{}
+	}
+	t.m[key] = e
+	t.order = append(t.order, key)
+	for len(t.order) > maxIdempotencyKeys {
+		delete(t.m, t.order[0])
+		t.order = t.order[1:]
+	}
+	t.mu.Unlock()
+
+	e.info, e.err = sess.client.Start(ctx, req)
+	if e.err != nil {
+		t.mu.Lock()
+		if t.m[key] == e {
+			delete(t.m, key)
+		}
+		t.mu.Unlock()
+	} else {
+		s.watch(sess, e.info, req)
+	}
+	close(e.done)
+	return e.info, false, e.err
 }
 
 // waitCommand collects a command's output until it exits.
@@ -241,6 +369,16 @@ func (n *ndjsonWriter) write(ev StreamEvent) error {
 	return nil
 }
 
+// flush sends what has been written so far, and the status line and
+// headers if they have not gone out yet.
+func (n *ndjsonWriter) flush() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.last = time.Now()
+	n.pending = false
+	return n.rc.Flush()
+}
+
 func (n *ndjsonWriter) flushLater() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -269,7 +407,20 @@ func (n *ndjsonWriter) close() {
 // event, or with an error event if the stream cannot continue. Nothing is
 // buffered beyond one event: a slow client slows the reads from the
 // agent, and the agent then drops from its ring buffer and says so with a
-// truncated event. first, when set, is sent as a "start" event.
+// truncated event.
+//
+// The status line and the headers are sent as soon as it is known that
+// the stream can be served, never later than the agent's own answer and
+// never waiting for the command to say something:
+//
+//   - attaching (first nil): the agent's stream is opened first, so that
+//     an unknown pid, a dead sandbox or an agent that does not answer is
+//     still a plain HTTP error; then the headers are flushed;
+//   - starting with wait=stream (first set): the command already runs, so
+//     the headers and the "start" event carrying its pid are flushed
+//     before anything else is attempted. Whatever goes wrong afterwards
+//     is an in-stream "error" event, and the client has the pid to
+//     reattach with.
 func (s *Server) pipeStream(w http.ResponseWriter, r *http.Request, sess *session, pid string, from int64, first *CommandView) error {
 	ctx, cancel := s.streamCtx(r)
 	defer cancel()
@@ -290,33 +441,63 @@ func (s *Server) pipeStream(w http.ResponseWriter, r *http.Request, sess *sessio
 			out.close()
 		}
 	}()
+	// fail reports err as an HTTP error while that is still possible and
+	// as the stream's last event afterwards.
+	fail := func(err error) error {
+		switch {
+		case ctx.Err() != nil && r.Context().Err() != nil:
+			return nil // the client went away
+		case ctx.Err() != nil:
+			err = &Error{Status: http.StatusServiceUnavailable, Code: CodeShuttingDown,
+				Message: "the server is shutting down; reconnect with from=<last offset>", RetryAfter: 5 * time.Second}
+		default:
+			err = s.agentFailure(sess, err, CodeProcessNotFound)
+		}
+		if out == nil {
+			return err
+		}
+		e := toError(err)
+		_ = out.write(StreamEvent{Type: EventError, Error: &ErrorBody{
+			Code: e.Code, Message: e.Message, RequestID: requestID(r), Details: e.Details}})
+		return nil
+	}
+
 	if first != nil {
 		begin()
+		// The first write of a stream is flushed at once.
 		if err := out.write(StreamEvent{Type: EventStart, Command: first}); err != nil {
 			return nil
 		}
 	}
-	for ev, err := range sess.client.Stream(ctx, pid, from) {
-		if err != nil {
-			if ctx.Err() != nil && r.Context().Err() != nil {
-				return nil // the client went away
-			}
-			if ctx.Err() != nil {
-				err = &Error{Status: http.StatusServiceUnavailable, Code: CodeShuttingDown,
-					Message: "the server is shutting down; reconnect with from=<last offset>"}
-			} else {
-				err = s.agentFailure(sess, err, CodeProcessNotFound)
-			}
-			if out == nil {
-				return err // nothing sent yet: a plain HTTP error
-			}
-			e := toError(err)
-			_ = out.write(StreamEvent{Type: EventError, Error: &ErrorBody{
-				Code: e.Code, Message: e.Message, RequestID: requestID(r), Details: e.Details}})
-			return nil
+
+	// The agent answers a stream request immediately; RequestTimeout
+	// bounds the wait for that answer, not the stream.
+	sctx, scancel := context.WithCancel(ctx)
+	defer scancel()
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(s.cfg.RequestTimeout, func() { timedOut.Store(true); scancel() })
+	stream, err := sess.client.OpenStream(sctx, pid, from)
+	if !timer.Stop() && err == nil {
+		_ = stream.Close()
+		err = context.DeadlineExceeded
+	}
+	if err != nil {
+		if timedOut.Load() && ctx.Err() == nil {
+			err = context.DeadlineExceeded
 		}
-		if out == nil {
-			begin()
+		return fail(err)
+	}
+	defer stream.Close()
+	if out == nil {
+		begin()
+		if err := out.flush(); err != nil {
+			return nil // the client went away
+		}
+	}
+
+	for ev, err := range stream.Events() {
+		if err != nil {
+			return fail(err)
 		}
 		if ev.Type == agentapi.EventStdout || ev.Type == agentapi.EventStderr || ev.Type == agentapi.EventPTY {
 			s.touch(sess)

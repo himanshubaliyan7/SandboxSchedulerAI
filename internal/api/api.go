@@ -142,6 +142,18 @@ type Config struct {
 	// JanitorInterval is how often sessions of sandboxes that are no
 	// longer running are dropped. Default 15s.
 	JanitorInterval time.Duration
+
+	// CORSAllowedOrigins switches cross-origin browser access to the
+	// data-plane routes on. Each entry is an exact origin
+	// ("https://app.example.com", no path, no trailing slash) or "*" for
+	// any origin. Empty (the default) means off: no CORS header is ever
+	// sent and OPTIONS is not a method of any route. See cors.go.
+	CORSAllowedOrigins []string
+	// CORSAllowAPIKey lets a cross-origin request authenticate with a
+	// tenant API key on the data-plane routes. Off by default: an API key
+	// has no business in a browser, and with it off a key that reaches
+	// one by mistake does not work from there.
+	CORSAllowAPIKey bool
 }
 
 func (c *Config) defaults() error {
@@ -201,11 +213,19 @@ type Server struct {
 	auth     *authCache
 	limiters *limiters
 	sessions *sessions
+	cors     *corsPolicy
+
+	routeList   []string            // "METHOD /path" of every registered route
+	dataMethods map[string][]string // data-plane path -> methods, for preflights
 }
 
 // New validates cfg and returns a Server.
 func New(cfg Config) (*Server, error) {
 	if err := cfg.defaults(); err != nil {
+		return nil, err
+	}
+	cors, err := newCORSPolicy(cfg.CORSAllowedOrigins, cfg.CORSAllowAPIKey)
+	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -216,6 +236,7 @@ func New(cfg Config) (*Server, error) {
 		auth:     newAuthCache(cfg.AuthCacheTTL),
 		limiters: newLimiters(cfg.CreateRatePerSec, cfg.CreateBurst),
 		sessions: newSessions(),
+		cors:     cors, dataMethods: map[string][]string{},
 	}
 	s.routes()
 	s.wg.Add(1)
@@ -253,21 +274,38 @@ func (s *Server) routes() {
 	s.data("POST /v1/sandboxes/{id}/commands/{pid}/close-stdin", s.handleCloseStdin)
 	s.data("POST /v1/sandboxes/{id}/commands/{pid}/signal", s.handleSignal)
 	s.data("POST /v1/sandboxes/{id}/commands/{pid}/resize", s.handleResize)
-	s.data("GET /v1/sandboxes/{id}/commands/{pid}/ws", s.handleWS)
+	s.dataWS("GET /v1/sandboxes/{id}/commands/{pid}/ws", s.handleWS)
 	s.data("GET /v1/sandboxes/{id}/files", s.handleFileRead)
 	s.data("PUT /v1/sandboxes/{id}/files", s.handleFileWrite)
 	s.data("DELETE /v1/sandboxes/{id}/files", s.handleFileDelete)
 	s.data("GET /v1/sandboxes/{id}/files/list", s.handleFileList)
+	s.data("GET /v1/sandboxes/{id}/files/stat", s.handleFileStat)
 	s.data("POST /v1/sandboxes/{id}/files/mkdir", s.handleMkdir)
+	s.preflights()
 
 	// Unauthenticated operational endpoints.
-	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	s.handle("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	s.mux.HandleFunc("GET /readyz", s.handleReady)
+	s.handle("GET /readyz", s.handleReady)
 	if !s.cfg.NoMetricsRoute {
-		s.mux.HandleFunc("GET /metrics", s.serveMetrics)
+		s.handle("GET /metrics", s.serveMetrics)
 	}
+}
+
+// handle registers a route and remembers it for Routes.
+func (s *Server) handle(pattern string, h http.HandlerFunc) {
+	s.routeList = append(s.routeList, pattern)
+	s.mux.HandleFunc(pattern, h)
+}
+
+// Routes lists every route the server serves, as "METHOD /path" with the
+// path parameters in braces, in registration order. The CORS preflight
+// handlers (OPTIONS on the data-plane paths, present only when CORS is
+// configured) are not in the list. api/openapi.yaml must describe exactly
+// these routes; a test compares the two.
+func (s *Server) Routes() []string {
+	return append([]string(nil), s.routeList...)
 }
 
 // MetricsHandler serves the Prometheus metrics at GET /metrics and

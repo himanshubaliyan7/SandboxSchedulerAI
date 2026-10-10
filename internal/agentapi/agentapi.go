@@ -19,9 +19,20 @@
 //	PUT    /files?path=P&mode=0644 raw body -> 204
 //	DELETE /files?path=P                    -> 204
 //	GET    /files/list?path=P               -> []FileInfo
-//	POST   /files/mkdir?path=P              -> 204
+//	GET    /files/stat?path=P               -> FileInfo
+//	POST   /files/mkdir?path=P              -> 201 (created) or 204 (already there)
 //
-// Errors are returned as Error with a matching HTTP status.
+// Errors are returned as Error with a matching HTTP status. The codes are
+// bad_request, too_large, no_route, already_initialized, egress_failed,
+// internal (general); bad_cwd, command_not_found, exec_format,
+// permission_denied, tag_in_use, start_failed, pty_failed, not_found,
+// process_exited, stdin_closed, is_a_pty, not_a_pty, bad_signal
+// (processes); not_found, permission_denied, conflict, is_directory,
+// no_space, io_error (files).
+//
+// The stream route sends its status line and headers at once, before the
+// first event, so a caller can tell "accepted, nothing to report yet" from
+// "not answered".
 package agentapi
 
 import "time"
@@ -139,7 +150,8 @@ type ResizeRequest struct {
 	Rows uint16 `json:"rows"`
 }
 
-// FileInfo is one directory entry.
+// FileInfo describes a file or directory: one entry of a listing, or the
+// answer of the stat route.
 type FileInfo struct {
 	Name    string    `json:"name"`
 	Path    string    `json:"path"`
@@ -149,10 +161,14 @@ type FileInfo struct {
 	ModTime time.Time `json:"mod_time"`
 }
 
-// Error is the JSON error body.
+// Error is the JSON error body. Details is only set by the gateway, in
+// the status frame that precedes an application close code: the same
+// code-specific details as the API's error envelope (state and reason
+// for sandbox_terminated).
 type Error struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details,omitempty"`
 }
 
 // WebSocket binary frames carry a one-byte channel prefix. Channels 0-4
@@ -170,7 +186,10 @@ const (
 	ChannelOffset byte = 9 // agent -> client: JSON OffsetFrame, sent first and after a truncation
 )
 
-// StatusFrame is the terminal frame on ChannelStatus.
+// StatusFrame is the terminal frame on ChannelStatus. Exit is set when the
+// process ended; Error when the session was ended for another reason, by
+// the agent (bad_frame, bad_signal, stdin_overflow) or by the gateway
+// (the API error code that is also the close reason, see Close*).
 type StatusFrame struct {
 	Exit  *ExitStatus `json:"exit,omitempty"`
 	Error *Error      `json:"error,omitempty"`
@@ -200,4 +219,72 @@ const (
 	KeepaliveInterval = 25 * time.Second
 	// MaxFrameBytes bounds a single output frame or event payload.
 	MaxFrameBytes = 32 << 10
+	// MaxClientPayloadBytes bounds the payload of one WebSocket frame from
+	// a client (stdin bytes, or a JSON control document), and
+	// MaxClientFrameBytes the whole frame: the channel byte plus the
+	// payload. These two are the only definition of the limit: the agent
+	// and the gateway both set their read limit from MaxClientFrameBytes,
+	// and api/openapi.yaml quotes the same numbers (a test compares them).
+	MaxClientPayloadBytes = 1 << 20
+	MaxClientFrameBytes   = 1 + MaxClientPayloadBytes
 )
+
+// WebSocket close codes.
+//
+// 1000 follows the ChannelStatus frame of a session that ended by itself:
+// the process exited, or the agent refused a frame (StatusFrame.Error).
+// 1009 answers a client frame larger than MaxClientFrameBytes. When the
+// gateway has to end a session for a reason of its own it uses one of the
+// application codes below. The close reason is then the API error code as
+// a bare token (for example "sandbox_not_running"), which is more
+// specific than the close code and always shorter than the 123 bytes a
+// close frame can carry. Where the connection got as far as the upgrade,
+// a ChannelStatus frame with the same code and a message for people is
+// sent just before the close.
+//
+// A client that cannot read the HTTP response of a refused handshake (a
+// browser) asks for the refusal in this form with the query parameter
+// handshake_errors=close; see CloseCodeFor for the mapping.
+const (
+	// CloseSandboxTerminated: the sandbox is not running (any more). Final.
+	CloseSandboxTerminated = 4000
+	// CloseUnauthorized: missing or wrong credentials. Final.
+	CloseUnauthorized = 4001
+	// CloseShuttingDown: the server is stopping. The command may survive a
+	// restart only with the "leave" shutdown policy; reattaching is worth
+	// one try.
+	CloseShuttingDown = 4002
+	// CloseAgentUnavailable: the link to the in-sandbox agent broke while
+	// the sandbox is still running. Reattach with from=<offset>.
+	CloseAgentUnavailable = 4003
+	// CloseNotFound: no such sandbox or command. Final.
+	CloseNotFound = 4004
+	// CloseBadRequest: the handshake request was malformed. Final.
+	CloseBadRequest = 4005
+	// CloseRateLimited: the tenant's bucket is empty. Retry later.
+	CloseRateLimited = 4029
+	// CloseError: anything else (internal error, timeout). Retry.
+	CloseError = 4099
+)
+
+// CloseCodeFor maps an API error code to the WebSocket close code the
+// gateway uses for it.
+func CloseCodeFor(apiCode string) int {
+	switch apiCode {
+	case "sandbox_terminated", "sandbox_not_running":
+		return CloseSandboxTerminated
+	case "unauthorized":
+		return CloseUnauthorized
+	case "shutting_down":
+		return CloseShuttingDown
+	case "agent_unavailable":
+		return CloseAgentUnavailable
+	case "not_found", "process_not_found":
+		return CloseNotFound
+	case "bad_request":
+		return CloseBadRequest
+	case "rate_limited":
+		return CloseRateLimited
+	}
+	return CloseError
+}

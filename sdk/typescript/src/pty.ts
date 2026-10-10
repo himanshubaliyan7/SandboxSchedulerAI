@@ -31,12 +31,61 @@ export const Channel = {
 export const FLOW_HIGH_WATERMARK = 100_000
 /** ... and resumes it below this many, so acknowledgements must come in smaller steps. */
 export const FLOW_LOW_WATERMARK = 10_000
-/** Largest output payload of one server frame. */
+/** Largest output payload of one server frame (the frame is one channel byte longer). */
 export const MAX_SERVER_FRAME_BYTES = 32_768
+/**
+ * Largest payload of one client frame the server accepts: 1 MiB, after
+ * the channel byte (so the frame may be 1048577 bytes). A larger frame is
+ * answered with close code 1009.
+ */
+export const MAX_CLIENT_FRAME_PAYLOAD_BYTES = 1_048_576
+
+/**
+ * Application close codes of the WebSocket route (see "How a WebSocket
+ * ends" in api/openapi.yaml). The close reason is the API error code.
+ */
+export const CloseCode = {
+  SandboxTerminated: 4000,
+  Unauthorized: 4001,
+  ShuttingDown: 4002,
+  AgentUnavailable: 4003,
+  NotFound: 4004,
+  BadRequest: 4005,
+  RateLimited: 4029,
+  Error: 4099,
+} as const
+
+/** The API error code a close code stands for when the reason is missing. */
+const CLOSE_DEFAULT_REASON: Record<number, string> = {
+  [CloseCode.SandboxTerminated]: 'sandbox_terminated',
+  [CloseCode.Unauthorized]: 'unauthorized',
+  [CloseCode.ShuttingDown]: 'shutting_down',
+  [CloseCode.AgentUnavailable]: 'agent_unavailable',
+  [CloseCode.NotFound]: 'process_not_found',
+  [CloseCode.BadRequest]: 'bad_request',
+  [CloseCode.RateLimited]: 'rate_limited',
+  [CloseCode.Error]: 'internal',
+}
+
+/** Close codes after which reattaching cannot succeed. */
+const FINAL_CLOSE_CODES = new Set<number>([CloseCode.SandboxTerminated, CloseCode.Unauthorized, CloseCode.NotFound, CloseCode.BadRequest])
+
+/** Error codes of a status frame that end one connection but not the session. */
+const TRANSIENT_STATUS_CODES = new Set(['agent_unavailable', 'shutting_down', 'rate_limited', 'timeout', 'internal'])
+
+/**
+ * The typed error for an application close code, or undefined when the
+ * close is one to reattach after (or not an application code at all).
+ */
+export function errorFromClose(code: number | undefined, reason: string | undefined): SandboxError | undefined {
+  if (code === undefined || !FINAL_CLOSE_CODES.has(code)) return undefined
+  const token = reason && /^[a-z_]{1,64}$/.test(reason) ? reason : (CLOSE_DEFAULT_REASON[code] ?? 'unknown')
+  return errorFromBody(undefined, { code: token, message: `the server closed the connection: ${token} (close code ${code})` })
+}
 
 const DEFAULT_ACK_EVERY_BYTES = 4_096
-// One stdin frame. The in-sandbox agent accepts 1 MiB per frame including
-// the channel byte; smaller frames also keep keystrokes interleaving well.
+// One stdin frame: far below MAX_CLIENT_FRAME_PAYLOAD_BYTES, so that
+// keystrokes interleave well with a large paste.
 const STDIN_FRAME_BYTES = 64 * 1024
 // Input typed while the socket is reconnecting is kept up to this size.
 const MAX_PENDING_INPUT_BYTES = 1 << 20
@@ -269,7 +318,11 @@ export class PtyHandle {
 
   #connect(): void {
     const { api, sandboxId } = this.#ctx
-    const url = `${api.url(_commandsPath(sandboxId, this.pid, 'ws'), { from: this.#offset }).replace(/^http/, 'ws')}`
+    // handshake_errors=close: a refused handshake arrives as a status
+    // frame and a close code, which is the only form a browser can read.
+    // (A server that predates the parameter ignores it.)
+    const query = { from: this.#offset, handshake_errors: 'close' }
+    const url = `${api.url(_commandsPath(sandboxId, this.pid, 'ws'), query).replace(/^http/, 'ws')}`
     let socket: WebSocketLike
     try {
       socket = openSocket(this.#ctx, url)
@@ -283,7 +336,8 @@ export class PtyHandle {
 
     const onOpen = (): void => {
       if (this.#socket !== socket) return
-      if (!this.#ready.settled) this.#ready.resolve()
+      // Not "ready" yet: with handshake_errors=close a refused handshake
+      // opens too. The first frame tells (see #handle).
       const queued = this.#pending
       this.#pending = []
       this.#pendingBytes = 0
@@ -323,6 +377,9 @@ export class PtyHandle {
     if (this.#done.settled || this.#socket !== socket) return
     const channel = msg[0]
     const payload = msg.subarray(1)
+    // Any frame but a status frame means the session is attached (the
+    // server's first frame is the offset frame).
+    if (channel !== Channel.Status && !this.#ready.settled) this.#ready.resolve()
     switch (channel) {
       case Channel.Stdout:
       case Channel.Stderr: {
@@ -362,8 +419,9 @@ export class PtyHandle {
           return
         }
         const err = errorFromBody(undefined, typeof f.error === 'object' && f.error !== null ? (f.error as ErrorBody) : undefined)
-        // A broken link between gateway and agent is worth another attempt; anything else is final.
-        if (err.code !== 'agent_unavailable') this.#finish(undefined, err)
+        // A broken link to the agent or a stopping server is worth another
+        // attempt (the close that follows triggers it); anything else is final.
+        if (!TRANSIENT_STATUS_CODES.has(err.code)) this.#finish(undefined, err)
         return
       }
       case Channel.Ping:
@@ -379,27 +437,38 @@ export class PtyHandle {
     this.#send(jsonFrame(Channel.Ack, { offset: this.#offset }), false)
   }
 
-  /** The socket closed without a status frame: find out why, then give up or reattach. */
+  /** The socket closed without a final status frame: give up or reattach, as the close code says. */
   async #lost(socket: WebSocketLike, ev: CloseEventLike): Promise<void> {
     if (this.#done.settled || this.#socket !== socket) return
     this.#socket = undefined
     const cfg = this.#ctx.stream
     const signal = this.#abort.signal
 
-    // A plain request tells a dead sandbox or a bad credential (typed
-    // error) from a network blip (reattach). The WebSocket API itself
-    // exposes neither the HTTP status of a refused handshake nor a reason.
-    try {
-      await this.#ctx.api.empty('GET', _commandsPath(this.#ctx.sandboxId, this.pid), {
-        auth: 'data',
-        retry: 'none',
-        signal,
-      })
-    } catch (e) {
-      if (this.#done.settled) return
-      if (e instanceof SandboxError && !(e instanceof ConnectionError) && !(e instanceof TimeoutError) && !isTransient(e)) {
-        this.#finish(undefined, e)
+    const appCode = ev.code !== undefined && ev.code >= 4000 && ev.code <= 4999
+    if (appCode) {
+      // The server said why: no need to ask.
+      const final = errorFromClose(ev.code, ev.reason)
+      if (final) {
+        this.#finish(undefined, final)
         return
+      }
+    } else {
+      // No reason given: a network failure, or a server that predates the
+      // close codes refusing the handshake (which the WebSocket API shows
+      // as a bare 1006). A plain request tells a dead sandbox or a bad
+      // credential (typed error) from a blip (reattach).
+      try {
+        await this.#ctx.api.empty('GET', _commandsPath(this.#ctx.sandboxId, this.pid), {
+          auth: 'data',
+          retry: 'none',
+          signal,
+        })
+      } catch (e) {
+        if (this.#done.settled) return
+        if (e instanceof SandboxError && !(e instanceof ConnectionError) && !(e instanceof TimeoutError) && !isTransient(e)) {
+          this.#finish(undefined, e)
+          return
+        }
       }
     }
     if (this.#done.settled) return

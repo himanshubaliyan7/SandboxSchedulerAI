@@ -11,7 +11,7 @@ from typing import Any, Literal, Union, overload
 import httpx
 
 from .._config import describe, seg
-from ..errors import ConflictError, PathNotFoundError, TransportError
+from ..errors import ApiError, ConflictError, PathNotFoundError, TransportError
 from ..models import EntryInfo, FileData, WriteEntry, WriteInfo
 from .api import ApiClient
 
@@ -183,30 +183,76 @@ class Files:
             else []
         )
 
-    def exists(self, path: str) -> bool:
-        """Whether a file or directory exists at ``path``."""
+    def get_info(self, path: str) -> EntryInfo:
+        """Describe the file or directory at ``path`` (a symbolic link is followed).
+
+        Raises :class:`~sbx.PathNotFoundError` if nothing is there. Uses the
+        server's stat route; against a server, or a sandbox agent, that
+        predates it, falls back to listing the parent directory.
+        """
+        try:
+            data = self._api.json(
+                "GET", self._base + "/stat", plane="data", params={"path": path}, idempotent=True
+            )
+        except ApiError as e:
+            if not _stat_unsupported(e):
+                raise
+        else:
+            return EntryInfo.from_json(data)
         clean = posixpath.normpath(path)
         parent, name = posixpath.split(clean)
+        if not name or name in (".", ".."):
+            # The path names a directory by itself: listing it proves it exists.
+            self.list(clean)
+            return EntryInfo(name=name or "/", path=clean, is_dir=True)
+        for entry in self.list(parent or "."):
+            if entry.name == name:
+                return entry
+        raise PathNotFoundError(f"{path}: no such file or directory", code="file_not_found", status_code=404)
+
+    def stat(self, path: str) -> EntryInfo:
+        """Alias of :meth:`get_info`."""
+        return self.get_info(path)
+
+    def exists(self, path: str) -> bool:
+        """Whether a file or directory exists at ``path``."""
         try:
-            if not name or name in (".", ".."):
-                self.list(clean)
-                return True
-            entries = self.list(parent or ".")
+            self.get_info(path)
         except PathNotFoundError:
             return False
         except ConflictError as e:
             if e.code == "conflict":  # a path component is not a directory
                 return False
             raise
-        return any(entry.name == name for entry in entries)
+        return True
 
-    def make_dir(self, path: str) -> None:
-        """Create a directory and any missing parents. Succeeds if it already exists."""
-        self._api.request("POST", self._base + "/mkdir", plane="data", params={"path": path}, idempotent=True)
+    def make_dir(self, path: str) -> bool:
+        """Create a directory and any missing parents.
+
+        Returns ``True`` if this call created the directory and ``False`` if
+        it already existed (as in E2B). A server that predates the
+        distinction always answers "already existed", so there the result
+        is always ``False``.
+        """
+        response = self._api.request(
+            "POST", self._base + "/mkdir", plane="data", params={"path": path}, idempotent=True
+        )
+        return response.status_code == 201
 
     def remove(self, path: str) -> None:
         """Delete a file, or a directory and everything in it."""
         self._api.request("DELETE", self._base, plane="data", params={"path": path})
+
+
+def _stat_unsupported(e: ApiError) -> bool:
+    """Whether an answer means "this server, or this sandbox's agent, has no stat route"."""
+    if isinstance(e, PathNotFoundError):
+        return False  # the real answer of a server that has the route
+    if e.status_code == 404:
+        return e.code != "file_not_found" and str(e).startswith("no such route")
+    if e.status_code == 405:
+        return True
+    return e.code in ("not_implemented", "no_route")  # a new server in front of an old agent
 
 
 def _read_chunks(reader: Any, sent: List[int]) -> Iterator[bytes]:

@@ -570,7 +570,10 @@ func TestFiles(t *testing.T) {
 	tok := withToken(sb.AccessToken)
 
 	payload := bytes.Repeat([]byte("0123456789abcdef"), 64<<10) // 1 MiB
+	// mkdir says whether it made the directory: 201, or 204 if it was there.
+	h.want(h.do("POST", base+"/mkdir?path=data/in", nil, tok), 201, "")
 	h.want(h.do("POST", base+"/mkdir?path=data/in", nil, tok), 204, "")
+	h.want(h.do("POST", base+"/mkdir?path=data", nil, tok), 204, "")
 	h.want(h.do("PUT", base+"?path=data/in/blob.bin&mode=0600", payload, tok), 204, "")
 	r := h.want(h.do("GET", base+"?path=data/in/blob.bin", nil, tok), 200, "")
 	if !bytes.Equal(r.Body, payload) || r.Header.Get("Content-Length") != strconv.Itoa(len(payload)) ||

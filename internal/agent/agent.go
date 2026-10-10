@@ -108,6 +108,7 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("PUT "+v+"/files", a.handleFileWrite)
 	mux.HandleFunc("DELETE "+v+"/files", a.handleFileDelete)
 	mux.HandleFunc("GET "+v+"/files/list", a.handleFileList)
+	mux.HandleFunc("GET "+v+"/files/stat", a.handleFileStat)
 	mux.HandleFunc("POST "+v+"/files/mkdir", a.handleMkdir)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &apiError{http.StatusNotFound, "no_route", "no such route: " + r.Method + " " + r.URL.Path})

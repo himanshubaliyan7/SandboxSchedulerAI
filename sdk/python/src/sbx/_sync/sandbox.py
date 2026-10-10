@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from builtins import list as List
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
 from .._config import ConnectionConfig, RetryPolicy, ms, seg
+from .._variant import ClassOrInstanceMethod
 from ..errors import ConfigurationError, NotFoundError, SandboxNotRunningError, SbxError
 from ..models import NetworkPolicy, SandboxEvent, SandboxInfo, SandboxStats, TemplateInfo
 from .api import ApiClient
@@ -40,6 +41,30 @@ def _api(
         ws_base_url=ws_base_url,
     )
     return ApiClient(config, http_client=http_client, transport=transport)
+
+
+class _KillSelf(Protocol):
+    """``sandbox.kill(...)``."""
+
+    def __call__(self, *, wait: bool = False) -> bool: ...
+
+
+class _KillById(Protocol):
+    """``Sandbox.kill(sandbox_id, ...)``."""
+
+    def __call__(
+        self,
+        sandbox_id: str,
+        *,
+        wait: bool = False,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        request_timeout: float | None = None,
+        retry: RetryPolicy | None = None,
+        headers: Mapping[str, str] | None = None,
+        http_client: httpx.Client | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> bool: ...
 
 
 class Sandbox:
@@ -393,8 +418,8 @@ class Sandbox:
             self._api.json("GET", self._path("/stats"), plane="control", idempotent=True)
         )
 
-    def kill(self, *, wait: bool = False) -> bool:
-        """Kill the sandbox and destroy its storage.
+    def _kill(self, *, wait: bool = False) -> bool:
+        """Kill this sandbox and destroy its storage (``sandbox.kill()``).
 
         Returns ``True`` if the server accepted the request and ``False``
         if there is no such sandbox. By default the call returns as soon as
@@ -409,6 +434,57 @@ class Sandbox:
             return False
         return True
 
+    @classmethod
+    def _kill_by_id(
+        cls,
+        sandbox_id: str,
+        *,
+        wait: bool = False,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        request_timeout: float | None = None,
+        retry: RetryPolicy | None = None,
+        headers: Mapping[str, str] | None = None,
+        http_client: httpx.Client | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> bool:
+        """Kill a sandbox by id, without connecting to it (``Sandbox.kill(sandbox_id)``).
+
+        Needs the tenant API key. Returns ``False`` if there is no such
+        sandbox; ``wait`` is as for ``sandbox.kill()``.
+        """
+        if not sandbox_id:
+            raise ValueError("sandbox_id must not be empty")
+        api = _api(
+            api_key=api_key,
+            base_url=base_url,
+            request_timeout=request_timeout,
+            retry=retry,
+            headers=headers,
+            http_client=http_client,
+            transport=transport,
+        )
+        params = {"wait": "true"} if wait else None
+        try:
+            api.request(
+                "DELETE", f"/v1/sandboxes/{seg(sandbox_id)}", plane="control", params=params, idempotent=True
+            )
+        except NotFoundError:
+            return False
+        finally:
+            api.close()
+        return True
+
+    #: ``sandbox.kill(wait=False)`` kills this sandbox;
+    #: ``Sandbox.kill(sandbox_id, api_key=...)`` kills one by id.
+    #: Both return ``False`` if there is no such sandbox.
+    kill = ClassOrInstanceMethod[_KillById, _KillSelf](
+        "_kill_by_id",
+        "_kill",
+        "Kill a sandbox: ``sandbox.kill(wait=False)`` on an instance, "
+        "``Sandbox.kill(sandbox_id, *, wait=False, api_key=None, base_url=None, ...)`` on the class.",
+    )
+
     def close(self) -> None:
         """Release the HTTP connections. The sandbox keeps running."""
         self._api.close()
@@ -419,7 +495,7 @@ class Sandbox:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         try:
             if self._api.config.api_key:
-                self.kill()
+                self._kill()
         except SbxError:
             # Do not hide the exception that is already propagating.
             if exc_type is None:

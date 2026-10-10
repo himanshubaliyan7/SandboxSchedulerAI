@@ -28,6 +28,12 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request, p *Process)
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	rc := http.NewResponseController(w)
+	// The status line and headers go out now, whatever the process is
+	// doing: a caller with a header timeout must not mistake a silent
+	// command for a dead agent.
+	if rc.Flush() != nil {
+		return
+	}
 	enc := json.NewEncoder(w)
 	ctx := r.Context()
 

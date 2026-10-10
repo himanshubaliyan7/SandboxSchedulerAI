@@ -71,7 +71,23 @@ func (c *Client) ListFiles(ctx context.Context, path string) ([]agentapi.FileInf
 }
 
 // Mkdir creates a directory and any missing parents. It succeeds if the
-// directory already exists.
-func (c *Client) Mkdir(ctx context.Context, path string) error {
-	return c.call(ctx, http.MethodPost, fileURL("/files/mkdir", path, nil), nil, nil)
+// directory already exists; created says whether this call made it. (An
+// agent older than the stat route always answers 204, which reads as
+// "not created".)
+func (c *Client) Mkdir(ctx context.Context, path string) (created bool, err error) {
+	resp, err := c.do(ctx, http.MethodPost, fileURL("/files/mkdir", path, nil), nil, "")
+	if err != nil {
+		return false, err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusCreated, nil
+}
+
+// StatFile describes one path. A missing path is a 404 with code
+// "not_found"; an agent that predates the route answers 404 "no_route".
+func (c *Client) StatFile(ctx context.Context, path string) (agentapi.FileInfo, error) {
+	var out agentapi.FileInfo
+	err := c.call(ctx, http.MethodGet, fileURL("/files/stat", path, nil), nil, &out)
+	return out, err
 }

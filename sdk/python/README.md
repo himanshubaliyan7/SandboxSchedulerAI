@@ -68,6 +68,7 @@ Sandbox.list_templates()
 
 sandbox.kill()  # True; False if there is no such sandbox
 sandbox.kill(wait=True)  # returns only after the container is gone
+Sandbox.kill("sb-0123456789abcdef")  # by id, without connecting (needs the API key)
 ```
 
 `kill()` returns as soon as the server has fenced the sandbox (it is unusable
@@ -124,8 +125,18 @@ if result.exit_code == 1:
 ```
 
 **Timeouts.** `timeout` is the wall-clock limit of the command in seconds,
-enforced inside the sandbox. `None` (the default) means no limit; this
-differs from E2B, whose default is 60 seconds.
+enforced inside the sandbox. The default is 60 seconds, as in E2B and in the
+TypeScript SDK; pass `timeout=0` for no limit.
+
+**Shell.** A command line without `args` is run by `/bin/sh -c`. E2B uses
+`/bin/bash -l -c`; the default image here (Alpine) has no bash, and both
+SDKs of this project use `/bin/sh`.
+
+**Retrying a start.** If the connection fails while a command is being
+started you cannot know whether it runs. Pass `idempotency_key="..."` and
+call `run` again with the same key and command: the server starts it at most
+once and the second call attaches to it (`sbxd` with `Idempotency-Key`
+support; an older server ignores the key).
 
 ### Background commands
 
@@ -180,7 +191,10 @@ for chunk in sandbox.files.read("data/big.parquet", format="stream"):
 
 sandbox.files.list("data")  # -> list[EntryInfo]: name, path, size, mode, is_dir, modified_time
 sandbox.files.exists("data/in.csv")
-sandbox.files.make_dir("out/plots")
+sandbox.files.get_info(
+    "data/in.csv"
+)  # EntryInfo(name, path, size, mode, is_dir, ...); PathNotFoundError if absent
+sandbox.files.make_dir("out/plots")  # True if it created the directory, False if it was there
 sandbox.files.remove("data")  # a file, or a directory and everything in it
 ```
 
@@ -223,6 +237,12 @@ handle does the protocol work:
   byte where output stopped. Lost output is reported through `on_truncated`
   and `result.truncated`. If the sandbox is gone, `wait()` raises the reason
   (`SandboxNotRunningError.reason`, e.g. `idle_timeout`).
+- **Close codes.** The server ends a session with an application close code
+  (4000-4099). The final ones (sandbox terminated, unauthorised, not found,
+  bad request) become the matching typed error at once; the transient ones
+  (server shutting down, agent unavailable, rate limited) make the handle
+  attach again. A server without close codes is handled as before, through
+  the HTTP status of the next handshake.
 - The frame size limit is raised to 4 MiB (the server sends up to 32769 bytes).
 
 `wait()` on a PTY returns the exit status and does not raise on non-zero: for
@@ -315,16 +335,25 @@ Sandbox.create("python", ws_base_url="wss://ws.example.com")  # WebSocket origin
 A client passed with `http_client=` is not closed by the SDK. Every request
 carries `User-Agent: sbx-python/<version> (...)`.
 
+## Compatibility with older servers
+
+| Feature | With a server that predates it |
+|---|---|
+| `files.get_info` / `exists` (stat route) | falls back to listing the parent directory (also when only the sandbox's agent is older) |
+| `files.make_dir` result | always `False` |
+| WebSocket close codes | the reason comes from the HTTP status of the re-attach, as before |
+| `idempotency_key` | ignored by the server: a repeated `run` starts a second command |
+
 ## Differences from E2B
 
 | | E2B | sbx |
 |---|---|---|
 | Template | optional | required first argument of `create` |
-| Command timeout default | 60 s | none |
+| Command timeout default | 60 s | 60 s (`timeout=0` for none) |
 | `commands.run(..., args=[...])` | not available | runs without a shell |
 | Non-zero exit | raises `CommandExitException` | raises `CommandExitError`; `check=False` to opt out |
 | `pid` | integer | opaque string |
-| `files.make_dir` | returns whether it created the directory | returns `None` (the server does not say) |
+| `files.make_dir` | returns whether it created the directory | the same |
 | `pty.create` | `create(size, ...)`, output via `handle.wait(on_pty=...)` | `create(cols, rows, on_data, ...)` |
 | Pause / resume, `get_host`, `files.watch_dir`, `files.rename` | yes | not offered by the server |
 

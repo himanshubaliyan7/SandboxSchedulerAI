@@ -300,6 +300,8 @@ class Commands:
         stdin: bool,
         tag: str | None,
     ) -> dict[str, Any]:
+        if timeout is None:
+            timeout = self._api.config.command_timeout
         if not cmd:
             raise ValueError("cmd must not be empty")
         body: dict[str, Any]
@@ -339,6 +341,7 @@ class Commands:
         stdin: bool = False,
         tag: str | None = None,
         check: bool = True,
+        idempotency_key: str | None = None,
     ) -> CommandResult: ...
 
     @overload
@@ -356,6 +359,7 @@ class Commands:
         stdin: bool = False,
         tag: str | None = None,
         check: bool = True,
+        idempotency_key: str | None = None,
     ) -> CommandHandle: ...
 
     def run(
@@ -372,6 +376,7 @@ class Commands:
         stdin: bool = False,
         tag: str | None = None,
         check: bool = True,
+        idempotency_key: str | None = None,
     ) -> CommandResult | CommandHandle:
         """Run a command in the sandbox.
 
@@ -385,7 +390,8 @@ class Commands:
             cwd: working directory (default ``/workspace``).
             timeout: wall-clock limit in seconds, enforced by the sandbox:
                 the process group is killed and the reason is ``timeout``.
-                ``None`` or 0 means no limit.
+                Default 60 (as in E2B and in the TypeScript SDK); 0 means
+                no limit.
             on_stdout, on_stderr: called with decoded text as it arrives.
             background: return a handle as soon as the command has started
                 instead of waiting for it.
@@ -395,12 +401,20 @@ class Commands:
             check: raise :class:`~sbx.CommandExitError` on a non-zero exit
                 status (E2B's behaviour). With ``check=False`` the result is
                 returned whatever the status.
+            idempotency_key: makes the start safe to repeat. The server
+                starts at most one command per sandbox and key, and a
+                repeated ``run`` with the same key and command attaches to
+                the one already started; use it to retry after a
+                connection failure. 1-128 characters of ``[A-Za-z0-9._:-]``.
+                A server that predates ``Idempotency-Key`` ignores it and
+                starts a second command.
         """
         body = self._start_body(cmd, args, envs, cwd, timeout, stdin, tag)
+        extra = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         if background:
             # A 429 is answered before the command exists, so it is retried;
             # nothing else is, because the command may have started.
-            response = self._api.request("POST", self._path(), plane="data", json=body)
+            response = self._api.request("POST", self._path(), plane="data", json=body, headers=extra)
             return CommandHandle(
                 self._api,
                 self._sandbox_id,
@@ -410,7 +424,7 @@ class Commands:
                 check=check,
             )
         stream = self._api.open_stream(
-            "POST", self._path(), plane="data", params={"wait": "stream"}, json=body
+            "POST", self._path(), plane="data", params={"wait": "stream"}, json=body, headers=extra
         )
         handle = CommandHandle(
             self._api,

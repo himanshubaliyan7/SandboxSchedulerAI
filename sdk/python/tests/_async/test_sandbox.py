@@ -309,3 +309,23 @@ async def test_a_caller_supplied_http_client_is_used_and_left_open(server: FakeS
         assert not client.is_closed
         assert server.requests[-1].headers["x-trace"] == "t1"
         assert server.requests[-1].headers["x-extra"] == "e1"
+
+
+async def test_kill_by_id_on_the_class(server: FakeServer, sandbox: AsyncSandbox) -> None:
+    # Sandbox.kill(id): no instance, no access token, just the API key.
+    assert await AsyncSandbox.kill(sandbox.sandbox_id, api_key=API_KEY, transport=server.transport()) is True
+    request = server.requests[-1]
+    assert request.method == "DELETE" and request.url.path == f"/v1/sandboxes/{sandbox.sandbox_id}"
+    assert request.headers["x-api-key"] == API_KEY and "wait" not in request.url.params
+    assert server.sandbox(sandbox.sandbox_id).state == "destroyed"
+    assert await AsyncSandbox.kill(
+        sandbox.sandbox_id, wait=True, api_key=API_KEY, transport=server.transport()
+    )
+    assert server.requests[-1].url.params["wait"] == "true"
+    assert (
+        await AsyncSandbox.kill("sb-ffffffffffffffff", api_key=API_KEY, transport=server.transport()) is False
+    )
+    with pytest.raises(ValueError):
+        await AsyncSandbox.kill("", api_key=API_KEY, transport=server.transport())
+    # The instance form is unchanged.
+    assert await sandbox.kill() is True

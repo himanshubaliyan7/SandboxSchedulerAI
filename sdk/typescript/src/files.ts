@@ -1,7 +1,7 @@
 /** Files: streamed upload and download, directory listing, mkdir, remove. */
 
 import type { SandboxContext } from './commands.js'
-import { ConnectionError, SandboxError } from './errors.js'
+import { ConnectionError, NotFoundError, SandboxError } from './errors.js'
 import type { CallOptions } from './http.js'
 import { type EntryInfo, entryFromWire, list } from './types.js'
 import { concatBytes, utf8 } from './util.js'
@@ -141,40 +141,76 @@ export class Files {
     return list(res, 'files').map(entryFromWire)
   }
 
-  /** Whether a file or directory exists at `path`. */
-  async exists(path: string, opts: CallOptions = {}): Promise<boolean> {
-    // The API has no stat route. Opening the file and dropping the body
-    // costs one request and transfers next to nothing.
+  /**
+   * Describes the file or directory at `path` (E2B: `getInfo`). A symbolic
+   * link is followed. Rejects with `NotFoundError` (`file_not_found`) if
+   * nothing is there.
+   *
+   * Uses the server's stat route; against a server (or a sandbox agent)
+   * that predates it, falls back to listing the parent directory.
+   */
+  async getInfo(path: string, opts: CallOptions = {}): Promise<EntryInfo> {
     try {
-      const res = await this.#ctx.api.request('GET', filesPath(this.#ctx.sandboxId), {
+      const res = await this.#ctx.api.json<unknown>('GET', filesPath(this.#ctx.sandboxId, 'stat'), {
         auth: 'data',
         retry: 'idempotent',
-        stream: true,
         query: { path },
         signal: opts.signal,
         timeoutMs: opts.requestTimeoutMs,
       })
-      await res.body?.cancel().catch(() => {})
-      this.#ctx.api.release(res)
+      return entryFromWire(res)
+    } catch (e) {
+      if (!statUnsupported(e)) throw e
+    }
+    const clean = path.replace(/\/+$/, '')
+    const cut = clean.lastIndexOf('/')
+    const name = cut === -1 ? clean : clean.slice(cut + 1)
+    if (name === '' || name === '.' || name === '..') {
+      // The path names a directory by itself: listing it proves it exists.
+      await this.list(path, opts)
+      return { name: name || '/', path, type: 'dir', size: 0, mode: '0755' }
+    }
+    const parent = cut === -1 ? '.' : cut === 0 ? '/' : clean.slice(0, cut)
+    const entry = (await this.list(parent, opts)).find((e) => e.name === name)
+    if (!entry) throw new NotFoundError(`${path}: no such file or directory`, { code: 'file_not_found', status: 404 })
+    return entry
+  }
+
+  /** Alias of {@link Files.getInfo}. */
+  stat(path: string, opts: CallOptions = {}): Promise<EntryInfo> {
+    return this.getInfo(path, opts)
+  }
+
+  /** Whether a file or directory exists at `path`. */
+  async exists(path: string, opts: CallOptions = {}): Promise<boolean> {
+    try {
+      await this.getInfo(path, opts)
       return true
     } catch (e) {
-      if (e instanceof SandboxError) {
-        if (e.code === 'file_not_found') return false
-        if (e.code === 'is_directory') return true
-      }
+      if (e instanceof SandboxError && e.code === 'file_not_found') return false
+      // A component of the path is a file: nothing can exist below it.
+      if (e instanceof SandboxError && e.code === 'conflict') return false
       throw e
     }
   }
 
-  /** Creates a directory and any missing parents. Succeeds if it already exists. */
-  async makeDir(path: string, opts: CallOptions = {}): Promise<void> {
-    await this.#ctx.api.empty('POST', filesPath(this.#ctx.sandboxId, 'mkdir'), {
+  /**
+   * Creates a directory and any missing parents. Resolves with `true` if
+   * this call created it and `false` if it already existed (as in E2B).
+   *
+   * A server that predates the distinction always answers "already
+   * existed", so there the result is always `false`.
+   */
+  async makeDir(path: string, opts: CallOptions = {}): Promise<boolean> {
+    const res = await this.#ctx.api.request('POST', filesPath(this.#ctx.sandboxId, 'mkdir'), {
       auth: 'data',
       retry: 'idempotent',
       query: { path },
       signal: opts.signal,
       timeoutMs: opts.requestTimeoutMs,
     })
+    await res.body?.cancel().catch(() => {})
+    return res.status === 201
   }
 
   /** Deletes a file, or a directory and everything in it. */
@@ -193,4 +229,14 @@ function incomplete(path: string, received: number, expected: number): Connectio
   return new ConnectionError(`the download of ${path} is incomplete: ${received} of ${expected} bytes`, {
     code: 'download_interrupted',
   })
+}
+
+/** True when the answer means "this server or this sandbox's agent has no stat route". */
+function statUnsupported(e: unknown): boolean {
+  if (!(e instanceof SandboxError)) return false
+  // An old server: 404 `not_found` ("no such route"); `file_not_found` is the real answer of a new one.
+  if (e.status === 404 && e.code !== 'file_not_found') return true
+  if (e.status === 405) return true
+  // A new server in front of an old agent.
+  return e.code === 'not_implemented' || e.code === 'no_route'
 }

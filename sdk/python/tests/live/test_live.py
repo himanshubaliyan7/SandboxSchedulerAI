@@ -224,8 +224,15 @@ def test_files(sandbox: Sandbox) -> None:
     assert {e.name for e in files.list()} >= {"notes", "data", "multi"}
     assert all(e.is_dir for e in files.list() if e.name in ("notes", "data", "multi"))
 
-    files.make_dir("made/deep/er")
-    files.make_dir("made/deep/er")
+    assert files.make_dir("made/deep/er") is True
+    assert files.make_dir("made/deep/er") is False
+    assert files.make_dir("made") is False
+    info = files.get_info("made/deep")
+    assert (info.name, info.path, info.is_dir) == ("deep", "/workspace/made/deep", True)
+    blob = files.get_info("data/blob.bin")
+    assert not blob.is_dir and blob.size > 0
+    with pytest.raises(sbx.PathNotFoundError):
+        files.get_info("made/nope")
     assert (
         files.exists("made/deep/er")
         and files.exists("data/blob.bin")
@@ -556,3 +563,64 @@ async def test_async_client_smoke() -> None:
         sandbox_id = sb.sandbox_id
     listed = await AsyncSandbox.list(state="all", limit=1000, api_key=API_KEY, base_url=BASE_URL)
     assert {s.sandbox_id: s.state for s in listed}[sandbox_id] in ("recycling", "destroyed")
+
+
+def test_kill_by_id_and_pty_close_code() -> None:
+    sb = create()
+    try:
+        handle = sb.pty.create(80, 24, lambda data: None)
+        # Sandbox.kill(id): the class form, with nothing but the id and the API key.
+        assert Sandbox.kill(sb.sandbox_id, api_key=API_KEY, base_url=BASE_URL) is True
+        # The open terminal is told why it ended, by status frame and close code 4000.
+        with pytest.raises(sbx.SandboxTerminatedError) as e:
+            handle.wait(timeout=15)
+        assert e.value.code == "sandbox_terminated" and e.value.reason == "released"
+        assert handle.reconnects == 0
+        assert Sandbox.kill("sb-0000000000000000", api_key=API_KEY, base_url=BASE_URL) is False
+    finally:
+        sb.close()
+
+
+def test_stream_headers_idempotency_and_cors(sandbox: Sandbox) -> None:
+    import httpx
+
+    token = sandbox.access_token or ""
+    base = f"{BASE_URL}/v1/sandboxes/{sandbox.sandbox_id}"
+    handle = sandbox.commands.run("sleep 2; echo late", background=True)
+    with httpx.Client(timeout=httpx.Timeout(10, read=1.0)) as http:
+        # The headers of a silent command's stream arrive at once (read timeout 1 s < 2 s of silence).
+        started = time.monotonic()
+        with http.stream(
+            "GET", f"{base}/commands/{handle.pid}/stream", headers={"X-Access-Token": token}
+        ) as r:
+            took = time.monotonic() - started
+            assert r.status_code == 200
+        print(f"[measured] stream headers of a command silent for 2 s: {took * 1000:.0f} ms")
+        assert took < 0.5
+
+        # CORS: the script starts the server with --cors-allowed-origins http://app.sbx.test.
+        ok = http.get(f"{base}/commands", headers={"X-Access-Token": token, "Origin": "http://app.sbx.test"})
+        assert (
+            ok.status_code == 200 and ok.headers.get("access-control-allow-origin") == "http://app.sbx.test"
+        )
+        assert "access-control-allow-credentials" not in ok.headers
+        bad = http.get(f"{base}/commands", headers={"X-Access-Token": token, "Origin": "http://evil.test"})
+        assert bad.status_code == 403 and "access-control-allow-origin" not in bad.headers
+        key = http.get(f"{base}/commands", headers={"X-API-Key": API_KEY, "Origin": "http://app.sbx.test"})
+        assert key.status_code == 403 and key.json()["error"]["code"] == "api_key_not_allowed"
+        pre = http.request(
+            "OPTIONS",
+            f"{base}/commands",
+            headers={"Origin": "http://app.sbx.test", "Access-Control-Request-Method": "POST"},
+        )
+        assert pre.status_code == 204 and "X-Access-Token" in pre.headers["access-control-allow-headers"]
+    handle.wait()
+
+    # A repeated start with the same key attaches to the first command.
+    key_ = f"live-{time.time_ns()}"
+    first = sandbox.commands.run("echo once; sleep 0.3", idempotency_key=key_)
+    again = sandbox.commands.run("echo once; sleep 0.3", idempotency_key=key_)
+    assert again.pid == first.pid and again.stdout == "once\n"
+    with pytest.raises(sbx.ConflictError) as e:
+        sandbox.commands.run("echo other", idempotency_key=key_)
+    assert e.value.code == "idempotency_key_reused"

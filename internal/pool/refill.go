@@ -74,6 +74,9 @@ func (c *Controller) breakerResult(templateID string, ok bool) {
 func (c *Controller) Refill(ctx context.Context) error {
 	c.refillMu.Lock()
 	defer c.refillMu.Unlock()
+	if c.quiesced() {
+		return nil // shutting down: nothing is created any more
+	}
 
 	templates, err := c.store.ListTemplates(ctx)
 	if err != nil {
@@ -151,6 +154,11 @@ func (c *Controller) startCreate(ctx context.Context, tmpl core.Template) error 
 	// Register before the row exists so the reconciler never sees a
 	// CREATING row of this process that it does not know is in flight.
 	c.mu.Lock()
+	if c.quiesce {
+		c.mu.Unlock()
+		cancel()
+		return ErrStopped
+	}
 	c.creating[id] = &createOp{templateID: tmpl.ID, cancel: cancel}
 	c.mu.Unlock()
 	unregister := func() {
@@ -313,7 +321,8 @@ func (c *Controller) failCreate(ctx context.Context, sb core.Sandbox, inst runti
 	switch {
 	case timedOut(ctx):
 		reason = core.ReasonDeadlineExceeded
-	case c.rootCtx.Err() != nil:
+	case c.rootCtx.Err() != nil, ctx.Err() != nil && c.quiesced():
+		// Cancelled by Stop, or by a Quiesce that ran out of time.
 		reason = core.ReasonHostDrain
 	}
 	if reason != core.ReasonHostDrain {

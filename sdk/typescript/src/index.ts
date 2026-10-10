@@ -31,7 +31,17 @@ export type { FileData, FileReadOptions, FileWriteOptions } from './files.js'
 export { Files } from './files.js'
 export type { CallOptions, ConnectionOptions, FetchLike, RetryOptions, WebSocketConstructor, WebSocketLike } from './http.js'
 export type { PtyConnectOptions, PtyCreateOptions, PtyOutputOptions, PtyResult, PtySize } from './pty.js'
-export { Channel, FLOW_HIGH_WATERMARK, FLOW_LOW_WATERMARK, MAX_SERVER_FRAME_BYTES, Pty, PtyHandle } from './pty.js'
+export {
+  Channel,
+  CloseCode,
+  errorFromClose,
+  FLOW_HIGH_WATERMARK,
+  FLOW_LOW_WATERMARK,
+  MAX_CLIENT_FRAME_PAYLOAD_BYTES,
+  MAX_SERVER_FRAME_BYTES,
+  Pty,
+  PtyHandle,
+} from './pty.js'
 export type {
   SandboxConnectOptions,
   SandboxCreateOptions,

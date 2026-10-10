@@ -57,11 +57,14 @@ func TestFiles(t *testing.T) {
 	if err := h.c.WriteFile(ctx, "a/b/empty", 0o600, strings.NewReader("")); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.c.Mkdir(ctx, "a/b/dir/deep"); err != nil {
-		t.Fatal(err)
+	if created, err := h.c.Mkdir(ctx, "a/b/dir/deep"); err != nil || !created {
+		t.Fatalf("mkdir with missing parents: created %v, err %v", created, err)
 	}
-	if err := h.c.Mkdir(ctx, "a/b/dir/deep"); err != nil {
-		t.Fatalf("mkdir of an existing directory: %v", err)
+	if created, err := h.c.Mkdir(ctx, "a/b/dir/deep"); err != nil || created {
+		t.Fatalf("mkdir of an existing directory: created %v, err %v", created, err)
+	}
+	if created, err := h.c.Mkdir(ctx, "a/b/dir"); err != nil || created {
+		t.Fatalf("mkdir of an existing parent: created %v, err %v", created, err)
 	}
 
 	ls, err := h.c.ListFiles(ctx, "a/b")
@@ -115,7 +118,7 @@ func TestFiles(t *testing.T) {
 	if _, err := h.c.ListFiles(ctx, "a/b/small.txt"); !agentclient.IsConflict(err) {
 		t.Errorf("list a file: %v, want 409", err)
 	}
-	if err := h.c.Mkdir(ctx, "a/b/small.txt/x"); !agentclient.IsConflict(err) {
+	if _, err := h.c.Mkdir(ctx, "a/b/small.txt/x"); !agentclient.IsConflict(err) {
 		t.Errorf("mkdir under a file: %v, want 409", err)
 	}
 	if _, err := h.c.ReadFile(ctx, "", io.Discard); agentclient.StatusOf(err) != http.StatusBadRequest {

@@ -245,7 +245,7 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
       await expect(sb.commands.connect('no-such-pid')).rejects.toBeInstanceOf(NotFoundError)
     })
 
-    it('diagnostic: when the stream route of a silent command sends its response headers', async () => {
+    it('the stream route of a silent command sends its response headers at once', async () => {
       const h = await sb.commands.run('sleep 2; echo x', { background: true })
       const t0 = Date.now()
       const res = await fetch(`${baseUrl}/v1/sandboxes/${sb.sandboxId}/commands/${h.pid}/stream`, {
@@ -253,8 +253,19 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
       })
       const headersAfter = Date.now() - t0
       await res.body?.cancel()
-      console.log(`[diagnostic] GET .../stream of a command silent for 2 s: response headers after ${headersAfter} ms`)
+      console.log(`[measured] GET .../stream of a command silent for 2 s: response headers after ${headersAfter} ms`)
+      expect(res.status).toBe(200)
+      expect(headersAfter).toBeLessThan(500)
       await h.wait()
+    })
+
+    it('an Idempotency-Key makes a repeated start attach to the first command', async () => {
+      const key = `live-${Date.now()}`
+      const first = await sb.commands.run('echo once; sleep 0.3', { idempotencyKey: key })
+      const again = await sb.commands.run('echo once; sleep 0.3', { idempotencyKey: key })
+      expect(again.pid).toBe(first.pid)
+      expect(again.stdout).toBe('once\n')
+      await expect(sb.commands.run('echo other', { idempotencyKey: key })).rejects.toMatchObject({ code: 'idempotency_key_reused' })
     })
 
     it('reconnects with from=<offset> when the stream is cut mid-command, without loss or duplication', async () => {
@@ -378,9 +389,12 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
     })
 
     it('makeDir, mode, and errors', async () => {
-      await sb.files.makeDir('a/b/c')
-      await sb.files.makeDir('a/b/c')
+      expect(await sb.files.makeDir('a/b/c')).toBe(true)
+      expect(await sb.files.makeDir('a/b/c')).toBe(false)
+      expect(await sb.files.makeDir('a')).toBe(false)
       expect((await sb.files.list('a/b')).map((e) => [e.name, e.type])).toEqual([['c', 'dir']])
+      expect(await sb.files.getInfo('a/b')).toMatchObject({ name: 'b', path: '/workspace/a/b', type: 'dir' })
+      await expect(sb.files.getInfo('a/nope')).rejects.toMatchObject({ code: 'file_not_found', status: 404 })
       await sb.files.write('a/run.sh', '#!/bin/sh\necho ran\n', { mode: 0o755 })
       expect((await sb.files.list('a')).find((e) => e.name === 'run.sh')?.mode).toBe('0755')
       expect((await sb.commands.run('./a/run.sh', { args: [] })).stdout).toBe('ran\n')
@@ -499,6 +513,17 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
   })
 
   describe('kill', () => {
+    it('a terminal learns from the close code that its sandbox was killed', async () => {
+      const victim = await create({ timeoutMs: 120_000 })
+      extra.push(victim)
+      const pty = await victim.pty.create()
+      const waiting = pty.wait().catch((e) => e)
+      await victim.kill()
+      const err = await waiting
+      expect(err).toBeInstanceOf(SandboxTerminatedError)
+      expect(err).toMatchObject({ code: 'sandbox_terminated', reason: 'released' })
+    })
+
     it('kill ends the sandbox; later calls report why', async () => {
       const victim = await create({ timeoutMs: 120_000 })
       extra.push(victim)
@@ -513,6 +538,8 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
       expect(err).toMatchObject({ reason: 'released' })
       await expect(h.wait()).rejects.toBeInstanceOf(SandboxTerminatedError)
       expect(await victim.kill()).toBe(true) // idempotent
+      // A terminal on a dead sandbox is refused with a close code the SDK types.
+      await expect(victim.pty.connect(h.pid)).rejects.toBeInstanceOf(SandboxTerminatedError)
       expect((await Sandbox.list(conn())).map((s) => s.sandboxId)).not.toContain(victim.sandboxId)
     })
 

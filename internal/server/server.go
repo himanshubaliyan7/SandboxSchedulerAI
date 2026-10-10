@@ -31,20 +31,38 @@ import (
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
 )
 
-// Shutdown policies: what a graceful stop does with tenant-owned
-// sandboxes. Warm sandboxes are always left running; they hold no tenant
-// data and the next start re-adopts them.
+// Shutdown policies: what a graceful stop (SIGTERM, SIGINT) leaves behind.
+//
+// Whatever the policy, the stop first closes the API (no new requests,
+// open streams and WebSockets are ended with shutting_down), then stops
+// the refill loop and waits for the creates in flight to finish, and only
+// then touches a sandbox. So no create is ever started, or left half
+// done, by a shutdown: every container that remains is a whole sandbox
+// with a row that says what it is.
 const (
-	// ShutdownDrain releases every tenant-owned sandbox with reason
-	// host_drain before exiting. This is the default: the egress proxy
-	// and the gateway die with the process, so a session left behind
-	// would be unreachable and its network policy unenforced.
+	// ShutdownDrain (the default) releases every tenant-owned sandbox
+	// with reason host_drain and leaves the warm ones running. A tenant
+	// session cannot outlive the process: its egress proxy and its
+	// gateway die with it, so it would be unreachable and its network
+	// policy unenforced. A warm sandbox holds no tenant data and is
+	// re-adopted by the next start (after one readiness probe), which
+	// makes a restart cheap. After the stop, the containers of this host
+	// id are exactly its warm sandboxes.
 	ShutdownDrain = "drain"
-	// ShutdownLeave exits without touching tenant-owned sandboxes. They
+	// ShutdownLeave exits without touching any sandbox. Tenant sandboxes
 	// keep running with no way out (their proxy socket is gone) and no
 	// way in until the next start, whose first reconcile pass recycles
 	// them with reason host_drain. Useful only to make a stop fast.
+	// After the stop, the containers of this host id are its warm and
+	// its tenant sandboxes.
 	ShutdownLeave = "leave"
+	// ShutdownDestroy removes everything this host id owns: tenant
+	// sandboxes (reason host_drain), warm sandboxes, any other container
+	// carrying the host id, and the run dirs. For decommissioning a host
+	// and for tests. After the stop nothing of this host id is left.
+	// `sbxd admin host destroy` does the same for a server that is not
+	// running.
+	ShutdownDestroy = "destroy"
 )
 
 // SeccompDefault selects Podman's built-in seccomp profile instead of the
@@ -98,7 +116,8 @@ type Config struct {
 	// socket without extra configuration.
 	UsernsMode string
 
-	// ShutdownPolicy is ShutdownDrain (default) or ShutdownLeave.
+	// ShutdownPolicy is ShutdownDrain (default), ShutdownLeave or
+	// ShutdownDestroy.
 	ShutdownPolicy string
 	// ShutdownTimeout bounds the graceful stop. Default 30s.
 	ShutdownTimeout time.Duration
@@ -106,6 +125,13 @@ type Config struct {
 	// EgressPermitPrivateCIDRs opens sub-ranges of private address space
 	// to sandboxes whose policy allows them (egress.Config).
 	EgressPermitPrivateCIDRs []string
+
+	// CORSAllowedOrigins opens the data-plane routes to browsers on these
+	// origins ("https://app.example.com", or "*"); empty means no CORS.
+	// CORSAllowAPIKey additionally accepts a tenant API key from them.
+	// See api.Config.
+	CORSAllowedOrigins []string
+	CORSAllowAPIKey    bool
 
 	// API settings; zero values take the api package's defaults.
 	MaxUploadBytes   int64
@@ -250,9 +276,9 @@ func (c *Config) defaults() error {
 	switch c.ShutdownPolicy {
 	case "":
 		c.ShutdownPolicy = ShutdownDrain
-	case ShutdownDrain, ShutdownLeave:
+	case ShutdownDrain, ShutdownLeave, ShutdownDestroy:
 	default:
-		return fmt.Errorf("unknown shutdown policy %q (want %s or %s)", c.ShutdownPolicy, ShutdownDrain, ShutdownLeave)
+		return fmt.Errorf("unknown shutdown policy %q (want %s, %s or %s)", c.ShutdownPolicy, ShutdownDrain, ShutdownLeave, ShutdownDestroy)
 	}
 	if c.MetricsListen == "" && c.MetricsToken == "" && !isLoopbackAddr(c.Listen) {
 		return fmt.Errorf("refusing to serve unauthenticated /metrics on the non-loopback address %s: "+
@@ -462,6 +488,7 @@ func Run(ctx context.Context, cfg Config) error {
 		},
 		MaxUploadBytes: cfg.MaxUploadBytes, TouchInterval: cfg.TouchInterval, ClaimWait: cfg.ClaimWait,
 		AuthCacheTTL: cfg.AuthCacheTTL, CreateRatePerSec: cfg.CreateRatePerSec, CreateBurst: cfg.CreateBurst,
+		CORSAllowedOrigins: cfg.CORSAllowedOrigins, CORSAllowAPIKey: cfg.CORSAllowAPIKey,
 	})
 	if err != nil {
 		return err
@@ -514,7 +541,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	log.Info("sbxd listening", "addr", ln.Addr().String(), "host", cfg.HostID, "run_dir", cfg.RunDir,
 		"podman_api", apiVersion, "seccomp", orDefault(seccomp, SeccompDefault), "agent_binary", agentBinary,
-		"shutdown_policy", cfg.ShutdownPolicy)
+		"shutdown_policy", cfg.ShutdownPolicy, "cors_origins", cfg.CORSAllowedOrigins)
 	if cfg.OnListen != nil {
 		cfg.OnListen(ln.Addr())
 	}
@@ -525,10 +552,13 @@ func Run(ctx context.Context, cfg Config) error {
 	case <-ctx.Done():
 	}
 
-	// Graceful stop: stop accepting, end streams, apply the shutdown
-	// policy, stop the controller. Whatever is left (warm sandboxes, and
-	// with ShutdownLeave the tenant ones) is labelled and recorded, so
-	// the next start reconciles it.
+	// Graceful stop, in this order (see the Shutdown* constants):
+	//  1. stop accepting and end streams;
+	//  2. stop the refill loop and wait for in-flight creates;
+	//  3. apply the shutdown policy;
+	//  4. stop the controller (waits for teardowns in flight).
+	// Whatever is left is labelled and recorded, so the next start
+	// reconciles it.
 	log.Info("shutting down", "policy", cfg.ShutdownPolicy, "timeout", cfg.ShutdownTimeout)
 	sctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
@@ -542,8 +572,20 @@ func Run(ctx context.Context, cfg Config) error {
 	if metricsSrv != nil {
 		_ = metricsSrv.Close()
 	}
-	if cfg.ShutdownPolicy == ShutdownDrain {
+	if err := ctrl.Quiesce(sctx); err != nil {
+		log.Warn("in-flight creates were cancelled: the shutdown budget ran out", "err", err)
+	}
+	switch cfg.ShutdownPolicy {
+	case ShutdownDrain:
 		drain(sctx, log, st, ctrl, cfg.HostID)
+	case ShutdownDestroy:
+		// Not bounded by what is left of the budget alone: a destroy that
+		// stops half-way defeats its purpose.
+		dctx, dcancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		if _, err := ctrl.DestroyAll(dctx); err != nil {
+			log.Error("shutdown policy destroy: not everything could be destroyed; run `sbxd admin host destroy`", "err", err)
+		}
+		dcancel()
 	}
 	ctrl.Stop()
 	egressMgr.Close()

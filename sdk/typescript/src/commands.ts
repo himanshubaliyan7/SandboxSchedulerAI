@@ -111,6 +111,15 @@ export interface CommandStartOptions extends CommandOutputOptions, CallOptions {
    */
   timeoutMs?: number
   /**
+   * Makes the start safe to repeat: the server starts at most one command
+   * per sandbox and key, and a repeated `run` with the same key and the
+   * same command attaches to the one already started. Use it to retry
+   * after a `start_unconfirmed` error. 1-128 characters of
+   * `[A-Za-z0-9._:-]`. Needs a server that knows `Idempotency-Key`; an
+   * older one ignores it and starts a second command.
+   */
+  idempotencyKey?: string
+  /**
    * `true` keeps stdin open so that `sendStdin()` works. A string or bytes
    * are written to stdin, which is then closed (foreground and background).
    * Default: stdin is `/dev/null`.
@@ -165,7 +174,9 @@ async function callback<A>(fn: ((arg: A) => unknown) | undefined, arg: A): Promi
   }
 }
 
-type Source = { kind: 'start'; body: Record<string, unknown> } | { kind: 'attach'; pid: string; from: number }
+type Source =
+  | { kind: 'start'; body: Record<string, unknown>; idempotencyKey?: string | undefined }
+  | { kind: 'attach'; pid: string; from: number }
 
 /**
  * A running (or finished) command.
@@ -209,31 +220,27 @@ export class CommandHandle implements AsyncIterable<CommandEvent> {
   static async start(
     ctx: SandboxContext,
     body: Record<string, unknown>,
-    opts: CommandOutputOptions & CallOptions,
+    opts: CommandOutputOptions & CallOptions & { idempotencyKey?: string },
     buffered: boolean,
   ): Promise<CommandHandle> {
     const h = new CommandHandle(ctx, opts, buffered)
-    void h.#pump({ kind: 'start', body }, opts)
+    void h.#pump({ kind: 'start', body, idempotencyKey: opts.idempotencyKey }, opts)
     await h.#started.promise
     return h
   }
 
   /** @internal Attaches to an existing command and resolves once the server has accepted the stream. */
   static async attach(ctx: SandboxContext, pid: string, opts: CommandConnectOptions): Promise<CommandHandle> {
-    // Checked with a plain request first: the stream route sends its
-    // response headers only with the first event, which for a silent
-    // command is the keepalive 25 s later.
-    await ctx.api.empty('GET', commandsPath(ctx.sandboxId, pid), {
-      auth: 'data',
-      retry: 'idempotent',
-      signal: opts.signal,
-      timeoutMs: opts.requestTimeoutMs,
-    })
+    // The stream route answers with its headers at once (an unknown
+    // command is a 404 right here), so opening it is the check. A server
+    // older than that only sends the headers with the first event: there
+    // this resolves when the command next prints something, or with its
+    // keepalive after 25 s.
     const h = new CommandHandle(ctx, opts, true)
     h.#pid = pid
     h.#offset = opts.from ?? 0
-    h.#started.resolve()
     void h.#pump({ kind: 'attach', pid, from: h.#offset }, opts)
+    await h.#started.promise
     return h
   }
 
@@ -357,22 +364,21 @@ export class CommandHandle implements AsyncIterable<CommandEvent> {
   async #open(source: Source, opts: CallOptions): Promise<Response> {
     const { api, sandboxId } = this.#ctx
     if (source.kind === 'start') {
+      const headers: Record<string, string> = { Accept: 'application/x-ndjson' }
+      if (source.idempotencyKey !== undefined) headers['Idempotency-Key'] = source.idempotencyKey
       return api.request('POST', commandsPath(sandboxId), {
         auth: 'data',
         retry: 'rate-limit',
         stream: true,
         query: { wait: 'stream' },
         json: source.body,
-        headers: { Accept: 'application/x-ndjson' },
+        headers,
         signal: this.#abort.signal,
         timeoutMs: opts.requestTimeoutMs,
       })
     }
-    // The response headers of the stream route arrive with its first
-    // event, at the latest the keepalive, so the deadline for them is the
-    // stream's idle timeout rather than the (shorter) request timeout.
-    const idle = this.#ctx.stream.idleTimeoutMs
-    const base = opts.requestTimeoutMs ?? api.requestTimeoutMs
+    // The server sends the response headers of a stream at once, so the
+    // ordinary request deadline applies to them; the body has none.
     return api.request('GET', commandsPath(sandboxId, source.pid, 'stream'), {
       auth: 'data',
       retry: 'idempotent',
@@ -380,7 +386,7 @@ export class CommandHandle implements AsyncIterable<CommandEvent> {
       query: { from: source.from },
       headers: { Accept: 'application/x-ndjson' },
       signal: this.#abort.signal,
-      timeoutMs: idle <= 0 || base <= 0 ? 0 : Math.max(idle, base),
+      timeoutMs: opts.requestTimeoutMs,
     })
   }
 
@@ -392,6 +398,9 @@ export class CommandHandle implements AsyncIterable<CommandEvent> {
       let cause: unknown
       try {
         const res = await this.#open(source, opts)
+        // Attaching: the server has accepted the stream. (A start is
+        // confirmed by its start event instead, which carries the pid.)
+        if (source.kind === 'attach' && !this.#started.settled) this.#started.resolve()
         try {
           const before = this.#offset
           const finished = await this.#consume(res)

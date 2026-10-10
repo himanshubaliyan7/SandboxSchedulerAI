@@ -40,11 +40,7 @@ type wsSession struct {
 	fatal      *agentapi.Error
 }
 
-const (
-	maxPendingPongs = 16
-	// wsReadLimit bounds one client frame.
-	wsReadLimit = 1 << 20
-)
+const maxPendingPongs = 16
 
 func poke(ch chan struct{}) {
 	select {
@@ -67,7 +63,8 @@ func (a *Agent) handleWS(w http.ResponseWriter, r *http.Request, p *Process) {
 		return // Accept has written the error response
 	}
 	defer conn.CloseNow()
-	conn.SetReadLimit(wsReadLimit)
+	// One frame: the channel byte and at most MaxClientPayloadBytes.
+	conn.SetReadLimit(agentapi.MaxClientFrameBytes)
 
 	ctx, cancel := context.WithCancel(a.ctx)
 	defer cancel()

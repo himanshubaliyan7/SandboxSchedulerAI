@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SandboxSchedulerAI API
-  version: "1.0.0"
+  version: "1.1.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -27,7 +27,13 @@ info:
       `code` is stable and meant for programs; `message` is for people.
     * A sandbox that belongs to another tenant, or to nobody (a warm
       sandbox), is indistinguishable from one that does not exist: `404
-      not_found`. There is no `403`.
+      not_found`. Ownership is never answered with `403`; that status is
+      only used for a path the sandbox user may not access
+      (`permission_denied`) and for the two CORS refusals below.
+    * Any route can answer `504 timeout` when the server gave up waiting
+      for the store or for the in-sandbox agent (30 s). It says nothing
+      about whether the operation happened; for a command start, see
+      `Idempotency-Key`.
     * A sandbox id looks like `sb-0123456789abcdef`. A command id (`pid`)
       is an opaque string issued by the in-sandbox agent; it is not a
       kernel pid.
@@ -44,6 +50,15 @@ info:
       on a WebSocket, as the subprotocol entry `sbx.token.<token>`. With a
       token and no API key, a wrong token and an unknown sandbox are both
       `401 unauthorized`.
+    * **Which answer wins.** The credential is checked first, the
+      sandbox's state second. A sandbox that has ended keeps its row, and
+      with it the hash of its token, until the row is garbage-collected
+      (7 days after it was destroyed). So for that long the *right* token
+      of an ended sandbox is answered `409 sandbox_not_running` with
+      `details.state` and `details.reason`: its holder is told why its
+      sandbox is gone, which `401` would hide. A wrong token is `401`
+      whatever the state, and after the row is gone every token is `401`.
+      Either way the token opens nothing any more.
 
     ## Rate limits and quota
 
@@ -76,16 +91,58 @@ info:
 
     `POST .../commands?wait=stream` and `GET .../commands/{pid}/stream`
     answer `200` with `Content-Type: application/x-ndjson`: one
-    `StreamEvent` JSON object per line, flushed within 20 ms. `offset` is a
-    single byte counter per command across stdout, stderr and PTY output.
-    A client that has processed an output event resumes with
-    `from = offset + len(data)`. The stream ends after the `exit` event, or
-    after an `error` event if it cannot continue (the sandbox terminated,
-    or the server is shutting down). `keepalive` events arrive every 25 s
-    while a command is silent. If `from` is older than the agent's 1 MiB
-    replay buffer, the first event is `truncated` with `dropped` bytes and
-    output resumes at `offset`. A slow reader never slows the command: it
-    receives `truncated` events instead.
+    `StreamEvent` JSON object per line, flushed within 20 ms.
+
+    * **The status line and headers are sent at once**, as soon as the
+      request is authorised and the agent has accepted the stream. They do
+      not wait for the command to produce output, so a client may use a
+      short timeout for the headers and a long (or no) timeout for the
+      body. Everything that has an HTTP status (`400`, `401`, `404`,
+      `409`, `429`, `502`, `504`) is detected before that point; after
+      it, a failure is the stream's last line, an `error` event.
+    * With `wait=stream` the first line is always the `start` event with
+      the `Command` (and so its `pid`), written together with the headers
+      before anything else is attempted. From then on no HTTP error is
+      possible: even "the agent went away right after the start" is an
+      in-stream `error` event, and the client has the pid to reattach.
+    * `offset` is a single byte counter per command across stdout, stderr
+      and PTY output. A client that has processed an output event resumes
+      with `from = offset + len(data)`. On `start` and `error` events
+      `offset` carries no information (it is `0`); ignore it there.
+    * The stream ends after the `exit` event, or after an `error` event if
+      it cannot continue. In-stream error codes: `sandbox_terminated`
+      (final; `details.state`, `details.reason`), `shutting_down` (the
+      server is stopping), `agent_unavailable` (the link to the agent
+      broke; reattach with `from`), `timeout` and `internal` (reattach).
+    * `keepalive` events arrive every 25 s while a command is silent. If
+      `from` is older than the agent's 1 MiB replay buffer, the first
+      event is `truncated` with `dropped` bytes and output resumes at
+      `offset`. A slow reader never slows the command: it receives
+      `truncated` events instead.
+
+    ### Not knowing whether a command started
+
+    If the connection is cut before the client has read the `start` event
+    (or the `201` of a start without `wait`), it does not know the pid and
+    must not blindly start again. Two ways out:
+
+    * **`Idempotency-Key`** (recommended). Send the start with a header
+      `Idempotency-Key: <1-128 characters of [A-Za-z0-9._:-]>` and, after
+      a failure, send the same request again. The command is started at
+      most once per sandbox and key: the repeat answers for the command
+      the first request started, in the form its own `wait` asks for
+      (`200` instead of `201` without `wait`; the `start` event and a
+      replay of the output from offset 0 with `wait=stream`), with the
+      response header `Idempotent-Replayed: true`. The same key with a
+      different body is `409 idempotency_key_reused`. A start that failed
+      is not remembered, so the key can be reused to try again. Keys are
+      kept for the life of the sandbox (the newest 1024).
+    * **`tag`**. Give the command a unique `tag` and, after a failure,
+      look for it in `GET .../commands`: if it is listed, attach to its
+      `pid` with the stream route (`from=0` replays the output); if not,
+      the start did not happen. A second start with the tag of a command
+      that is still running is `409 tag_in_use`, but the tag of a command
+      that has exited can be taken again, so this needs the lookup.
 
     ## PTY and interactive I/O (WebSocket)
 
@@ -98,7 +155,7 @@ info:
     | 0 | client to server | stdin bytes (PTY: `0x03` is Ctrl+C, `0x04` is Ctrl+D) |
     | 1 | server to client | stdout bytes; all output of a PTY command |
     | 2 | server to client | stderr bytes (pipe mode only) |
-    | 3 | server to client | JSON `WSStatusFrame`: the last frame, followed by a normal close (1000) |
+    | 3 | server to client | JSON `WSStatusFrame`: the last frame, followed by the close |
     | 4 | client to server | JSON `{"cols":N,"rows":N}`: resize the PTY |
     | 5 | client to server | JSON `{"signal":"SIGINT"}`: signal the process group |
     | 6 | client to server | JSON `{"offset":N}`: acknowledge output up to `offset` (flow control) |
@@ -109,9 +166,12 @@ info:
     * Output frames carry no offset: the client counts bytes from the last
       channel-9 frame. Reattach with `from=<that count>` to continue
       without loss; the command keeps running while no client is attached.
-    * A frame from the server is at most 32769 bytes (1 + 32768). Some
-      WebSocket libraries default to a smaller read limit; raise it. A
-      frame from the client may be at most 1 MiB + 1.
+    * Frame sizes. A frame from the server is at most 32769 bytes (1
+      channel byte + 32768). Some WebSocket libraries default to a smaller
+      read limit; raise it. A frame from the client is at most 1048577
+      bytes: 1 channel byte + 1048576 (1 MiB) of payload. The gateway and
+      the agent apply this one limit; a larger frame closes the connection
+      with `1009`, and the command is unaffected.
     * Flow control is optional and end to end. Until the first channel-6
       frame the command is never paused. After it, the agent stops reading
       from the command once more than 100000 bytes are unacknowledged and
@@ -119,13 +179,78 @@ info:
       than 10000 bytes. The gateway keeps no queue.
     * Subprotocols: the server selects `sbx.v1` when offered. A browser
       passes the token as `new WebSocket(url, ["sbx.v1", "sbx.token." + token])`.
-      Any `Origin` is accepted, because authentication never relies on
-      cookies.
-    * The server sends WebSocket pings every 25 s. Close codes: 1000 after
-      the status frame; 1001 with reason `sandbox terminated` or `server
-      shutting down`; on a broken agent connection a channel-3 frame with
-      `error` precedes a 1001 close. An unknown `pid` or bad credentials
-      fail the HTTP handshake with the usual error envelope.
+    * `Origin`: without `--cors-allowed-origins` any origin is accepted,
+      because authentication never relies on cookies. With it, a handshake
+      from another origin that is not on the list is refused with `403
+      origin_not_allowed` (see "Browsers and CORS").
+    * The server sends WebSocket pings every 25 s.
+
+    ### How a WebSocket ends
+
+    | Close code | Reason (a stable token) | Meaning | What to do |
+    |-----------:|-------------------------|---------|------------|
+    | 1000 | (empty) | Follows a channel-3 frame: `exit` (the command ended), or `error` from the agent (`bad_frame`, `bad_signal`, `stdin_overflow`). | Done. |
+    | 1009 | (set by the library) | A client frame exceeded 1048577 bytes. | Send smaller frames. |
+    | 4000 | `sandbox_terminated`, `sandbox_not_running` | The sandbox is not running (any more). | Give up. |
+    | 4001 | `unauthorized` | Missing or wrong credentials. | Give up. |
+    | 4002 | `shutting_down` | The server is stopping. | Reattach later; expect 4000 if the sandbox was drained. |
+    | 4003 | `agent_unavailable` | The link to the in-sandbox agent broke; the sandbox still runs. | Reattach with `from`. |
+    | 4004 | `process_not_found`, `not_found` | No such command, or no such sandbox. | Give up. |
+    | 4005 | `bad_request` | Malformed handshake (`from`, `handshake_errors`). | Fix the request. |
+    | 4029 | `rate_limited` | The tenant's bucket is empty. | Retry after a pause. |
+    | 4099 | any other API error code (`timeout`, `internal`, ...) | Unexpected. | Reattach with `from`. |
+
+    * The close reason is the API error code as a bare token, at most 123
+      bytes. Codes 4000-4099 are only ever sent by the gateway. A client
+      should decide on the close code and treat an unknown 4xxx code like
+      4099.
+    * Whenever the connection got as far as the upgrade, a channel-3 frame
+      `{"error":{"code","message"}}` with the same code precedes a 4xxx
+      close, so a client that reads frames learns the reason even where
+      it cannot read close codes. A connection that ends with no close
+      frame at all (code 1006 in browsers) is a network failure: reattach.
+    * A refused handshake is by default a plain HTTP error with the usual
+      envelope (`401`, `404`, `409`, `429`, ...). Browsers cannot read
+      that. With the query parameter `handshake_errors=close` the server
+      accepts the upgrade instead and immediately ends the connection as
+      above (status frame, then the 4xxx close). A refused `Origin` stays
+      an HTTP `403` in both modes.
+
+    ## Browsers and CORS
+
+    Off by default: no CORS header is ever sent, `OPTIONS` is `405`, and a
+    page on another origin can use nothing but the WebSocket route.
+    `sbxd serve --cors-allowed-origins https://app.example.com,...` (exact
+    origins, or `*` for any) turns it on **for the data-plane routes only**
+    (tags `commands` and `files`), the routes a sandbox access token opens:
+
+    * `OPTIONS` on those paths answers a preflight with `204`,
+      `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`,
+      `Access-Control-Allow-Headers: X-Access-Token, Content-Type, Accept,
+      X-Request-Id, Idempotency-Key` and `Access-Control-Max-Age: 600`. It
+      needs no credentials.
+    * Responses to a configured origin carry
+      `Access-Control-Allow-Origin` (that origin, or `*` if `*` is
+      configured), `Vary: Origin` and `Access-Control-Expose-Headers:
+      X-Request-Id, Retry-After, Location, Idempotent-Replayed,
+      WWW-Authenticate`. `Access-Control-Allow-Credentials` is never
+      sent: there are no cookies to send.
+    * A request (or preflight, or WebSocket handshake) whose `Origin` is
+      another host than the one it was sent to and is not configured is
+      refused with `403 origin_not_allowed` before anything is done, and
+      gets no CORS header: an origin is only ever echoed if it is on the
+      list. Requests without an `Origin` header, which is every
+      non-browser client, are not affected in any way.
+    * **API keys stay out of browsers.** The control-plane routes take no
+      part in CORS whatever is configured: they answer no preflight and
+      send no CORS header, and since a tenant API key can only be sent in
+      a header that requires a preflight, a page on another origin cannot
+      call them. On the data-plane routes a cross-origin request that
+      carries a tenant API key (`X-API-Key`, or a bearer that is not an
+      `sbt_` token) is refused with `403 api_key_not_allowed`, and neither
+      header is in `Access-Control-Allow-Headers`. An operator who really
+      wants keys in a browser has to say so with `--cors-allow-api-key`,
+      which lifts this for the data-plane routes only.
 servers:
   - url: http://127.0.0.1:8080
     description: Default listen address of `sbxd serve`
@@ -137,6 +262,7 @@ tags:
   - name: files
     description: Data plane. Tenant API key or the sandbox's access token. The sandbox must be `running`.
   - name: templates
+    description: Read-only view of the sandbox templates. Tenant API key only.
   - name: operations
     description: Unauthenticated endpoints for probes and scraping.
 security:
@@ -182,6 +308,7 @@ paths:
           description: "`pool_empty` (no warm sandbox within the wait) or `shutting_down`."
           headers: { Retry-After: { $ref: "#/components/headers/RetryAfter" } }
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "504": { $ref: "#/components/responses/Timeout" }
     get:
       tags: [sandboxes]
       operationId: listSandboxes
@@ -223,6 +350,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }]
     get:
@@ -235,6 +363,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "504": { $ref: "#/components/responses/Timeout" }
     delete:
       tags: [sandboxes]
       operationId: deleteSandbox
@@ -242,9 +371,16 @@ paths:
       description: |
         Asynchronous by default: the `204` is sent as soon as the sandbox
         is fenced, which means its state is `recycling` with reason
-        `released`, its access token no longer works, every data-plane
-        route answers `409 sandbox_not_running`, its egress is detached
-        and it no longer counts against the tenant's concurrency quota.
+        `released`, its access token opens nothing any more, its egress is
+        detached and it no longer counts against the tenant's concurrency
+        quota. From that moment every data-plane route answers `409
+        sandbox_not_running` (with `details.state` and `details.reason:
+        "released"`) to the tenant's API key and to the sandbox's own
+        token alike. It is `409` and not `401` for the token on purpose:
+        the credential is checked before the state, and the token still
+        identifies the sandbox, so its holder is told that the sandbox is
+        gone rather than that its credential is bad. A wrong token is
+        `401` as always. See "Which answer wins" in the introduction.
         The container is then killed (SIGKILL, no grace period) and
         removed with all of its storage in the background, normally
         within a few hundred milliseconds; the state then becomes
@@ -273,6 +409,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/timeout:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }]
     post:
@@ -303,6 +440,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/NotRunning" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/network:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }]
     put:
@@ -332,6 +470,7 @@ paths:
           description: "`sandbox_not_running` or `network_not_attached`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/events:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }]
     get:
@@ -361,6 +500,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/stats:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }]
     get:
@@ -376,6 +516,10 @@ paths:
           description: "`sandbox_not_running`, or `sandbox_terminated` if the instance turned out to be dead."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "501":
+          description: "`not_implemented`: this server was built without a stats source for its isolation backend. `sbxd` with the Podman backend always has one."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/templates:
     get:
       tags: [templates]
@@ -394,6 +538,7 @@ paths:
                   templates: { type: array, items: { $ref: "#/components/schemas/Template" } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "504": { $ref: "#/components/responses/Timeout" }
 
   /v1/sandboxes/{id}/commands:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }]
@@ -416,24 +561,45 @@ paths:
           started. Follow it with the stream or WebSocket route.
         * `true`: `200` with a `WaitResult` when the command has exited.
           stdout and stderr are each cut at 1 MiB (`truncated`).
-        * `stream`: `200` NDJSON; a `start` event, then the events of the
-          stream route from offset 0, ending with `exit`.
+        * `stream`: `200` NDJSON; a `start` event, sent with the response
+          headers before anything else, then the events of the stream
+          route from offset 0, ending with `exit`.
 
         The command keeps running if the client disconnects; reconnect
-        with the stream route.
+        with the stream route. To make the start itself safe to repeat
+        after a lost connection, send an `Idempotency-Key`; see "Not
+        knowing whether a command started" in the introduction.
       security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
       parameters:
         - name: wait
           in: query
           schema: { type: string, enum: ["false", "true", "stream"], default: "false" }
+        - name: Idempotency-Key
+          in: header
+          description: |
+            Optional. Makes the start safe to repeat: the command is
+            started at most once per sandbox and key, and a repeat with
+            the same body answers for that command with
+            `Idempotent-Replayed: true`.
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]+$" }
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: "#/components/schemas/StartCommandRequest" } } }
       responses:
         "200":
-          description: With `wait=true`, a `WaitResult`; with `wait=stream`, an NDJSON stream of `StreamEvent`.
+          description: |
+            With `wait=true`, a `WaitResult`; with `wait=stream`, an NDJSON
+            stream of `StreamEvent`; without `wait`, the `Command` of an
+            earlier request with the same `Idempotency-Key` (a replay:
+            nothing was started by this request).
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
           content:
-            application/json: { schema: { $ref: "#/components/schemas/WaitResult" } }
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WaitResult"
+                  - $ref: "#/components/schemas/Command"
             application/x-ndjson: { schema: { $ref: "#/components/schemas/StreamEvent" } }
         "201":
           description: Started (no `wait`).
@@ -445,17 +611,18 @@ paths:
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
-          description: "`permission_denied` (the file is not executable by the sandbox user)."
+          description: "`permission_denied` (the file is not executable by the sandbox user). With `--cors-allowed-origins` also `origin_not_allowed` and `api_key_not_allowed`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: "`sandbox_not_running`, `sandbox_terminated`, or `tag_in_use`."
+          description: "`sandbox_not_running`, `sandbox_terminated`, `tag_in_use`, or `idempotency_key_reused` (the key was used for a different command)."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "500":
-          description: "`start_failed` or `pty_failed` from the agent (for example the pids limit is exhausted), or `internal`."
+          description: "`start_failed` or `pty_failed` from the agent (for example the pids limit is exhausted), or `internal` (from the gateway or the agent)."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
     get:
       tags: [commands]
       operationId: listCommands
@@ -473,10 +640,12 @@ paths:
                 properties:
                   commands: { type: array, items: { $ref: "#/components/schemas/Command" } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/NotRunning" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/commands/{pid}:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
     get:
@@ -487,29 +656,37 @@ paths:
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Command" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/CommandNotFound" }
         "409": { $ref: "#/components/responses/NotRunning" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/commands/{pid}/stream:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
     get:
       tags: [commands]
       operationId: streamCommand
       summary: Stream a command's output (NDJSON; replay then live)
-      description: See "Streaming a command" in the introduction. Reconnectable at any time, also after the command has exited, for as long as the sandbox lives.
+      description: |
+        See "Streaming a command" in the introduction. Reconnectable at
+        any time, also after the command has exited, for as long as the
+        sandbox lives. The response headers are sent immediately, without
+        waiting for the command's first output.
       security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
       parameters: [{ $ref: "#/components/parameters/From" }]
       responses:
         "200":
-          description: One `StreamEvent` per line until `exit` or `error`.
+          description: One `StreamEvent` per line until `exit` or `error`. The headers do not wait for the first event.
           content: { application/x-ndjson: { schema: { $ref: "#/components/schemas/StreamEvent" } } }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/CommandNotFound" }
         "409": { $ref: "#/components/responses/NotRunning" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/commands/{pid}/stdin:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
     post:
@@ -524,6 +701,7 @@ paths:
       responses:
         "204": { description: Written. }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/CommandNotFound" }
         "409":
           description: "`stdin_closed` (not started with `stdin`, or already closed), `process_exited`, or `sandbox_not_running`."
@@ -531,6 +709,7 @@ paths:
         "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/commands/{pid}/close-stdin:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
     post:
@@ -542,12 +721,14 @@ paths:
       responses:
         "204": { description: Closed. }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/CommandNotFound" }
         "409":
           description: "`is_a_pty`, `stdin_closed`, `process_exited` or `sandbox_not_running`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/commands/{pid}/signal:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
     post:
@@ -564,12 +745,14 @@ paths:
           description: "`bad_signal` or `bad_request`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/CommandNotFound" }
         "409":
           description: "`process_exited` or `sandbox_not_running`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/commands/{pid}/resize:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
     post:
@@ -584,19 +767,24 @@ paths:
         "204": { description: Resized. }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/CommandNotFound" }
         "409":
           description: "`not_a_pty`, `process_exited` or `sandbox_not_running`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/commands/{pid}/ws:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/Pid" }]
     get:
       tags: [commands]
       operationId: attachCommand
       summary: Attach a WebSocket to a command (PTY or pipe mode)
-      description: See "PTY and interactive I/O" in the introduction for the framing. Works for pipe-mode commands too (stdout on channel 1, stderr on channel 2).
+      description: |
+        See "PTY and interactive I/O" in the introduction for the framing
+        and "How a WebSocket ends" for the close codes. Works for
+        pipe-mode commands too (stdout on channel 1, stderr on channel 2).
       security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }, { WSSubprotocolToken: [] }]
       parameters:
         - $ref: "#/components/parameters/From"
@@ -604,14 +792,29 @@ paths:
           in: header
           description: "Optional. Offer `sbx.v1`; add `sbx.token.<access token>` to authenticate from a browser."
           schema: { type: string, example: "sbx.v1, sbx.token.sbt_0123..." }
+        - name: handshake_errors
+          in: query
+          description: |
+            `http` (default): a refused handshake is an HTTP error with
+            the error envelope. `close`: the upgrade is accepted and the
+            refusal is delivered as a channel-3 status frame followed by
+            an application close code (4000-4099), for clients that
+            cannot read the HTTP response of a failed handshake.
+          schema: { type: string, enum: [http, close], default: http }
       responses:
-        "101": { description: Switching protocols. Binary frames as described in the introduction. }
+        "101":
+          description: |
+            Switching protocols. Binary frames as described in the
+            introduction. With `handshake_errors=close` this is also the
+            answer to a handshake that is then refused with a close code.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OriginNotAllowed" }
         "404": { $ref: "#/components/responses/CommandNotFound" }
         "409": { $ref: "#/components/responses/NotRunning" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
 
   /v1/sandboxes/{id}/files:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/FilePath" }]
@@ -630,10 +833,11 @@ paths:
         "403": { $ref: "#/components/responses/PermissionDenied" }
         "404": { $ref: "#/components/responses/FileNotFound" }
         "409":
-          description: "`is_directory` or `sandbox_not_running`."
+          description: "`is_directory` (the path is a directory), `conflict` (a component of the path is a file: ENOTDIR) or `sandbox_not_running`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
     put:
       tags: [files]
       operationId: writeFile
@@ -659,11 +863,16 @@ paths:
         "403": { $ref: "#/components/responses/PermissionDenied" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: "`is_directory` (the path is a directory) or `sandbox_not_running`."
+          description: |
+            `is_directory` (the path is a directory), `sandbox_not_running`,
+            or `conflict`: a parent of the path is a file (ENOTDIR, or
+            EEXIST while creating the parents), or a directory appeared at
+            the path during the upload (EISDIR, ENOTEMPTY).
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "507":
           description: "`no_space`: the sandbox's writable storage is full."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
@@ -678,9 +887,10 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/PermissionDenied" }
         "404": { $ref: "#/components/responses/FileNotFound" }
-        "409": { $ref: "#/components/responses/NotRunning" }
+        "409": { $ref: "#/components/responses/FileConflict" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/files/list:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }]
     get:
@@ -707,25 +917,65 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/PermissionDenied" }
         "404": { $ref: "#/components/responses/FileNotFound" }
-        "409": { $ref: "#/components/responses/NotRunning" }
+        "409": { $ref: "#/components/responses/FileConflict" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+  /v1/sandboxes/{id}/files/stat:
+    parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/FilePath" }]
+    get:
+      tags: [files]
+      operationId: statFile
+      summary: Describe one file or directory
+      description: |
+        The cheap way to ask whether a path exists and what it is: nothing
+        is read or listed. A symbolic link is followed, so `is_dir` and
+        `size` describe its target; a link whose target is missing is
+        described as the link itself.
+      security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/FileInfo" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/PermissionDenied" }
+        "404": { $ref: "#/components/responses/FileNotFound" }
+        "409": { $ref: "#/components/responses/FileConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "501":
+          description: |
+            `not_implemented`: the sandbox runs an agent that predates
+            this route (a warm sandbox created by an older server and
+            adopted after an upgrade). List the parent directory instead.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
   /v1/sandboxes/{id}/files/mkdir:
     parameters: [{ $ref: "#/components/parameters/SandboxID" }, { $ref: "#/components/parameters/FilePath" }]
     post:
       tags: [files]
       operationId: makeDirectory
       summary: Create a directory and any missing parents
-      description: Succeeds if the directory already exists.
+      description: |
+        Succeeds if the directory already exists; the status says which it
+        was. Both `201` and `204` are success with an empty body, and a
+        client that does not need the distinction should accept any `2xx`
+        (before the distinction existed the answer was always `204`).
       security: [{ ApiKey: [] }, { BearerKey: [] }, { AccessToken: [] }, { BearerToken: [] }, { QueryToken: [] }]
       responses:
-        "204": { description: Created or already present. }
+        "201": { description: The directory was created by this request. }
+        "204": { description: The directory already existed. }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/PermissionDenied" }
-        "409": { $ref: "#/components/responses/NotRunning" }
+        "404":
+          description: "`not_found` (sandbox), or `file_not_found`: a parent cannot be created because it is a symbolic link to a missing target."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "409":
+          description: "`conflict`: the path, or one of its parents, exists and is not a directory (EEXIST, ENOTDIR). Or `sandbox_not_running`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/AgentUnavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "507":
           description: "`no_space`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
@@ -812,6 +1062,9 @@ components:
     RetryAfter:
       description: Whole seconds to wait before retrying.
       schema: { type: integer, minimum: 1 }
+    IdempotentReplayed:
+      description: "`true` when the request carried an `Idempotency-Key` that had already started a command: this response describes that command and nothing was started. Absent otherwise."
+      schema: { type: string, enum: ["true"] }
   parameters:
     SandboxID:
       name: id
@@ -853,7 +1106,10 @@ components:
       description: "`not_found` (sandbox) or `file_not_found` (path)."
       content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
     PermissionDenied:
-      description: "`permission_denied`: the sandbox user may not access the path."
+      description: |
+        `permission_denied`: the sandbox user may not access the path.
+        With `--cors-allowed-origins` also `origin_not_allowed` and
+        `api_key_not_allowed`; see "Browsers and CORS".
       content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
     NotRunning:
       description: |
@@ -861,6 +1117,24 @@ components:
         `details.state` and `details.reason` say why. `sandbox_terminated`
         (same details) when the sandbox died while the request was being
         served.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    FileConflict:
+      description: |
+        `conflict`: the path cannot be what the request needs it to be,
+        because a component of it is a file (ENOTDIR). Or
+        `sandbox_not_running` / `sandbox_terminated`, as for every
+        data-plane route.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    OriginNotAllowed:
+      description: |
+        Only when the server runs with `--cors-allowed-origins`:
+        `origin_not_allowed` (the request's `Origin` is another host and
+        is not on the list) or, on HTTP routes, `api_key_not_allowed` (a
+        tenant API key in a cross-origin request). Every data-plane route
+        can answer this; see "Browsers and CORS".
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Timeout:
+      description: "`timeout`: the server gave up waiting for the store or the in-sandbox agent. Whether the operation happened is unknown."
       content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
     TooLarge:
       description: "`payload_too_large`."
@@ -893,13 +1167,27 @@ components:
             `network_not_allowed`, `network_not_attached`,
             `invalid_timeout`, `payload_too_large`, `rate_limited`,
             `quota_exceeded`, `pool_empty`, `shutting_down`, `not_ready`,
-            `agent_unavailable`, `timeout`, `not_implemented`, `internal`.
+            `agent_unavailable`, `timeout`, `not_implemented`,
+            `idempotency_key_reused`, `origin_not_allowed`,
+            `api_key_not_allowed`, `internal`.
             Agent codes passed through on command and file routes:
-            `bad_cwd`, `bad_signal`, `command_not_found`, `exec_format`,
-            `conflict`, `is_a_pty`, `not_a_pty`, `is_directory`,
-            `process_exited`, `stdin_closed`, `tag_in_use`,
-            `permission_denied`, `no_space`, `io_error`, `pty_failed`,
-            `start_failed`, `too_large`.
+            `bad_request` (400), `bad_cwd`, `bad_signal`,
+            `command_not_found`, `exec_format`, `conflict`, `is_a_pty`,
+            `not_a_pty`, `is_directory`, `process_exited`, `stdin_closed`,
+            `tag_in_use`, `permission_denied`, `no_space`, `io_error`,
+            `pty_failed`, `start_failed`, `too_large`, `internal` (500:
+            an unexpected failure inside the agent). The agent's own
+            `not_found` is always translated to `process_not_found` or
+            `file_not_found`.
+            Agent codes a client does not normally see: `no_route` (404,
+            the agent has no such route: only if the sandbox runs an
+            older agent than the server expects; the stat route reports
+            that case as `501 not_implemented`), and `already_initialized`
+            (409) and `egress_failed` (500), which can only occur while a
+            sandbox is being assigned and then fail the create with `500
+            internal`.
+            In WebSocket status frames only: `bad_frame`,
+            `stdin_overflow`.
           example: sandbox_not_running
         message: { type: string }
         request_id: { type: string }
@@ -1043,7 +1331,7 @@ components:
             cpus: { type: number }
             memory_bytes: { type: integer, format: int64 }
             pids_limit: { type: integer, format: int64 }
-            workdir_bytes: { type: integer, format: int64, description: Size of `/workspace` (tmpfs, counted in `memory_bytes`). }
+            workdir_bytes: { type: integer, format: int64, description: "Size of `/workspace` (tmpfs, counted in `memory_bytes`)." }
             tmp_bytes: { type: integer, format: int64, description: Size of `/tmp`. }
             nofile_limit: { type: integer, format: int64 }
         network: { type: string, enum: [none, allowlist, full], description: The widest mode a sandbox of this template may ask for. }
@@ -1073,7 +1361,7 @@ components:
         cwd: { type: string, description: Default `/workspace`. }
         timeout_ms: { type: integer, format: int64, minimum: 0, description: "Wall-clock limit; on expiry the process group is SIGKILLed and the exit reason is `timeout`. 0 means none." }
         stdin: { type: boolean, default: false, description: Keep stdin open (pipe mode). }
-        tag: { type: string, description: Optional name, unique among the sandbox's running commands. }
+        tag: { type: string, description: "Optional name, unique among the sandbox's running commands. Also the handle for finding a command again after a lost start; see the introduction." }
         pty: { $ref: "#/components/schemas/PTYSize" }
     ExitStatus:
       type: object
@@ -1096,7 +1384,7 @@ components:
         pty: { type: boolean }
         started_at: { type: string, format: date-time }
         exit: { $ref: "#/components/schemas/ExitStatus" }
-        next_offset: { type: integer, format: int64, description: Offset the next output byte will get, i.e. total output bytes so far. }
+        next_offset: { type: integer, format: int64, description: "Offset the next output byte will get, i.e. total output bytes so far." }
     WaitResult:
       allOf:
         - $ref: "#/components/schemas/Command"
@@ -1120,9 +1408,17 @@ components:
             `truncated`: `dropped` bytes before `offset` are lost.
             `keepalive`: nothing happened; `offset` is the current end.
             `exit`: last line, with `exit`; `offset` is the total output size.
-            `error`: last line when the stream cannot continue, with `error`.
-        offset: { type: integer, format: int64 }
-        data: { type: string, format: byte, description: Base64, at most 32768 bytes decoded. }
+            `error`: last line when the stream cannot continue, with
+            `error`; its `code` is `sandbox_terminated`, `shutting_down`,
+            `agent_unavailable`, `timeout` or `internal`.
+        offset:
+          type: integer
+          format: int64
+          description: |
+            Position in the command's output; see the event types. On
+            `start` and `error` events it is always `0` and means
+            nothing: do not move a resume position because of it.
+        data: { type: string, format: byte, description: "Base64, at most 32768 bytes decoded." }
         dropped: { type: integer, format: int64 }
         exit: { $ref: "#/components/schemas/ExitStatus" }
         command: { $ref: "#/components/schemas/Command" }
@@ -1136,10 +1432,12 @@ components:
           type: object
           required: [code, message]
           properties:
-            code: { type: string, description: "For example `bad_frame`, `stdin_overflow` (agent), `sandbox_terminated`, `agent_unavailable` (gateway)." }
+            details: { type: object, additionalProperties: true, description: "Only from the gateway: the details of the API error with that code, e.g. `state` and `reason` for `sandbox_terminated`." }
+            code: { type: string, description: "From the agent, followed by close 1000: `bad_frame`, `bad_signal`, `stdin_overflow`. From the gateway, followed by a 4xxx close with this code as its reason: `sandbox_terminated`, `sandbox_not_running`, `shutting_down`, `agent_unavailable`, `unauthorized`, `process_not_found`, `not_found`, `bad_request`, `rate_limited`, `timeout`, `internal`." }
             message: { type: string }
     FileInfo:
       type: object
+      description: One entry of a directory listing, or the answer of the stat route.
       required: [name, path, size, mode, is_dir, mod_time]
       properties:
         name: { type: string }

@@ -198,6 +198,12 @@ def program(
     return run
 
 
+def parents(path: str) -> list[str]:
+    """Every proper ancestor of an absolute path, nearest last."""
+    parts = path.strip("/").split("/")
+    return ["/" + "/".join(parts[:i]) for i in range(1, len(parts))]
+
+
 def abspath(path: str) -> str:
     import posixpath
 
@@ -224,6 +230,9 @@ class FakeServer:
         self.before_stream: Callable[[FakeCommand, int], None] | None = None
         self.stream_requests: list[tuple[str, int]] = []
         self.delete_status = 204
+        #: Behave like a server from before the stat route and mkdir's
+        #: created flag: no /files/stat, and mkdir always answers 204.
+        self.legacy = False
         self._n = 0
 
     # -- test controls --------------------------------------------------------
@@ -542,10 +551,23 @@ class FakeServer:
             return error(400, "bad_request", "the path query parameter is required")
         path = abspath(raw)
         if rest == "/mkdir" and method == "POST":
+            if path in sb.files:
+                return error(409, "conflict", "mkdir: file exists")
+            created = path not in sb.dirs
             parts = path.strip("/").split("/")
             for i in range(1, len(parts) + 1):
                 sb.dirs.add("/" + "/".join(parts[:i]))
-            return httpx.Response(204)
+            return httpx.Response(201 if created and not self.legacy else 204)
+        if rest == "/stat" and method == "GET" and not self.legacy:
+            if any(parent in sb.files for parent in parents(path)):
+                return error(409, "conflict", "not a directory")
+            if path != "/" and path not in sb.dirs and path not in sb.files:
+                return error(404, "file_not_found", "no such file or directory")
+            is_dir = path not in sb.files
+            return httpx.Response(200, json={
+                "name": path.rstrip("/").rsplit("/", 1)[-1], "path": path, "size": len(sb.files.get(path, b"")),
+                "mode": sb.modes.get(path, "0755" if is_dir else "0644"), "is_dir": is_dir, "mod_time": NOW,
+            })  # fmt: skip
         if rest != "":
             return error(404, "not_found", "no such route: " + request.url.path)
         if method == "GET":

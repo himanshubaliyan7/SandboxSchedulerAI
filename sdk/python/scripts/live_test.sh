@@ -4,16 +4,20 @@
 # What it does, in order:
 #   1. builds sbxd and the static sbx-agent into a temporary directory;
 #   2. makes sure a private Postgres is running (container "sbx-py-pg", port 55434);
-#   3. takes the shared Podman lock and, while holding it: creates two tenants,
-#      two API keys and a "python" template, starts the server, runs
-#      `pytest -m live`, stops the server with SIGTERM and checks that none of
-#      its containers remain.
+#   3. takes the Podman lock and, while holding it: creates two tenants,
+#      two API keys and a "python" template, starts the server with
+#      --shutdown-policy destroy, runs `pytest -m live`, stops the server with
+#      SIGTERM and fails if any of its containers remain.
+#
+# The lock only keeps two runs of this script apart (they share a host id,
+# a run dir and a port). Servers are scoped by host id, so nothing else
+# needs it.
 #
 # The lock is held only for step 3. Extra arguments go to pytest, e.g.
 #   scripts/live_test.sh -k pty -x
 #
 # Environment:
-#   SBX_PODMAN_LOCK   lock file shared by everyone who runs sbxd as this user
+#   SBX_PODMAN_LOCK   lock file (default $XDG_RUNTIME_DIR/sbx-podman.lock, else /tmp/sbx-podman.lock)
 #   SBX_LIVE_LISTEN   server address            (default 127.0.0.1:18081)
 #   SBX_LIVE_PG_PORT  port of the Postgres      (default 55434)
 #   SBX_LIVE_KEEP_PG  set to 1 to leave the Postgres container running
@@ -24,7 +28,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-LOCK="${SBX_PODMAN_LOCK:-/tmp/claude-1000/-home-user-warmbox/00dddaa2-61cf-4bfd-a377-ebe4c5ac26b7/scratchpad/podman.lock}"
+LOCK="${SBX_PODMAN_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/sbx-podman.lock}"
 LISTEN="${SBX_LIVE_LISTEN:-127.0.0.1:18081}"
 PG_PORT="${SBX_LIVE_PG_PORT:-55434}"
 PG_NAME="sbx-py-pg"
@@ -68,6 +72,7 @@ export SBX_RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/sbxpy"
 export SBX_HOST_ID="$HOST_ID"
 SBXD="$WORK/sbxd"
 SERVER_PID=""
+LEFTOVER=0
 
 mine() { podman ps -a --filter "label=sbx.host_id=$HOST_ID" --format '{{.ID}}'; }
 
@@ -78,12 +83,14 @@ cleanup() {
         for _ in $(seq 1 90); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.5; done
         kill -KILL "$SERVER_PID" 2>/dev/null || true
     fi
-    # A graceful stop releases tenant sandboxes but keeps the warm pool for
-    # the next start. This server will not start again, so remove what is
-    # left; the label makes sure only this script's containers are touched.
+    # The server runs with --shutdown-policy destroy, so a graceful stop
+    # leaves nothing of this host id. Anything that is left is a bug: it is
+    # reported (and fails the run), then removed; the label makes sure only
+    # this script's containers are touched.
     left="$(mine)"
     if [[ -n "$left" ]]; then
-        echo "== removing $(echo "$left" | wc -l) warm container(s) left for a restart"
+        LEFTOVER="$(echo "$left" | wc -l)"
+        echo "== ERROR: $LEFTOVER container(s) left after a stop with --shutdown-policy destroy; removing them"
         # shellcheck disable=SC2086
         podman rm -f -t 0 $left >/dev/null
     fi
@@ -104,7 +111,8 @@ KEY_B="$(key sbxpy-b)"
     --network allowlist --warm-target 3 >/dev/null
 
 echo "== starting sbxd on $LISTEN (host id $HOST_ID, run dir $SBX_RUN_DIR)"
-"$SBXD" serve --listen "$LISTEN" --agent-binary "$WORK/sbx-agent" >"$WORK/sbxd.log" 2>&1 &
+"$SBXD" serve --listen "$LISTEN" --agent-binary "$WORK/sbx-agent" --shutdown-policy destroy \
+    --cors-allowed-origins "http://app.sbx.test" >"$WORK/sbxd.log" 2>&1 &
 SERVER_PID=$!
 ready=0
 for _ in $(seq 1 120); do
@@ -135,4 +143,8 @@ fi
 if [[ -n "${SBX_LIVE_LOG_COPY:-}" ]]; then
     sed -E 's/sb[xt]_[A-Za-z0-9_]+/<redacted>/g' "$WORK/sbxd.log" >"$SBX_LIVE_LOG_COPY" || true
 fi
+# Stop the server now, so that what it leaves behind counts towards the result.
+trap - EXIT
+cleanup
+if [[ "$LEFTOVER" != 0 ]]; then status=1; fi
 exit "$status"

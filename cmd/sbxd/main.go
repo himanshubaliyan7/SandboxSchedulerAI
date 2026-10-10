@@ -3,7 +3,7 @@
 //
 //	sbxd serve      run the server
 //	sbxd preflight  check that this host can run rootless sandboxes
-//	sbxd admin      bootstrap tenants, API keys and templates
+//	sbxd admin      bootstrap tenants, API keys and templates; destroy a host's sandboxes
 //	sbxd version    print the version
 //
 // Every serve flag has an environment fallback (SBX_DATABASE_URL,
@@ -38,7 +38,8 @@ const usage = `usage: sbxd <command> [flags]
 commands:
   serve       run the scheduler and its API
   preflight   check the host and print a report (exit status 1 on failure)
-  admin       manage tenants, API keys and templates (see "sbxd admin")
+  admin       manage tenants, API keys and templates; destroy everything a
+              host id owns (see "sbxd admin")
   version     print the version
 
 Run "sbxd <command> -h" for the flags of a command.
@@ -186,6 +187,7 @@ func cmdServe(args []string, stderr io.Writer) error {
 		logLevel, logFormat string
 		permitPrivate       string
 		maxUpload           string
+		corsOrigins         string
 	)
 	fs.StringVar(&cfg.DatabaseURL, "database-url", envStr("SBX_DATABASE_URL", ""), "Postgres URL [SBX_DATABASE_URL] (required)")
 	fs.StringVar(&cfg.Listen, "listen", envStr("SBX_LISTEN", "127.0.0.1:8080"), "API listen address [SBX_LISTEN]")
@@ -210,7 +212,13 @@ func cmdServe(args []string, stderr io.Writer) error {
 		"seccomp profile: empty for the embedded hardened profile, \""+server.SeccompDefault+"\", or an absolute path [SBX_SECCOMP_PROFILE]")
 	fs.StringVar(&cfg.UsernsMode, "userns", envStr("SBX_USERNS", ""), "user namespace mapping: keep-id (default), nomap, host, auto [SBX_USERNS]")
 	fs.StringVar(&cfg.ShutdownPolicy, "shutdown-policy", envStr("SBX_SHUTDOWN_POLICY", server.ShutdownDrain),
-		"what a graceful stop does with tenant sandboxes: drain (release them) or leave (the next start recycles them) [SBX_SHUTDOWN_POLICY]")
+		"what a graceful stop leaves behind: drain (release tenant sandboxes, keep the warm ones for the next start), "+
+			"leave (touch nothing; the next start recycles tenant sandboxes) or destroy (remove everything this host id owns) [SBX_SHUTDOWN_POLICY]")
+	fs.StringVar(&corsOrigins, "cors-allowed-origins", envStr("SBX_CORS_ALLOWED_ORIGINS", ""),
+		"comma-separated browser origins allowed to call the data-plane routes with a sandbox access token, e.g. "+
+			"https://app.example.com, or * for any; empty disables CORS [SBX_CORS_ALLOWED_ORIGINS]")
+	fs.BoolVar(&cfg.CORSAllowAPIKey, "cors-allow-api-key", envBool("SBX_CORS_ALLOW_API_KEY", false),
+		"also accept a tenant API key on the data-plane routes from those origins (not recommended: keys do not belong in browsers) [SBX_CORS_ALLOW_API_KEY]")
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", envDuration("SBX_SHUTDOWN_TIMEOUT", 30*time.Second), "budget of a graceful stop [SBX_SHUTDOWN_TIMEOUT]")
 	fs.StringVar(&permitPrivate, "egress-permit-private-cidrs", envStr("SBX_EGRESS_PERMIT_PRIVATE_CIDRS", ""),
 		"comma-separated private ranges sandboxes may reach when their policy allows it [SBX_EGRESS_PERMIT_PRIVATE_CIDRS]")
@@ -238,6 +246,11 @@ func cmdServe(args []string, stderr io.Writer) error {
 	cfg.Logger = logger
 	if cfg.MaxUploadBytes, err = parseSize(maxUpload); err != nil {
 		return fmt.Errorf("--max-upload-size: %w", err)
+	}
+	for _, o := range strings.Split(corsOrigins, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
+		}
 	}
 	for _, c := range strings.Split(permitPrivate, ",") {
 		if c = strings.TrimSpace(c); c != "" {

@@ -10,9 +10,9 @@ import httpx
 import pytest
 
 import sbx
-from sbx import Sandbox, WriteEntry, WriteInfo
+from sbx import PathNotFoundError, PermissionDeniedError, Sandbox, WriteEntry, WriteInfo
 
-from ..fake import ChunkStream, FakeServer, error
+from ..fake import ChunkStream, FakeServer, envelope, error
 
 
 class OneShot:
@@ -174,8 +174,9 @@ def test_list_exists_make_dir_remove(sandbox: Sandbox, server: FakeServer) -> No
     assert sandbox.files.list() == []
     assert server.requests[-1].url.params["path"] == "."
     sandbox.files.write("data/in.csv", "a,b\n")
-    sandbox.files.make_dir("data/out/deep")
-    sandbox.files.make_dir("data/out/deep")  # already there: fine
+    assert sandbox.files.make_dir("data/out/deep") is True
+    assert sandbox.files.make_dir("data/out/deep") is False  # already there: fine
+    assert sandbox.files.make_dir("data/out") is False
     entries = sandbox.files.list("data")
     assert [(e.name, e.path, e.is_dir, e.type, e.size, e.mode) for e in entries] == [
         ("in.csv", "/workspace/data/in.csv", False, "file", 4, "0644"),
@@ -223,3 +224,56 @@ def test_file_errors(sandbox: Sandbox, server: FakeServer) -> None:
         sandbox.files.write("x", b"y")
     with pytest.raises(sbx.InvalidArgumentError):
         sandbox.files.read("")
+
+
+def test_get_info_uses_the_stat_route(sandbox: Sandbox, server: FakeServer) -> None:
+    sandbox.files.write("data/in.csv", "a,b\n", mode=0o600)
+    info = sandbox.files.get_info("data/in.csv")
+    assert (info.name, info.path, info.size, info.mode, info.is_dir, info.type) == (
+        "in.csv",
+        "/workspace/data/in.csv",
+        4,
+        "0600",
+        False,
+        "file",
+    )
+    assert (sandbox.files.stat("data")).is_dir
+    with pytest.raises(PathNotFoundError) as exc:
+        sandbox.files.get_info("data/nope")
+    assert exc.value.code == "file_not_found"
+    assert sandbox.files.exists("data/in.csv")
+    assert not sandbox.files.exists("data/nope")
+    assert not sandbox.files.exists("data/in.csv/child")  # 409 conflict: the parent is a file
+    # Nothing was listed or downloaded to find that out.
+    assert len(server.seen("GET", r"/files/stat$")) == 6
+    assert not server.seen("GET", r"/files/list$") and not server.seen("GET", r"/files$")
+
+
+def test_get_info_falls_back_without_the_stat_route(sandbox: Sandbox, server: FakeServer) -> None:
+    server.legacy = True  # an older server: 404 "no such route"
+    sandbox.files.write("data/in.csv", "a,b\n")
+    info = sandbox.files.get_info("data/in.csv")
+    assert (info.name, info.size, info.is_dir) == ("in.csv", 4, False)
+    assert (sandbox.files.get_info("data")).is_dir
+    assert (sandbox.files.get_info(".")).is_dir
+    with pytest.raises(PathNotFoundError):
+        sandbox.files.get_info("data/nope")
+    assert sandbox.files.exists("data/in.csv") and not sandbox.files.exists("nope/x")
+    assert server.seen("GET", r"/files/list$")
+    # Such a server cannot say whether mkdir created anything.
+    assert sandbox.files.make_dir("fresh") is False
+    assert "/workspace/fresh" in server.sandbox().dirs
+
+
+def test_get_info_falls_back_for_an_old_agent(sandbox: Sandbox, server: FakeServer) -> None:
+    sandbox.files.write("f.txt", "x")
+    old_agent = httpx.Response(
+        501, json=envelope("not_implemented", "this sandbox's agent predates the stat route")
+    )
+    server.inject("GET", r"/files/stat$", old_agent, old_agent)
+    assert sandbox.files.exists("f.txt")
+    assert not sandbox.files.exists("ghost")
+    # Other failures are not mistaken for a missing route.
+    server.inject("GET", r"/files/stat$", httpx.Response(403, json=envelope("permission_denied", "no")))
+    with pytest.raises(PermissionDeniedError):
+        sandbox.files.exists("f.txt")

@@ -254,6 +254,7 @@ type Controller struct {
 	lifeMu  sync.Mutex
 	started bool
 	stopped bool
+	quiesce bool           // guarded by mu: no more creates (see Quiesce)
 	wg      sync.WaitGroup // loops and every background goroutine
 
 	refillMu    sync.Mutex // one refill pass at a time
@@ -340,6 +341,9 @@ func (c *Controller) Start(ctx context.Context) error {
 // finish, and waits for every background goroutine. WARM instances are
 // left running; a later controller re-adopts them (see Reconcile). Claims
 // waiting in a queue return ErrStopped. Stop is idempotent.
+//
+// A graceful shutdown calls Quiesce first (and DestroyAll, if nothing is
+// to be left behind); see shutdown.go.
 func (c *Controller) Stop() {
 	c.lifeMu.Lock()
 	already := c.stopped

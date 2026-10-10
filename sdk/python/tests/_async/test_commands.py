@@ -23,7 +23,13 @@ async def test_run_is_a_shell_command_line_by_default(sandbox: AsyncSandbox, ser
     server.programs.append(program(stdout=b"42\n"))
     result = await sandbox.commands.run('python3 -c "print(6*7)"')
     request = server.seen("POST", r"/commands$")[0]
-    assert body_of(request) == {"cmd": "/bin/sh", "args": ["-c", 'python3 -c "print(6*7)"']}
+    # The default per-command timeout is 60 s, as in E2B and the TypeScript SDK.
+    assert body_of(request) == {
+        "cmd": "/bin/sh",
+        "args": ["-c", 'python3 -c "print(6*7)"'],
+        "timeout_ms": 60000,
+    }
+    assert "idempotency-key" not in request.headers
     assert request.url.params["wait"] == "stream"
     assert (result.stdout, result.stderr, result.exit_code, result.reason) == ("42\n", "", 0, "exited")
     assert result.pid == "p1" and result.ok and result.error is None
@@ -44,8 +50,17 @@ async def test_run_with_args_starts_the_program_directly(sandbox: AsyncSandbox, 
         "stdin": True,
         "tag": "job",
     }
-    await sandbox.commands.run("true", args=[])
+    # timeout=0 switches the limit off; None means the default.
+    await sandbox.commands.run("true", args=[], timeout=0)
     assert body_of(server.requests[-1]) == {"cmd": "true", "args": []}
+    await sandbox.commands.run("true", args=[], timeout=None)
+    assert body_of(server.requests[-1]) == {"cmd": "true", "args": [], "timeout_ms": 60000}
+    # An idempotency key travels as a header, in both start forms.
+    await sandbox.commands.run("true", args=[], idempotency_key="job-1")
+    assert server.requests[-1].headers["idempotency-key"] == "job-1"
+    handle = await sandbox.commands.run("true", args=[], background=True, idempotency_key="job-2")
+    assert server.seen("POST", r"/commands$")[-1].headers["idempotency-key"] == "job-2"
+    await handle.wait()
     with pytest.raises(TypeError):
         await sandbox.commands.run("echo", args="hello")  # type: ignore[arg-type]
     with pytest.raises(ValueError):

@@ -8,12 +8,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"regexp"
 	"text/tabwriter"
 	"time"
 
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
+	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/server"
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
 )
 
@@ -22,6 +24,7 @@ const adminUsage = `usage: sbxd admin <resource> <action> [flags]
   tenant   create | update | list | delete
   key      create | list | revoke
   template apply | list | show | delete
+  host     destroy
 
 Every action takes --database-url (or SBX_DATABASE_URL) and --json.
 
@@ -32,6 +35,8 @@ examples:
       --cpus 1 --memory 512m --pids 256 --workdir-size 128m --tmp-size 64m \
       --network allowlist --idle-timeout 10m --max-lifetime 1h --warm-target 3 --max-total 20
   sbxd admin template apply --file templates.json   # one object or an array
+  sbxd admin host destroy --run-dir /run/user/1000/sbx   # server stopped: remove its containers,
+                                                         # run dirs and live sandbox rows
 `
 
 // adminFlags are the flags every admin action shares.
@@ -116,9 +121,55 @@ func cmdAdmin(args []string, stdout, stderr io.Writer) error {
 		return adminTemplateShow(a, rest)
 	case "template delete":
 		return adminTemplateDelete(a, rest)
+	case "host destroy":
+		return adminHostDestroy(a, rest)
 	}
 	fmt.Fprintf(stderr, "sbxd admin: unknown action %q\n\n%s", name, adminUsage)
 	return errUsage
+}
+
+// --- host --------------------------------------------------------------------
+
+// adminHostDestroy removes everything one scheduler identity owns, with
+// the server stopped: its containers, its run dirs and its live rows.
+func adminHostDestroy(a *adminFlags, args []string) error {
+	hostID := a.fs.String("host-id", envStr("SBX_HOST_ID", ""),
+		"host id whose containers and rows are destroyed [SBX_HOST_ID] (default: derived from --run-dir, as serve does)")
+	runDir := a.fs.String("run-dir", envStr("SBX_RUN_DIR", ""),
+		"that server's run dir: checked for a running server, and its per-sandbox directories are removed [SBX_RUN_DIR]")
+	socket := a.fs.String("podman-socket", envStr("SBX_PODMAN_SOCKET", ""), "Podman API socket [SBX_PODMAN_SOCKET]")
+	noDB := a.fs.Bool("no-database", false, "only remove containers and run dirs; leave the sandbox rows to the next server start")
+	if err := parse(a.fs, args); err != nil {
+		return err
+	}
+	if *hostID == "" && *runDir == "" {
+		// The same defaults as serve, so that the pair "sbxd serve" /
+		// "sbxd admin host destroy" works without flags.
+		*runDir = server.DefaultRunDir()
+	}
+	if *hostID == "" && *runDir == "" {
+		return errors.New("--host-id or --run-dir is required")
+	}
+	dbURL := *a.dbURL
+	switch {
+	case *noDB:
+		dbURL = ""
+	case dbURL == "":
+		return errors.New("a database URL is required (--database-url or SBX_DATABASE_URL), or pass --no-database to leave the rows alone")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	rep, err := server.DestroyHost(ctx, server.DestroyHostConfig{HostID: *hostID, RunDir: *runDir, PodmanSocket: *socket,
+		DatabaseURL: dbURL, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		return err
+	}
+	if *a.asJSON {
+		return a.printJSON(rep)
+	}
+	fmt.Fprintf(a.stdout, "host %s: destroyed %d container(s), removed %d run dir(s), closed %d sandbox row(s)\n",
+		rep.HostID, rep.Containers, rep.RunDirs, rep.Rows)
+	return nil
 }
 
 // --- tenants -----------------------------------------------------------------

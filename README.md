@@ -65,6 +65,38 @@ The REST API is described in `api/openapi.yaml`.
   listener, route removed from the API listener) is set.
 - **Delete.** `DELETE /v1/sandboxes/{id}` answers once the sandbox is fenced and
   destroys the container in the background; `?wait=true` waits for it.
+- **Shutdown.** On SIGTERM or SIGINT `sbxd serve` closes the API (open streams and
+  WebSockets end with `shutting_down`), then stops the refill loop and waits for the
+  creates in flight, and only then touches a sandbox, so a stop never starts a
+  container or leaves one half made. What remains is decided by `--shutdown-policy`:
+
+  | Policy | Tenant sandboxes | Warm sandboxes | Containers of this host id after the stop |
+  |---|---|---|---|
+  | `drain` (default) | released, reason `host_drain` | **left running** | exactly the warm pool |
+  | `leave` | left running, unreachable | left running | warm and tenant sandboxes |
+  | `destroy` | destroyed, reason `host_drain` | destroyed | none |
+
+  Leaving the warm pool is deliberate: a warm sandbox holds no tenant data, and the
+  next start re-adopts it after one readiness probe, so a restart does not pay for a
+  cold pool. It also means that after a default stop `podman ps` still shows
+  `warm-target` containers per template. They are not leaked: they are labelled with
+  the host id, recorded in the database, and adopted or reaped by the next start.
+  With `leave`, the next start recycles the tenant sandboxes (`host_drain`). To stop a
+  server for good use `--shutdown-policy destroy`, or afterwards
+  `sbxd admin host destroy --run-dir <its run dir>` (add `--host-id` if it was set),
+  which removes the containers, run dirs and live sandbox rows of a host id without
+  starting the server and refuses to run while that server is up. Neither ever touches
+  a container of another host id. A second signal during the stop kills the process.
+- **Browsers (CORS).** Off by default. `--cors-allowed-origins https://app.example.com`
+  (comma-separated exact origins, or `*`) lets pages on those origins call the
+  data-plane routes (commands, files, the PTY WebSocket) with a sandbox access token.
+  The control plane never takes part, and a tenant API key is refused from a browser
+  origin (`403 api_key_not_allowed`) unless `--cors-allow-api-key` is also given. With
+  the flag set, a request or WebSocket handshake from any other origin is refused.
+  Details are in `api/openapi.yaml` under "Browsers and CORS".
+- **Retrying a command start.** A start that carries `Idempotency-Key` runs at most
+  once per sandbox and key; a repeat answers for the first command. See "Not knowing
+  whether a command started" in `api/openapi.yaml`.
 - **`oom` file.** When a sandbox is OOM-killed, conmon creates an empty file named
   `oom` in the working directory of the Podman service (the user's home for the
   systemd-activated service). Podman 4.9 has no option for it; a systemd drop-in
@@ -86,7 +118,7 @@ work; see `bench/RESULTS.md` for method and limits.
 
 | Path | What it is |
 |---|---|
-| `cmd/sbxd` | Server: `serve`, `preflight`, `admin` |
+| `cmd/sbxd` | Server: `serve`, `preflight`, `admin` (tenants, keys, templates, `host destroy`) |
 | `cmd/sbx-agent`, `internal/agent` | In-sandbox agent: processes, PTYs, ring-buffer replay, files |
 | `internal/api`, `api/openapi.yaml` | Public REST API: sandboxes, commands, streams, WebSocket PTY, files |
 | `internal/server` | Wiring and shutdown policy |
@@ -106,9 +138,14 @@ work; see `bench/RESULTS.md` for method and limits.
 ## Build and test
 
 ```sh
-make test     # unit tests
+make test     # unit tests; with SBX_TEST_DATABASE_URL also the store tests
 make e2e      # needs SBX_E2E_DATABASE_URL and the Podman socket
 ```
+
+`.github/workflows/ci.yml` runs the Go checks (with a Postgres service) and both SDKs'
+checks on every push and pull request. The Podman integration tests and `make e2e`
+need rootless Podman with cgroup v2 delegation and are run locally; CI only tries
+them in a separate job that cannot fail the build.
 
 ## Licence
 

@@ -148,6 +148,15 @@ export class MockServer {
   chunkBytes = 0
   /** What DELETE /v1/sandboxes/{id} answers: 204 synchronously, or 202 and a later state change. */
   asyncDelete = false
+  /**
+   * Behave like a server from before the close-out changes: stream headers
+   * only with the first event, no stat route, mkdir always 204, refused
+   * WebSocket handshakes as HTTP errors only, and a bare 1001 close when
+   * the sandbox goes away.
+   */
+  legacy = false
+  /** Send application close codes without the status frame before them (a client that only sees the close). */
+  closeWithoutStatusFrame = false
   url = ''
   wsCount = 0
   #server: Server
@@ -550,13 +559,18 @@ export class MockServer {
   #stream(res: ServerResponse, cmd: MockCommand, from: number, withStart: boolean): void {
     let cursor = from
     let begun = false
+    const begin = (): void => {
+      if (begun) return
+      begun = true
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' })
+      res.flushHeaders()
+      this.#streams.add(res)
+    }
+    // The real server sends the headers at once; the legacy one with the first event.
+    if (!this.legacy) begin()
     const write = (events: Record<string, unknown>[]): void => {
       if (events.length === 0) return
-      if (!begun) {
-        begun = true
-        res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' })
-        this.#streams.add(res)
-      }
+      begin()
       const text = Buffer.from(events.map((e) => `${JSON.stringify(e)}\n`).join(''))
       if (this.chunkBytes > 0) {
         for (let at = 0; at < text.length; at += this.chunkBytes) res.write(text.subarray(at, at + this.chunkBytes))
@@ -645,13 +659,31 @@ export class MockServer {
     if (!raw) throw new HttpError(400, 'bad_request', 'the path query parameter is required')
     const path = abs(raw)
     if (action === 'mkdir' && method === 'POST') {
+      if (sb.files.has(path)) throw new HttpError(409, 'conflict', 'mkdir: file exists')
+      const created = !sb.dirs.has(path)
       let p = ''
       for (const seg of path.split('/').filter(Boolean)) {
         p += `/${seg}`
         sb.dirs.add(p)
       }
-      res.writeHead(204).end()
+      res.writeHead(created && !this.legacy ? 201 : 204).end()
       return
+    }
+    if (action === 'stat' && method === 'GET' && !this.legacy) {
+      const name = path.slice(path.lastIndexOf('/') + 1)
+      if (sb.dirs.has(path)) {
+        return sendJson(res, 200, { name, path, size: 0, mode: '0755', is_dir: true, mod_time: '2026-10-10T00:00:00Z' })
+      }
+      const f = sb.files.get(path)
+      if (!f) throw new HttpError(404, 'file_not_found', 'no such file or directory')
+      return sendJson(res, 200, {
+        name,
+        path,
+        size: f.data.length,
+        mode: f.mode,
+        is_dir: false,
+        mod_time: '2026-10-10T00:00:00.123456789Z',
+      })
     }
     if (action !== undefined) throw new HttpError(404, 'not_found', `no such route: ${method} ${rec.path}`)
     if (method === 'GET') {
@@ -703,7 +735,29 @@ export class MockServer {
       const sb = this.authorizeData(rec, decodeURIComponent(m[1] ?? ''))
       cmd = this.#command(sb, decodeURIComponent(m[2] ?? ''))
     } catch (e) {
-      refuse(e instanceof HttpError ? e : new HttpError(500, 'internal', String(e)))
+      const err = e instanceof HttpError ? e : new HttpError(500, 'internal', String(e))
+      if (!this.legacy && url.searchParams.get('handshake_errors') === 'close') {
+        // Accept, say why on the status channel, close with the application code.
+        const codes: Record<string, number> = {
+          sandbox_terminated: 4000,
+          sandbox_not_running: 4000,
+          unauthorized: 4001,
+          shutting_down: 4002,
+          agent_unavailable: 4003,
+          not_found: 4004,
+          process_not_found: 4004,
+          bad_request: 4005,
+          rate_limited: 4029,
+        }
+        this.#wss.handleUpgrade(req, socket, head, (ws) => {
+          if (!this.closeWithoutStatusFrame) {
+            ws.send(Buffer.concat([Buffer.from([3]), Buffer.from(JSON.stringify({ error: { code: err.code, message: err.message } }))]))
+          }
+          ws.close(codes[err.code] ?? 4099, err.code)
+        })
+        return
+      }
+      refuse(err)
       return
     }
     this.wsCount++
@@ -750,7 +804,17 @@ export class MockServer {
       }
     }
     const ping = (payload: Buffer): void => ws.send(Buffer.concat([Buffer.from([7]), payload]))
-    const gone = (): void => ws.close(1001, 'sandbox terminated')
+    const gone = (): void => {
+      if (this.legacy) return ws.close(1001, 'sandbox terminated')
+      if (!this.closeWithoutStatusFrame) {
+        const sb = [...this.sandboxes.values()].find((s) => s.commands.get(cmd.pid) === cmd)
+        const details = { state: sb?.state ?? 'destroyed', reason: sb?.reason ?? 'released' }
+        sendJsonFrame(3, { error: { code: 'sandbox_terminated', message: `sandbox has terminated: ${details.reason}`, details } })
+      }
+      ws.close(4000, 'sandbox_terminated')
+    }
+    const closeWith = (code: number, reason: string): void => ws.close(code, reason)
+    cmd.on('ws-close', closeWith)
     cmd.on('update', pump)
     cmd.on('ws-ping', ping)
     cmd.on('gone', gone)
@@ -758,6 +822,7 @@ export class MockServer {
       cmd.off('update', pump)
       cmd.off('ws-ping', ping)
       cmd.off('gone', gone)
+      cmd.off('ws-close', closeWith)
     })
     ws.on('message', (data, isBinary) => {
       const buf = data as Buffer

@@ -507,7 +507,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, tenant stor
 		return err
 	}
 	if s.cfg.Stats == nil {
-		return errf(http.StatusNotImplemented, "not_implemented", "this server does not expose sandbox stats")
+		return errf(http.StatusNotImplemented, CodeNotImplemented, "this server does not expose sandbox stats")
 	}
 	st, err := s.cfg.Stats.Stats(ctx, acc.Sandbox.InstanceID)
 	if errors.Is(err, runtime.ErrNotRunning) || errors.Is(err, runtime.ErrNotFound) {

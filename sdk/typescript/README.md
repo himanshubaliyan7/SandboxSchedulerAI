@@ -160,7 +160,7 @@ only new output.
 | Output lost by a slow reader | not reported | `truncated` / `droppedBytes` / `onTruncated` |
 | `sandbox.setTimeout(ms)` | `void` | the updated `SandboxInfo` (the server may cap the value) |
 | PTY `wait()` on non-zero exit | throws | returns the result |
-| `files.exists/makeDir` | — / `boolean` | `boolean` / `void` |
+| `files.exists/makeDir/getInfo` | `boolean` / `boolean` / `EntryInfo` | the same (`makeDir` is `true` only if it created the directory) |
 | Not available | `pause`, `getHost`, `files.watchDir`, `files.rename` | the server has no such routes yet |
 
 ## Streaming robustness
@@ -190,10 +190,33 @@ const sandbox = await Sandbox.create('python', {
 })
 ```
 
-The one case that cannot be resumed: the connection dies after the start
-request was sent but before the server confirmed it. The SDK does not know
-the command's id, and will not start it a second time; you get a
-`ConnectionError` with `code: 'start_unconfirmed'`.
+The one case the SDK does not resume by itself: the connection dies after
+the start request was sent but before the server confirmed it. The SDK does
+not know the command's id, and will not start it a second time; you get a
+`ConnectionError` with `code: 'start_unconfirmed'`. The server sends the
+confirmation (the `start` event with the pid) together with the response
+headers, so the window is small. To close it, give the command an
+`idempotencyKey` and simply call `run` again with the same key and command:
+the server starts it at most once and the second call attaches to it.
+
+```ts
+const key = crypto.randomUUID()
+const run = () => sandbox.commands.run('python3 train.py', { idempotencyKey: key })
+const result = await run().catch((e) => (e.code === 'start_unconfirmed' ? run() : Promise.reject(e)))
+```
+
+### Compatibility with older servers
+
+The SDK relies on a few things `sbxd` gained together with it, and degrades
+as follows against a server without them:
+
+| Feature | With an older server |
+|---|---|
+| `files.getInfo` / `exists` (stat route) | falls back to listing the parent directory (also when only the sandbox's agent is older) |
+| `files.makeDir` result | always `false` (the server did not say whether it created the directory) |
+| Terminal closed by the server (close codes 4000-4099) | a close without a code makes the SDK ask the server once what happened, as before |
+| `commands.connect()` (immediate stream headers) | resolves only when the command next prints something, or after the 25 s keepalive; fails if `requestTimeoutMs` is shorter than that |
+| `idempotencyKey` | ignored by the server: a repeated `run` starts a second command |
 
 ## Terminals (PTY)
 
@@ -281,7 +304,8 @@ const stream = await sandbox.files.read('out/big.parquet', { format: 'stream' })
 
 await sandbox.files.list('out')     // [{ name, path, type: 'file' | 'dir', size, mode, modifiedTime }]
 await sandbox.files.exists('out/report.json')
-await sandbox.files.makeDir('a/b/c')   // parents too; fine if it exists
+await sandbox.files.getInfo('out')     // { name, path, type, size, mode, modifiedTime }; NotFoundError if absent
+await sandbox.files.makeDir('a/b/c')   // parents too; true if it created it, false if it was there
 await sandbox.files.remove('a')        // a file, or a directory and everything in it
 ```
 
@@ -370,9 +394,11 @@ await Sandbox.create('python', { retry: false }) // off
   and they are never put in a URL: on a WebSocket the token travels as a
   subprotocol (`sbx.token.<token>`).
 - Browser `fetch` calls to the server are cross-origin requests with custom
-  headers, so the server (or the proxy in front of it) must answer CORS
-  preflights. `sbxd` itself does not send CORS headers at the time of
-  writing; the WebSocket endpoint accepts any origin and works without.
+  headers, so the server must answer CORS preflights: start `sbxd serve`
+  with `--cors-allowed-origins https://your.app` (off by default). That
+  opens the data plane only (`commands`, `pty`, `files`), and only for the
+  sandbox access token: a tenant API key is refused from a browser origin.
+  Without the flag only the WebSocket endpoint (`pty`) works from a page.
 
 ## Configuration
 

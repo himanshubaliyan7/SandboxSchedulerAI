@@ -30,6 +30,8 @@ type session struct {
 
 	lastTouch atomic.Int64 // unix nanoseconds of the last store write
 	checking  atomic.Bool  // a lost-instance check is in flight
+
+	idem idemTable // idempotency keys of command starts
 }
 
 type sessions struct {

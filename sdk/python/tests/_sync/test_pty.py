@@ -453,3 +453,81 @@ def test_rest_helpers(sandbox: Sandbox, server: FakeServer, ws: FakeWSServer) ->
     with pytest.raises(sbx.ConflictError) as e:
         sandbox.pty.resize(plain.pid, 1, 1)
     assert e.value.code == "not_a_pty"
+
+
+def test_final_close_codes_are_typed_without_a_status_frame(sandbox: Sandbox, ws: FakeWSServer) -> None:
+    for code, reason, expected in (
+        (4000, "sandbox_terminated", sbx.SandboxTerminatedError),
+        (4000, "sandbox_not_running", sbx.SandboxNotRunningError),
+        (4000, "", sbx.SandboxTerminatedError),  # no reason: the code's own meaning
+        (4001, "unauthorized", sbx.AuthenticationError),
+        (4004, "process_not_found", sbx.CommandNotFoundError),
+        (4005, "bad_request", sbx.InvalidArgumentError),
+    ):
+
+        def script(
+            conn: ServerConnection, session: WSSession, code: int = code, reason: str = reason
+        ) -> None:
+            ws_offset(conn, 0)
+            conn.close(code, reason)
+
+        before = len(ws.sessions)
+        ws.scripts.append(script)
+        handle = sandbox.pty.create(80, 24, lambda data: None)
+        with pytest.raises(expected):
+            handle.wait()
+        assert len(ws.sessions) == before + 1, f"close {code} {reason!r} was followed by a re-attach"
+
+
+def test_transient_close_codes_and_status_frames_reattach(sandbox: Sandbox, ws: FakeWSServer) -> None:
+    def agent_lost(conn: ServerConnection, session: WSSession) -> None:
+        ws_offset(conn, 0)
+        ws_output(conn, session, b"a")
+        conn.send(
+            b"\x03"
+            + json.dumps(
+                {"error": {"code": "agent_unavailable", "message": "the agent did not answer"}}
+            ).encode()
+        )
+        conn.close(4003, "agent_unavailable")
+
+    def shutting_down(conn: ServerConnection, session: WSSession) -> None:
+        ws_offset(conn, session.start)
+        ws_output(conn, session, b"b")
+        conn.close(4002, "shutting_down")  # the close alone, without a status frame
+
+    def unknown_code(conn: ServerConnection, session: WSSession) -> None:
+        ws_offset(conn, session.start)
+        ws_output(conn, session, b"c")
+        conn.close(4777, "something_new")
+
+    def last(conn: ServerConnection, session: WSSession) -> None:
+        ws_offset(conn, session.start)
+        ws_output(conn, session, b"d")
+        ws_exit(conn)
+
+    ws.scripts += [agent_lost, shutting_down, unknown_code, last]
+    received: list[bytes] = []
+    handle = sandbox.pty.create(80, 24, received.append)
+    result = handle.wait()
+    assert result.exit_code == 0 and b"".join(received) == b"abcd"
+    assert [s.start for s in ws.sessions] == [0, 1, 2, 3] and handle.reconnects == 3
+
+
+def test_close_code_table() -> None:
+    from sbx import _wire as wire
+
+    assert wire.close_error(4000, "sandbox_not_running") == {
+        "code": "sandbox_not_running",
+        "message": "the server closed the connection: sandbox_not_running (close code 4000)",
+    }
+    assert wire.close_error(4004, None)["code"] == "process_not_found"  # type: ignore[index]
+    assert wire.close_error(4001, "Not A Token!")["code"] == "unauthorized"  # type: ignore[index]
+    for code in (4002, 4003, 4029, 4099, 4321, 1000, 1001, 1006, None):
+        assert wire.close_error(code, "x") is None
+    # The frame sizes the server documents.
+    assert wire.MAX_CLIENT_FRAME_PAYLOAD == 1 << 20 and wire.MAX_SERVER_FRAME_PAYLOAD == 32 << 10
+    assert (
+        wire.STDIN_CHUNK < wire.MAX_CLIENT_FRAME_PAYLOAD
+        and wire.MAX_SERVER_FRAME > wire.MAX_SERVER_FRAME_PAYLOAD
+    )

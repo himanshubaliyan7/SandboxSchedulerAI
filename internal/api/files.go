@@ -1,12 +1,14 @@
 package api
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
 
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentapi"
+	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
 )
 
 // File routes. Paths are interpreted by the in-sandbox agent: absolute,
@@ -123,6 +125,35 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request, sess *se
 	return nil
 }
 
+// handleFileStat describes one path: GET .../files/stat?path=P. It is how
+// a client asks "does this exist, and is it a directory" without reading
+// or listing anything.
+func (s *Server) handleFileStat(w http.ResponseWriter, r *http.Request, sess *session) error {
+	path, err := filePath(r)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := s.opCtx(r)
+	defer cancel()
+	fi, err := sess.client.StatFile(ctx, path)
+	if err != nil {
+		var age *agentclient.Error
+		if errors.As(err, &age) && age.Code == "no_route" {
+			// A warm sandbox created by an older server and adopted by
+			// this one still runs the agent it was created with.
+			return errf(http.StatusNotImplemented, CodeNotImplemented,
+				"this sandbox's agent predates the stat route; list the parent directory instead")
+		}
+		return s.agentFailure(sess, err, CodeFileNotFound)
+	}
+	writeJSON(w, http.StatusOK, fileView(fi))
+	return nil
+}
+
+// handleMkdir creates a directory and its missing parents. 201 means
+// this request created it, 204 that it was already there; both are
+// success, and a client that does not care treats any 2xx alike (204 was
+// the only answer before the distinction existed).
 func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, sess *session) error {
 	path, err := filePath(r)
 	if err != nil {
@@ -130,8 +161,13 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, sess *sessi
 	}
 	ctx, cancel := s.opCtx(r)
 	defer cancel()
-	if err := sess.client.Mkdir(ctx, path); err != nil {
+	created, err := sess.client.Mkdir(ctx, path)
+	if err != nil {
 		return s.agentFailure(sess, err, CodeFileNotFound)
+	}
+	if created {
+		w.WriteHeader(http.StatusCreated)
+		return nil
 	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil

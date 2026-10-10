@@ -231,29 +231,45 @@ func (c *Client) Get(ctx context.Context, id string) (agentapi.ProcessInfo, erro
 	return pi, err
 }
 
-// Stream reads the NDJSON event stream of a process starting at offset
-// from. The sequence ends after the exit event, on the first error
-// (yielded once, with a zero Event), or when ctx is done (ctx.Err() is
-// yielded). A sequence that ends without an exit event and without an
-// error does not happen: a connection cut short yields
-// io.ErrUnexpectedEOF. Keepalive events are yielded like any other.
-//
-// To resume after an error, call Stream again with from set to the
-// Offset+len(Data) of the last output event received.
-func (c *Client) Stream(ctx context.Context, id string, from int64) iter.Seq2[agentapi.Event, error] {
+// EventStream is an open NDJSON event stream of a process: the agent has
+// accepted the request and sent its response headers. Read it with Events
+// and Close it when done.
+type EventStream struct {
+	ctx  context.Context
+	body io.ReadCloser
+}
+
+// OpenStream opens the event stream of a process starting at offset from
+// and returns once the agent has answered: an unknown process or an
+// unreachable agent is an error here, before any event. The agent answers
+// at once, whether or not the process has produced anything. ctx governs
+// the whole life of the stream.
+func (c *Client) OpenStream(ctx context.Context, id string, from int64) (*EventStream, error) {
+	resp, err := c.do(ctx, http.MethodGet, procURL(id, "/stream?from="+strconv.FormatInt(from, 10)), nil, "")
+	if err != nil {
+		return nil, err
+	}
+	return &EventStream{ctx: ctx, body: resp.Body}, nil
+}
+
+// Close releases the stream's connection. It is safe to call twice.
+func (s *EventStream) Close() error { return s.body.Close() }
+
+// Events yields the stream's events. The sequence ends after the exit
+// event, on the first error (yielded once, with a zero Event), or when
+// the stream's context is done (its error is yielded). A sequence that
+// ends without an exit event and without an error does not happen: a
+// connection cut short yields io.ErrUnexpectedEOF. Keepalive events are
+// yielded like any other. Events may be ranged over once.
+func (s *EventStream) Events() iter.Seq2[agentapi.Event, error] {
 	return func(yield func(agentapi.Event, error) bool) {
-		resp, err := c.do(ctx, http.MethodGet, procURL(id, "/stream?from="+strconv.FormatInt(from, 10)), nil, "")
-		if err != nil {
-			yield(agentapi.Event{}, err)
-			return
-		}
-		defer resp.Body.Close()
+		defer s.body.Close()
 		// A line is one Event: at most MaxFrameBytes of data, base64.
-		br := bufio.NewReaderSize(resp.Body, 64<<10)
+		br := bufio.NewReaderSize(s.body, 64<<10)
 		for {
 			line, err := br.ReadBytes('\n')
 			if err != nil {
-				if cerr := ctx.Err(); cerr != nil {
+				if cerr := s.ctx.Err(); cerr != nil {
 					err = cerr
 				} else if err == io.EOF {
 					err = io.ErrUnexpectedEOF
@@ -270,6 +286,22 @@ func (c *Client) Stream(ctx context.Context, id string, from int64) iter.Seq2[ag
 				return
 			}
 		}
+	}
+}
+
+// Stream is OpenStream followed by Events: a failure to open is yielded
+// as the sequence's first and only item.
+//
+// To resume after an error, call Stream again with from set to the
+// Offset+len(Data) of the last output event received.
+func (c *Client) Stream(ctx context.Context, id string, from int64) iter.Seq2[agentapi.Event, error] {
+	return func(yield func(agentapi.Event, error) bool) {
+		s, err := c.OpenStream(ctx, id, from)
+		if err != nil {
+			yield(agentapi.Event{}, err)
+			return
+		}
+		s.Events()(yield)
 	}
 }
 

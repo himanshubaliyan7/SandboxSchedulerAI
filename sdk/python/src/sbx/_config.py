@@ -100,6 +100,11 @@ class RetryPolicy:
         return self.backoff(attempt + 1)
 
 
+#: Default per-command timeout of ``commands.run``, in seconds. The same as
+#: the TypeScript SDK's ``commandTimeoutMs`` (60000) and as E2B.
+DEFAULT_COMMAND_TIMEOUT = 60.0
+
+
 @dataclass(frozen=True)
 class ConnectionConfig:
     """Everything a client needs to talk to one server.
@@ -125,6 +130,9 @@ class ConnectionConfig:
     ws_base_url: str | None = None
     #: How ``commands.run("a | b")`` is turned into an argv when ``args`` is not given.
     shell: Sequence[str] = ("/bin/sh", "-c")
+    #: Wall-clock limit, in seconds, of a command started by ``commands.run``
+    #: without a ``timeout`` (E2B's default). 0 means no limit.
+    command_timeout: float = DEFAULT_COMMAND_TIMEOUT
 
     @classmethod
     def resolve(
