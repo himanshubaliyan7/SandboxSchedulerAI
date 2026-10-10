@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to exact release tags. To pin harder, replace a tag by
+# the commit SHA of that release (and keep the tag in a comment).
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: sbx
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Makes the store tests (and the pool's store integration test) run.
+      SBX_TEST_DATABASE_URL: postgres://postgres:sbx@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-ed:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      # The Podman integration tests skip themselves here: the job has no
+      # Podman API socket (see the podman job below). The end-to-end tests
+      # in test/e2e are gated by SBX_E2E=1 and are not run.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  # Rootless Podman on a hosted runner is not dependable: the tests need the
+  # user's Podman API socket and a delegated cgroup v2 subtree (memory, pids
+  # and cpu controllers for the user), which a runner's non-login session
+  # does not always have. So this job tries, reports, and never fails the
+  # build. The authoritative runs of these tests and of `make e2e` are local.
+  podman:
+    name: Podman integration (non-blocking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: go.mod
+      - name: Start the rootless Podman API service
+        run: |
+          podman --version
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          sudo mkdir -p "$XDG_RUNTIME_DIR" && sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$XDG_RUNTIME_DIR/podman"
+          nohup podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" >/tmp/podman-service.log 2>&1 &
+          for _ in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ] && break; sleep 0.2; done
+          podman pull docker.io/library/alpine:3.20
+          podman pull docker.io/library/python:3.12-alpine
+      - name: Host preflight (informational)
+        run: |
+          make build
+          bin/sbxd preflight || true
+      - name: Podman backend integration tests
+        run: go test -count=1 -v ./internal/runtime/podman/
+
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        # pyproject.toml points pyright at ./.venv, so the environment lives there.
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev]"
+      - name: ruff
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+      - name: pyright
+        run: .venv/bin/pyright
+      - name: The blocking client is generated from the asyncio one
+        run: .venv/bin/python scripts/unasync.py --check
+      - name: pytest
+        # The live tests skip themselves without a server.
+        run: .venv/bin/pytest -q
+
+  typescript-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - run: npm ci
+      - name: typecheck
+        run: npm run typecheck
+      - name: lint
+        run: npm run lint
+      - name: test
+        run: npm test
+      - name: build and verify the package
+        run: |
+          npm run build
+          npm run verify:dist
