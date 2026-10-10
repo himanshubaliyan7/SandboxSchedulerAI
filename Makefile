@@ -10,6 +10,7 @@ all: vet test build
 # linked one that cannot start in a musl image.
 build: agent
 	$(GO) build -trimpath -o $(BIN)/sbxd ./cmd/sbxd
+	$(GO) build -trimpath -o $(BIN)/sbx-mcp ./cmd/sbx-mcp
 
 # The in-sandbox agent must be static: it is bind-mounted into arbitrary images.
 agent:
