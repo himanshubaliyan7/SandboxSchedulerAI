@@ -42,6 +42,34 @@ curl -N -H "X-Access-Token: $TOKEN" -d '{"cmd":"python3","args":["-c","print(6*7
 
 The REST API is described in `api/openapi.yaml`.
 
+## Operating notes
+
+- **Host id.** Every container carries an `sbx.host_id` label and a server only
+  ever touches containers and database rows with its own id; containers of another
+  id are left alone, and `sbx.managed` containers with no id (made by an older
+  version) are left alone with a warning. The default id is
+  `<hostname>-u<uid>-<hash of the run dir>`; set `--host-id` / `SBX_HOST_ID` to pin
+  it. It must stay the same across restarts, and each server needs its own
+  `--run-dir` (a second server on a run dir in use refuses to start). Several
+  servers can then share one Podman user.
+- **Density ceiling.** Each running container holds one kernel key of the user's
+  `kernel.keys.maxkeys` quota (200 by default), so about 190 sandboxes per user
+  before creates fail with `Disk quota exceeded`. The Libpod API has no
+  per-container switch; set `keyring = false` under `[containers]` in
+  `~/.config/containers/containers.conf` and restart the Podman service, or raise
+  the sysctl as root. `sbxd preflight` and server start-up report the real ceiling
+  against the templates' `max_total`, and the same for inotify instances.
+- **Metrics.** `/metrics` is unauthenticated on the API listener, which is only
+  allowed while `--listen` is a loopback address: otherwise `sbxd serve` refuses to
+  start unless `--metrics-token` (bearer token) or `--metrics-listen` (separate
+  listener, route removed from the API listener) is set.
+- **Delete.** `DELETE /v1/sandboxes/{id}` answers once the sandbox is fenced and
+  destroys the container in the background; `?wait=true` waits for it.
+- **`oom` file.** When a sandbox is OOM-killed, conmon creates an empty file named
+  `oom` in the working directory of the Podman service (the user's home for the
+  systemd-activated service). Podman 4.9 has no option for it; a systemd drop-in
+  with `WorkingDirectory=` for `podman.service` moves it.
+
 ## Measured on a 4-thread laptop
 
 Podman 4.9.3, crun, network none, hardened spec. One machine, shared with other

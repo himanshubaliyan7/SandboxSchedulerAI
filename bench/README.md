@@ -60,7 +60,7 @@ back to `sleep` as the idle process and says so in the results).
 "Hardened" is the CLI equivalent of `podman.BuildCreateSpec`
 (`internal/runtime/podman/spec.go`): cap-drop all, no-new-privileges, read-only root,
 capped tmpfs on `/workspace`, `/tmp`, `/var/tmp`, `/run`, network none, 1 CPU, 256 MiB
-memory with memory-swap equal to it, `memory.high` at 90%, `memory.oom.group=1`, 128 pids,
+memory with memory-swap equal to it, `memory.oom.group=1`, 128 pids,
 nofile 1024, user 1000:1000 with `keep-id:uid=1000,gid=1000`, the product seccomp profile
 (`internal/runtime/podman/seccomp/sbx-seccomp.json`), log driver none, plus the run-dir and
 agent bind mounts. The REST benchmarks send the same SpecGenerator JSON as `spec.go`.

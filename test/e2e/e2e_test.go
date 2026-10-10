@@ -713,8 +713,9 @@ except Exception as e:
 		if allowed, denied := acme.metric(`sbx_egress_requests_total{verdict="allowed"}`), acme.metric(`sbx_egress_requests_total{verdict="denied"}`); allowed < 1 || denied < 4 {
 			t.Errorf("egress metrics: allowed=%v denied=%v", allowed, denied)
 		}
-		// Deleting the sandbox removes its proxy socket with its run dir.
-		acme.must(204, "DELETE", "/v1/sandboxes/"+net1.ID, nil, "")
+		// Deleting the sandbox removes its proxy socket with its run dir
+		// (wait=true: the default delete answers before the run dir is gone).
+		acme.must(204, "DELETE", "/v1/sandboxes/"+net1.ID+"?wait=true", nil, "")
 		if _, err := os.Stat(filepath.Join(e.runDir, net1.ID)); !os.IsNotExist(err) {
 			t.Errorf("run dir of the deleted sandbox: %v", err)
 		}
