@@ -143,8 +143,9 @@ export class ApiClient {
 
   constructor(opts: ConnectionOptions & { accessToken?: string | undefined } = {}) {
     this.baseUrl = stripTrailingSlash(opts.baseUrl ?? env('SBX_BASE_URL') ?? DEFAULT_BASE_URL)
-    this.#apiKey = opts.apiKey ?? env('SBX_API_KEY')
-    this.#accessToken = opts.accessToken
+    // An empty string means "no key", as an unset variable does.
+    this.#apiKey = opts.apiKey || env('SBX_API_KEY')
+    this.#accessToken = opts.accessToken || undefined
     this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     this.retry = opts.retry === false ? { ...DEFAULT_RETRY, maxRetries: 0 } : { ...DEFAULT_RETRY, ...definedOnly(opts.retry ?? {}) }
     this.webSocketCtor = opts.WebSocket

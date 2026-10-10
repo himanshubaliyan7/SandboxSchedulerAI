@@ -53,9 +53,9 @@ export interface PtyOutputOptions {
    * it settles — which is what throttles a command that prints faster than
    * the terminal can render.
    */
-  onData?: (data: Uint8Array) => void | Promise<void>
+  onData?: (data: Uint8Array) => unknown
   /** Called when output was lost (the client fell behind the server's 1 MiB replay buffer). */
-  onTruncated?: (info: { offset: number; dropped: number }) => void
+  onTruncated?: (info: { offset: number; dropped: number }) => unknown
   /**
    * Acknowledge output so that the server pauses a command whose output is
    * not being consumed. Default true.
@@ -476,7 +476,8 @@ export class Pty {
   async create(opts: PtyCreateOptions = {}): Promise<PtyHandle> {
     const body: Record<string, unknown> = {
       cmd: opts.cmd ?? '/bin/sh',
-      pty: { cols: Math.floor(opts.cols ?? 80), rows: Math.floor(opts.rows ?? 24) },
+      // A terminal that reports no size (0, or undefined when piped) gets the default.
+      pty: { cols: Math.floor(opts.cols || 80), rows: Math.floor(opts.rows || 24) },
       env: { TERM: 'xterm-256color', ...(opts.envs ?? {}) },
     }
     if (opts.args !== undefined) body.args = opts.args

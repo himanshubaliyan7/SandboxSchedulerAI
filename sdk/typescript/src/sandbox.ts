@@ -1,3 +1,4 @@
+/// <reference lib="esnext.disposable" preserve="true" />
 /**
  * The Sandbox class: the E2B-shaped entry point of the SDK.
  *
@@ -82,9 +83,10 @@ export interface SandboxListOptions extends ConnectionOptions, CallOptions {
 
 export interface SandboxKillOptions extends CallOptions {
   /**
-   * Also wait until the server reports the sandbox as gone (state
-   * `destroyed` or `failed`), which frees its quota slot. Default false:
-   * resolve as soon as the server has accepted the kill.
+   * Also wait until the container and its storage are gone (state
+   * `destroyed`). Default false: resolve as soon as the server has fenced
+   * the sandbox, which already makes it unusable and frees its quota slot;
+   * the teardown then finishes in the background.
    */
   waitUntilDestroyed?: boolean
   /** Budget for `waitUntilDestroyed`. Default 30000 ms. */
@@ -112,10 +114,13 @@ function contextFor(api: ApiClient, sandboxId: string, opts: SandboxOptions): Sa
 
 async function killById(api: ApiClient, sandboxId: string, opts: SandboxKillOptions): Promise<boolean> {
   try {
-    // 204 today; a server that makes the delete asynchronous may answer 202. Any 2xx means "accepted".
+    // The delete is asynchronous by default: 204 means the sandbox is fenced
+    // (unusable, off the quota) and is being destroyed. `wait=true` asks the
+    // server to answer after the teardown; any 2xx means "accepted".
     await api.empty('DELETE', sandboxPath(sandboxId), {
       auth: 'control',
       retry: 'idempotent',
+      query: { wait: opts.waitUntilDestroyed ? 'true' : undefined },
       signal: opts.signal,
       timeoutMs: opts.requestTimeoutMs,
     })
@@ -134,7 +139,7 @@ async function killById(api: ApiClient, sandboxId: string, opts: SandboxKillOpti
       if (e instanceof NotFoundError) return true
       throw e
     }
-    if (state === 'destroyed' || state === 'failed') return true
+    if (state === 'destroyed') return true
     if (Date.now() + delay > deadline) {
       throw new TimeoutError(`sandbox ${sandboxId} was still ${state} ${budget} ms after it was killed`, { code: 'kill_timeout' })
     }

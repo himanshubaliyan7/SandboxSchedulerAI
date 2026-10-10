@@ -43,6 +43,9 @@ describe('pty.create', () => {
     const sb = await create()
     const a = await sb.pty.create()
     expect(server().lastCommand(sb.sandboxId).request).toMatchObject({ pty: { cols: 80, rows: 24 } })
+    const zero = await sb.pty.create({ cols: 0, rows: 0 }) // a terminal that reports no size
+    expect(server().lastCommand(sb.sandboxId).request).toMatchObject({ pty: { cols: 80, rows: 24 } })
+    zero.disconnect()
     const b = await sb.pty.create({ cmd: 'python3', args: ['-q'], envs: { TERM: 'dumb' } })
     expect(server().lastCommand(sb.sandboxId).request).toMatchObject({ cmd: 'python3', args: ['-q'], env: { TERM: 'dumb' } })
     a.disconnect()

@@ -245,6 +245,18 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
       await expect(sb.commands.connect('no-such-pid')).rejects.toBeInstanceOf(NotFoundError)
     })
 
+    it('diagnostic: when the stream route of a silent command sends its response headers', async () => {
+      const h = await sb.commands.run('sleep 2; echo x', { background: true })
+      const t0 = Date.now()
+      const res = await fetch(`${baseUrl}/v1/sandboxes/${sb.sandboxId}/commands/${h.pid}/stream`, {
+        headers: { 'X-Access-Token': sb.accessToken as string },
+      })
+      const headersAfter = Date.now() - t0
+      await res.body?.cancel()
+      console.log(`[diagnostic] GET .../stream of a command silent for 2 s: response headers after ${headersAfter} ms`)
+      await h.wait()
+    })
+
     it('reconnects with from=<offset> when the stream is cut mid-command, without loss or duplication', async () => {
       // A fetch that breaks the first NDJSON response shortly after it starts, as a proxy would.
       const requests: string[] = []
@@ -306,7 +318,7 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
       expect((await sb.commands.run('cat dir/héllo.txt')).stdout).toBe('grüße 🚀\n')
       const entries = await sb.files.list('dir')
       expect(entries).toHaveLength(1)
-      expect(entries[0]).toMatchObject({ name: 'héllo.txt', path: '/workspace/dir/héllo.txt', type: 'file', size: 12, mode: '0644' })
+      expect(entries[0]).toMatchObject({ name: 'héllo.txt', path: '/workspace/dir/héllo.txt', type: 'file', size: 13, mode: '0644' })
       expect(entries[0]?.modifiedTime).toBeInstanceOf(Date)
       expect((await sb.files.list()).find((e) => e.name === 'dir')?.type).toBe('dir')
       expect(await sb.files.exists('dir/héllo.txt')).toBe(true)

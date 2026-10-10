@@ -73,8 +73,12 @@ export type CommandEvent =
     }
   | { type: 'exit'; exitCode: number; reason: ExitReason; signal?: string }
 
-/** Called with each piece of output. May return a promise; the stream waits for it (backpressure). */
-export type OutputCallback = (data: string) => void | Promise<void>
+/**
+ * Called with each piece of output. If it returns a promise the stream waits
+ * for it (backpressure); any other return value is ignored, so
+ * `(d) => process.stdout.write(d)` is a valid callback.
+ */
+export type OutputCallback = (data: string) => unknown
 
 export interface CommandOutputOptions {
   /** Called with stdout text as it arrives (PTY output is delivered here too). */
@@ -82,7 +86,7 @@ export interface CommandOutputOptions {
   /** Called with stderr text as it arrives. */
   onStderr?: OutputCallback
   /** Called when output was lost; see {@link CommandEvent}. */
-  onTruncated?: (info: { offset: number; dropped: number }) => void | Promise<void>
+  onTruncated?: (info: { offset: number; dropped: number }) => unknown
   /** Overrides the sandbox's `throwOnNonZeroExit` for this command. */
   throwOnNonZeroExit?: boolean
 }
@@ -152,7 +156,7 @@ class CallbackFailure {
   constructor(readonly error: unknown) {}
 }
 
-async function callback<A>(fn: ((arg: A) => void | Promise<void>) | undefined, arg: A): Promise<void> {
+async function callback<A>(fn: ((arg: A) => unknown) | undefined, arg: A): Promise<void> {
   if (!fn) return
   try {
     await fn(arg)

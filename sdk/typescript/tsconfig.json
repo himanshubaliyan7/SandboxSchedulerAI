@@ -15,7 +15,10 @@
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "sbx-sdk": ["./src/index.ts"]
+    }
   },
   "include": ["src", "test", "examples", "vitest.config.ts"]
 }

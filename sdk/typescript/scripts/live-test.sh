@@ -104,6 +104,21 @@ locked() {
       npx vitest run test/live --reporter=verbose
   ) || status=$?
 
+  if [[ $status -eq 0 && -f $SDK_DIR/dist/index.js ]]; then
+    log "running the examples"
+    (
+      cd "$SDK_DIR"
+      export SBX_BASE_URL="http://127.0.0.1:$PORT" SBX_API_KEY="$key"
+      node examples/01-run-code.ts
+      node examples/03-files.ts
+      # The PTY example needs a terminal: `script` provides one.
+      if command -v script >/dev/null; then
+        (sleep 1.5; printf 'echo pty-example-$((20+22))\r'; sleep 1; printf 'exit\r'; sleep 1) |
+          script -qec 'node examples/02-interactive-pty.ts' /dev/null | tr -d '\r' | grep -a 'pty-example-42' | tail -n 1
+      fi
+    ) || status=$?
+  fi
+
   if [[ $status -ne 0 ]]; then
     echo "live tests failed; sbxd log tail:" >&2
     tail -n 30 "$WORK/sbxd.log" >&2 || true
@@ -137,6 +152,7 @@ log "building sbxd and sbx-agent into $WORK/bin"
 )
 
 [[ -d $SDK_DIR/node_modules ]] || (cd "$SDK_DIR" && npm ci)
+(cd "$SDK_DIR" && npm run --silent build)
 
 log "starting a fresh Postgres ($PG_NAME on 127.0.0.1:$PG_PORT)"
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
