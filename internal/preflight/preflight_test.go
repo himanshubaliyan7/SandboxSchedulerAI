@@ -20,6 +20,10 @@ type host struct {
 	binaries map[string]string // name -> `--version` output
 	pingErr  error
 	pingVer  string
+	// sdrunArgs are the arguments of the last systemd-run call. The
+	// "systemd-run" entry of binaries is its output; non-empty means it
+	// failed.
+	sdrunArgs []string
 }
 
 func (h *host) write(path, content string) {
@@ -100,6 +104,13 @@ func (h *host) run() Report {
 	}
 	opts.Run = func(_ context.Context, name string, args ...string) (string, error) {
 		out, ok := h.binaries[filepath.Base(name)]
+		if ok && filepath.Base(name) == "systemd-run" {
+			h.sdrunArgs = args
+			if out != "" {
+				return out, errors.New("exit status 1")
+			}
+			return "", nil
+		}
 		if !ok || len(args) != 1 || args[0] != "--version" {
 			return "", errors.New("unexpected command")
 		}
@@ -131,7 +142,8 @@ func TestHealthyHost(t *testing.T) {
 			t.Errorf("bad or duplicate check: %+v", c)
 		}
 		seen[c.Name] = true
-		wantInfo := c.Name == CheckKVM
+		// runsc is installed on this host but not enabled: reported, no more.
+		wantInfo := c.Name == CheckKVM || c.Name == CheckRunsc
 		if (c.Status == StatusInfo) != wantInfo || (c.Status != StatusOK && !wantInfo) {
 			t.Errorf("%s: status %s", c.Name, c.Status)
 		}
@@ -300,6 +312,47 @@ func TestChecks(t *testing.T) {
 			CheckRunsc, StatusInfo, "runsc (gVisor) not found", ""},
 		{"no runsc, required", func(h *host) { delete(h.binaries, "runsc"); h.opts.RequireRunsc = true },
 			CheckRunsc, StatusFail, "runsc (gVisor) not found", "gvisor.dev"},
+		{"runsc found, not enabled", func(h *host) {},
+			CheckRunsc, StatusInfo, "not enabled (enable the gVisor tier with --runtimes crun,runsc)", ""},
+		{"runsc enabled, missing", func(h *host) {
+			delete(h.binaries, "runsc")
+			h.opts.Runtimes = []Runtime{{Name: "crun"}, {Name: "runsc"}}
+		}, CheckRunsc, StatusFail, "runsc (gVisor) not found", "--runtimes crun,runsc=/path/to/runsc"},
+		{"runsc enabled, bad path", func(h *host) {
+			h.opts.Runtimes = []Runtime{{Name: "crun"}, {Name: "runsc", Path: "/opt/gvisor/runsc"}}
+		}, CheckRunsc, StatusFail, "/opt/gvisor/runsc does not exist", ""},
+		{"runsc enabled by path", func(h *host) {
+			h.write("/opt/gvisor/runsc", "")
+			h.binaries["systemd-run"] = ""
+			h.opts.Runtimes = []Runtime{{Name: "crun"}, {Name: "runsc", Path: "/opt/gvisor/runsc"}}
+		}, CheckRunsc, StatusOK, "/opt/gvisor/runsc: runsc version release-20260101.0; enabled and usable", ""},
+		{"runsc enabled, no systemd-run", func(h *host) {
+			h.opts.Runtimes = []Runtime{{Name: "crun"}, {Name: "runsc"}}
+		}, CheckRunsc, StatusFail, "systemd-run is not in PATH", "systemd"},
+		{"runsc enabled, scope refused", func(h *host) {
+			h.binaries["systemd-run"] = "Failed to start transient scope unit: Access denied"
+			h.opts.Runtimes = []Runtime{{Name: "crun"}, {Name: "runsc"}}
+		}, CheckRunsc, StatusFail, "refused a transient scope with limits: exit status 1: Failed to start transient scope unit", "systemd user manager"},
+		{"crun by path, missing", func(h *host) { h.opts.Runtimes = []Runtime{{Name: "crun", Path: "/opt/crun"}} },
+			CheckCrun, StatusFail, "/opt/crun does not exist", "--runtimes"},
+		{"managed service, not probed", func(h *host) {
+			h.opts.ManagedPodman, h.opts.SkipServiceProbe = true, true
+			h.opts.PingSocket = func(context.Context, string) (string, error) { h.t.Error("the socket was pinged"); return "", nil }
+		}, CheckPodmanService, StatusInfo, "sbxd starts its own `podman system service`", ""},
+		{"managed service, probe ok", func(h *host) {
+			h.opts.ManagedPodman = true
+			h.opts.ProbeService = func(context.Context) (string, error) { return "4.9.3", nil }
+		}, CheckPodmanService, StatusOK, "starts and answers (Libpod API 4.9.3)", ""},
+		{"managed service, probe fails", func(h *host) {
+			h.opts.ManagedPodman = true
+			h.opts.ProbeService = func(context.Context) (string, error) { return "", errors.New("exited before its socket answered") }
+		}, CheckPodmanService, StatusFail, "could not be started: exited before its socket answered", "--podman-socket"},
+		{"managed service takes no keys", func(h *host) {
+			h.opts.ManagedPodman, h.opts.SkipServiceProbe = true, true
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", keyUsers("200"))
+			h.opts.PlannedSandboxes = 5000
+		}, CheckKeys, StatusOK, "runs with keyring = false, so sandboxes take no key", ""},
 		{"no kvm", func(h *host) { h.remove("/dev/kvm") },
 			CheckKVM, StatusInfo, "/dev/kvm is absent", ""},
 		{"swap on", func(h *host) {

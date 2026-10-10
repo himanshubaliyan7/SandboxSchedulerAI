@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman"
 	"github.com/himanshubaliyan7/warmbox/internal/server"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
@@ -137,7 +138,9 @@ func adminHostDestroy(a *adminFlags, args []string) error {
 		"host id whose containers and rows are destroyed [SBX_HOST_ID] (default: derived from --run-dir, as serve does)")
 	runDir := a.fs.String("run-dir", envStr("SBX_RUN_DIR", ""),
 		"that server's run dir: checked for a running server, and its per-sandbox directories are removed [SBX_RUN_DIR]")
-	socket := a.fs.String("podman-socket", envStr("SBX_PODMAN_SOCKET", ""), "Podman API socket [SBX_PODMAN_SOCKET]")
+	mode := a.fs.String("podman-mode", envStr("SBX_PODMAN_MODE", ""),
+		"managed (start a throwaway Podman service, as the server did; the default without --podman-socket) or external [SBX_PODMAN_MODE]")
+	socket := a.fs.String("podman-socket", envStr("SBX_PODMAN_SOCKET", ""), "Podman API socket of an existing service; implies external mode [SBX_PODMAN_SOCKET]")
 	noDB := a.fs.Bool("no-database", false, "only remove containers and run dirs; leave the sandbox rows to the next server start")
 	if err := parse(a.fs, args); err != nil {
 		return err
@@ -157,9 +160,9 @@ func adminHostDestroy(a *adminFlags, args []string) error {
 	case dbURL == "":
 		return errors.New("a database URL is required (--database-url or SBX_DATABASE_URL), or pass --no-database to leave the rows alone")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	rep, err := server.DestroyHost(ctx, server.DestroyHostConfig{HostID: *hostID, RunDir: *runDir, PodmanSocket: *socket,
+	rep, err := server.DestroyHost(ctx, server.DestroyHostConfig{HostID: *hostID, RunDir: *runDir, PodmanSocket: *socket, PodmanMode: *mode,
 		DatabaseURL: dbURL, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		return err
@@ -499,7 +502,9 @@ func adminTemplateApply(a *adminFlags, args []string) error {
 	file := a.fs.String("file", "", "JSON file with one template object or an array of them (\"-\" for stdin); replaces the flags below")
 	a.fs.StringVar(&f.ID, "id", "", "template id")
 	a.fs.StringVar(&f.Image, "image", "", "container image; it must already be pulled for the Podman user")
-	a.fs.StringVar(&f.Runtime, "runtime", "crun", "OCI runtime: crun or runsc")
+	a.fs.StringVar(&f.Runtime, "runtime", "crun", "OCI runtime (isolation tier): crun, or runsc for gVisor; it must be among --runtimes")
+	var runtimes string
+	addRuntimeFlags(a.fs, &runtimes)
 	a.fs.Float64Var(&f.CPUs, "cpus", 1, "CPU limit")
 	a.fs.StringVar(&mem, "memory", "512m", "memory limit")
 	a.fs.Int64Var(&f.PidsLimit, "pids", 256, "pids limit")
@@ -550,6 +555,21 @@ func adminTemplateApply(a *adminFlags, args []string) error {
 			return err
 		}
 		templates = []core.Template{t}
+	}
+
+	// The store does not know what a server has enabled, so the operator
+	// says it here as they say it to the server (the same flag, the same
+	// variable): a template for a tier that is not enabled is refused now
+	// and not when its first sandbox is created.
+	enabled, err := podman.ParseRuntimes(runtimes)
+	if err != nil {
+		return fmt.Errorf("--runtimes: %w", err)
+	}
+	if len(enabled) == 0 {
+		enabled = server.DefaultRuntimes()
+	}
+	if err := server.CheckTemplateRuntimes(templates, podman.RuntimeNames(enabled)); err != nil {
+		return fmt.Errorf("%w (give `template apply` the same --runtimes / SBX_RUNTIMES as the server)", err)
 	}
 
 	var out []templateFile

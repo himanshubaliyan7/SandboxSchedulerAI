@@ -319,7 +319,9 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		// would be a second, unbounded copy on the host disk, and "none"
 		// is also one of the documented start-latency levers.
 		LogConfiguration: logConfig{Driver: "none"},
-		OCIRuntime:       ociRuntime,
+		// Sent for the record and for Podman versions that honour it;
+		// 4.9.3 does not, see Config.RuntimeSockets.
+		OCIRuntime: ociRuntime,
 
 		// VOLUME declarations in the image would otherwise become
 		// anonymous volumes: writable, uncapped host disk.

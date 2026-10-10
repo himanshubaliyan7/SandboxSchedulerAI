@@ -13,6 +13,25 @@ import (
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
+// runtimeEnabled reports whether the backend can create sandboxes of the
+// template's runtime. A backend that lists no runtimes is not asked.
+func (c *Controller) runtimeEnabled(t core.Template) bool {
+	labels := c.backend.Capabilities().RuntimeLabels
+	if len(labels) == 0 {
+		return true
+	}
+	name := t.Runtime
+	if name == "" {
+		name = "crun" // what an unset template runtime has always meant
+	}
+	for _, l := range labels {
+		if l == name {
+			return true
+		}
+	}
+	return false
+}
+
 // breaker is a per-template circuit breaker on creates.
 type breaker struct {
 	failures  int // consecutive
@@ -98,6 +117,17 @@ func (c *Controller) Refill(ctx context.Context) error {
 	c.m.LastRefillAt = now
 	c.m.RefillPasses++
 	for _, t := range templates {
+		if !c.runtimeEnabled(t) {
+			// Applied while the server runs: the server would not have
+			// started with it. Say so once per version and leave its
+			// pool empty rather than fail a create every second.
+			if c.runtimeWarned[t.ID] != t.Version {
+				c.runtimeWarned[t.ID] = t.Version
+				c.log.Error("template names a runtime this server has not enabled; its pool is not filled and claims are refused",
+					"template", t.ID, "runtime", t.Runtime, "enabled", c.backend.Capabilities().RuntimeLabels)
+			}
+			continue
+		}
 		cs := counts[t.ID]
 		warm, total := cs[core.StateWarm], 0
 		for _, n := range cs {

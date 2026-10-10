@@ -97,6 +97,11 @@ type Config struct {
 	// ValidatePolicy rejects a network policy the egress proxy would not
 	// accept (egress.ValidatePolicy). Nil accepts everything the pool does.
 	ValidatePolicy func(core.NetworkPolicy) error
+	// RuntimeInfo describes the isolation tier a template's runtime name
+	// stands for on this server (runtime.Capabilities.Runtimes); ok is
+	// false for a runtime the server has not enabled. It feeds
+	// shared_kernel in GET /v1/templates. Nil leaves the field out.
+	RuntimeInfo func(name string) (info runtime.RuntimeInfo, ok bool)
 	// Ready is the readiness probe behind GET /readyz. Nil means ready.
 	Ready func(ctx context.Context) error
 	// ExtraMetrics is called at the end of GET /metrics to append

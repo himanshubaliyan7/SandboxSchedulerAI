@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/himanshubaliyan7/warmbox/internal/core"
 	"github.com/himanshubaliyan7/warmbox/internal/runtime"
@@ -24,8 +25,17 @@ type DestroyHostConfig struct {
 	// to run while a server holds its lock, and removes the per-sandbox
 	// directories in it. When empty, no directory is touched.
 	RunDir string
-	// PodmanSocket is the Libpod API socket; default as for serve.
+	// PodmanSocket is the Libpod API socket of an existing service; setting
+	// it selects external mode, as for serve.
 	PodmanSocket string
+	// PodmanMode is PodmanManaged or PodmanExternal; empty means managed
+	// unless PodmanSocket is set. In managed mode the server that owned
+	// the containers is gone and its service with it, so DestroyHost
+	// starts a throwaway service of its own: with the configuration that
+	// server left in RunDir when there is one (so that sandboxes of every
+	// runtime it had enabled can be removed), with a plain crun one
+	// otherwise.
+	PodmanMode string
 	// DatabaseURL, when set, also closes out the host's sandbox rows
 	// (reason host_drain), so that tenants' quota slots are freed and
 	// nothing is left for a later start to reconcile.
@@ -88,7 +98,20 @@ func DestroyHost(ctx context.Context, cfg DestroyHostConfig) (DestroyHostReport,
 		}
 	}
 
-	backend, err := podman.New(podman.Config{SocketPath: cfg.PodmanSocket})
+	mode, err := ResolvePodmanMode(cfg.PodmanMode, cfg.PodmanSocket)
+	if err != nil {
+		return rep, err
+	}
+	socket := cfg.PodmanSocket
+	if mode == PodmanManaged {
+		svc, cleanup, err := throwawayService(ctx, cfg.RunDir, log)
+		if err != nil {
+			return rep, err
+		}
+		defer cleanup()
+		socket = svc.SocketPath()
+	}
+	backend, err := podman.New(podman.Config{SocketPath: socket})
 	if err != nil {
 		return rep, err
 	}
@@ -132,15 +155,38 @@ func DestroyHost(ctx context.Context, cfg DestroyHostConfig) (DestroyHostReport,
 	if err != nil {
 		return rep, fmt.Errorf("list containers: %w", err)
 	}
+	// A few at a time: one removal takes about 100 ms, and a host that
+	// was run dense has more than a thousand.
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+		sem      = make(chan struct{}, 8)
+	)
 	for _, inst := range instances {
 		if inst.HostID != cfg.HostID {
 			continue
 		}
-		if err := backend.Destroy(ctx, inst.ID); err != nil {
-			return rep, fmt.Errorf("destroy container %s (sandbox %s): %w", inst.ID, inst.SandboxID, err)
-		}
-		rep.Containers++
-		log.Info("destroyed container", "instance", inst.ID, "sandbox", inst.SandboxID)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			err := backend.Destroy(ctx, inst.ID)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("destroy container %s (sandbox %s): %w", inst.ID, inst.SandboxID, err)
+				}
+				return
+			}
+			rep.Containers++
+			log.Info("destroyed container", "instance", inst.ID, "sandbox", inst.SandboxID)
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return rep, firstErr
 	}
 	if left, err := backend.List(ctx); err != nil {
 		return rep, fmt.Errorf("list containers: %w", err)
@@ -176,4 +222,41 @@ func DestroyHost(ctx context.Context, cfg DestroyHostConfig) (DestroyHostReport,
 		rep.Rows++
 	}
 	return rep, nil
+}
+
+// throwawayService starts a managed Podman service for a one-off task on
+// the sandboxes of a server that is not running, and returns it with a
+// function that stops it and removes its directory. The service's own
+// files live in a temporary directory; only the configuration is taken
+// from the old server's run dir, when it left one.
+func throwawayService(ctx context.Context, runDir string, log *slog.Logger) (*podman.Service, func(), error) {
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir, err := os.MkdirTemp(base, "sbx-adm-")
+	if err != nil {
+		return nil, nil, err
+	}
+	sc := podman.ServiceConfig{Dir: filepath.Join(dir, ManagedDir), SocketPath: filepath.Join(dir, ManagedSocket), Logger: log}
+	if conf := filepath.Join(runDir, ManagedDir, podman.ServiceConfFile); runDir != "" {
+		if _, err := os.Stat(conf); err == nil {
+			sc.ConfPath = conf
+		}
+	}
+	if sc.ConfPath == "" {
+		if sc.Runtimes, err = podman.PrepareRuntimes(dir, DefaultRuntimes(), nil, nil); err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, nil, err
+		}
+	}
+	svc, err := podman.StartService(ctx, sc)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, nil, err
+	}
+	return svc, func() {
+		_ = svc.Stop(context.WithoutCancel(ctx))
+		_ = os.RemoveAll(dir)
+	}, nil
 }

@@ -132,7 +132,7 @@ func TestPlannedSandboxes(t *testing.T) {
 		t.Errorf("planned=%d uncapped=%v, want 25 and [c d]", planned, uncapped)
 	}
 	// Smoke: the capacity check runs against this host without panicking.
-	checkCapacity(context.Background(), discardLogger(), "", []core.Template{{ID: "a", MaxTotal: 8}})
+	checkCapacity(context.Background(), discardLogger(), "", false, []core.Template{{ID: "a", MaxTotal: 8}})
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

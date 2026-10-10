@@ -299,6 +299,8 @@ works on that sandbox's data-plane routes.
 Running a server for real (host ids, shutdown policies, density limits, metrics,
 CORS) is covered in [`docs/operations.md`](docs/operations.md).
 
+Coming from another sandbox product? See the migration guides from [E2B](docs/migrating-from-e2b.md) and from [open-source Daytona](docs/migrating-from-daytona.md).
+
 ## Threat model
 
 Be clear about what the default tier is and is not.
