@@ -15,6 +15,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +56,7 @@ var _ Store = (*store.Store)(nil)
 type Pool interface {
 	Claim(ctx context.Context, tenantID, templateID string, opts pool.ClaimOptions) (core.Sandbox, error)
 	Release(ctx context.Context, sandboxID string, generation int64, reason core.TerminationReason) error
+	ReleaseAsync(ctx context.Context, sandboxID string, generation int64, reason core.TerminationReason) error
 	Touch(ctx context.Context, sandboxID string, generation int64) error
 	UpdateNetwork(ctx context.Context, sandboxID string, generation int64, policy core.NetworkPolicy) error
 	CheckInstance(ctx context.Context, sandboxID string, generation int64) (lost bool, err error)
@@ -99,7 +102,14 @@ type Config struct {
 	// ExtraMetrics is called at the end of GET /metrics to append
 	// metrics owned by other components, in Prometheus text format.
 	ExtraMetrics func(w io.Writer)
-	Logger       *slog.Logger
+	// MetricsToken, when not empty, is required as a bearer token
+	// ("Authorization: Bearer <token>") by GET /metrics, on the main
+	// handler and on MetricsHandler alike. Empty means no authentication.
+	MetricsToken string
+	// NoMetricsRoute leaves GET /metrics out of Handler; the caller then
+	// serves MetricsHandler on a listener of its own.
+	NoMetricsRoute bool
+	Logger         *slog.Logger
 
 	// MaxJSONBytes bounds JSON request bodies. Default 1 MiB.
 	MaxJSONBytes int64
@@ -255,7 +265,31 @@ func (s *Server) routes() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	s.mux.HandleFunc("GET /readyz", s.handleReady)
-	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	if !s.cfg.NoMetricsRoute {
+		s.mux.HandleFunc("GET /metrics", s.serveMetrics)
+	}
+}
+
+// MetricsHandler serves the Prometheus metrics at GET /metrics and
+// nothing else, for a listener separate from the API's. It applies the
+// same MetricsToken check as the route on the main handler.
+func (s *Server) MetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", s.serveMetrics)
+	return mux
+}
+
+// serveMetrics is handleMetrics behind the optional bearer token.
+func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	if want := s.cfg.MetricsToken; want != "" {
+		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+			writeError(w, requestID(r), errf(http.StatusUnauthorized, CodeUnauthorized, "a metrics bearer token is required"))
+			return
+		}
+	}
+	s.handleMetrics(w, r)
 }
 
 type ctxKey int

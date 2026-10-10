@@ -35,6 +35,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -477,6 +479,7 @@ func TestEndToEnd(t *testing.T) {
 	})
 
 	t.Run("MemoryBombIsContainedAndReported", func(t *testing.T) {
+		watchOOMFile(t) // conmon leaves an empty "oom" file behind; see the helper
 		victim := acme.create(map[string]any{"template_id": "py"})
 		start := time.Now()
 		events := acme.stream(victim, map[string]any{"cmd": "python3", "args": []string{"-c",
@@ -766,9 +769,9 @@ except Exception as e:
 			}
 		}
 		start := time.Now()
-		acme.must(204, "DELETE", "/v1/sandboxes/"+victim.ID, nil, "")
-		t.Logf("MEASURED delete (SIGKILL, remove, detach egress, remove run dir): %s", time.Since(start).Round(time.Millisecond))
-		// Delete is synchronous: nothing is left by the time it returns.
+		acme.must(204, "DELETE", "/v1/sandboxes/"+victim.ID+"?wait=true", nil, "")
+		t.Logf("MEASURED delete ?wait=true (SIGKILL, remove, detach egress, remove run dir): %s", time.Since(start).Round(time.Millisecond))
+		// With wait=true nothing is left by the time it returns.
 		if out := run(t, "podman", "ps", "-a", "--format", "{{.Names}}"); strings.Contains(out, victim.ID) {
 			t.Errorf("podman ps -a still shows %s:\n%s", victim.ID, out)
 		}
@@ -778,6 +781,107 @@ except Exception as e:
 		if got := acme.get(victim.ID); got.State != "destroyed" || got.Reason != "released" {
 			t.Errorf("after delete: %+v", got)
 		}
+	})
+
+	t.Run("DeleteAnswersOnceFenced", func(t *testing.T) {
+		// The default delete does not wait for the container to go: it
+		// answers when the sandbox is fenced and finishes in the background.
+		var answered, gone []time.Duration
+		for i := 0; i < 5; i++ {
+			waitFor(t, "a warm py sandbox", 60*time.Second, func() bool { return acme.warm("py") >= 1 })
+			victim := acme.create(map[string]any{"template_id": "py", "network": map[string]any{"mode": "allowlist"}})
+			acme.must(201, "POST", "/v1/sandboxes/"+victim.ID+"/commands", map[string]any{"cmd": "sleep", "args": []string{"600"}}, victim.AccessToken)
+			start := time.Now()
+			acme.must(204, "DELETE", "/v1/sandboxes/"+victim.ID, nil, "")
+			answered = append(answered, time.Since(start))
+			// Fenced at once: not running any more, token dead, egress socket gone.
+			if got := acme.get(victim.ID); (got.State != "recycling" && got.State != "destroyed") || got.Reason != "released" {
+				t.Errorf("right after DELETE: %+v", got)
+			}
+			if r := acme.do("POST", "/v1/sandboxes/"+victim.ID+"/commands?wait=true", shell("echo still-here"), victim.AccessToken); r.Status != 409 || r.apiError().Code != "sandbox_not_running" {
+				t.Errorf("command after DELETE: %d %s", r.Status, r.Body)
+			}
+			if _, err := os.Stat(filepath.Join(e.runDir, victim.ID, "egress.sock")); !os.IsNotExist(err) {
+				t.Errorf("egress socket right after DELETE: %v", err)
+			}
+			// ...and destroyed shortly after, container and run dir included.
+			acme.waitState(victim.ID, "destroyed", 20*time.Second)
+			gone = append(gone, time.Since(start))
+			if have := e.containers(t); have[victim.ID] != "" {
+				t.Errorf("container of %s is %q after the sandbox was reported destroyed", victim.ID, have[victim.ID])
+			}
+			if _, err := os.Stat(filepath.Join(e.runDir, victim.ID)); !os.IsNotExist(err) {
+				t.Errorf("run dir after the background teardown: %v", err)
+			}
+		}
+		rnd := func(d time.Duration) time.Duration { return d.Round(100 * time.Microsecond) }
+		t.Logf("MEASURED delete, default (answer once fenced), n=%d: answered p50=%s max=%s; reported destroyed (50 ms polling) p50=%s max=%s",
+			len(answered), rnd(percentile(answered, 0.5)), rnd(percentile(answered, 1)), rnd(percentile(gone, 0.5)), rnd(percentile(gone, 1)))
+		if r := acme.do("DELETE", "/v1/sandboxes/"+sb.ID+"?wait=sometimes", nil, ""); r.Status != 400 {
+			t.Errorf("DELETE ?wait=sometimes: %d %s", r.Status, r.Body)
+		}
+	})
+
+	t.Run("PythonBytecodeCacheOnReadOnlyRoot", func(t *testing.T) {
+		// The default environment sends Python's bytecode to /tmp/pycache,
+		// so only the first interpreter in a sandbox compiles the standard
+		// library. A caller's env still wins: PYTHONPYCACHEPREFIX="" turns
+		// it off, which is also the "before" measurement.
+		const mods = "json,re,ssl,sqlite3,asyncio,http.client,decimal,datetime,subprocess,argparse,logging,unittest," +
+			"email.parser,xml.etree.ElementTree,csv,hashlib,urllib.request,zipfile,tempfile,pathlib," +
+			"multiprocessing,ctypes,uuid,random,statistics,gzip,shutil,socket,threading,dataclasses"
+		script := "import sys, time; t = time.perf_counter(); import " + mods + "; print(round((time.perf_counter() - t) * 1000, 1), sys.pycache_prefix)"
+		measure := func(s sandbox, env map[string]string, n int) (ms []float64, prefix string) {
+			for i := 0; i < n; i++ {
+				body := map[string]any{"cmd": "python3", "args": []string{"-c", script}}
+				if env != nil {
+					body["env"] = env
+				}
+				res := acme.exec(s, body)
+				f := strings.Fields(string(res.Stdout))
+				if res.Exit.ExitCode != 0 || len(f) != 2 {
+					t.Fatalf("import probe: %+v stdout=%q stderr=%q", res.Exit, res.Stdout, res.Stderr)
+				}
+				v, err := strconv.ParseFloat(f[0], 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ms, prefix = append(ms, v), f[1]
+			}
+			return ms, prefix
+		}
+		median := func(v []float64) float64 {
+			s := append([]float64(nil), v...)
+			sort.Float64s(s)
+			return s[len(s)/2]
+		}
+		py := acme.create(map[string]any{"template_id": "py"})
+		if res := acme.exec(py, shell(`echo "$HOME|$TMPDIR|$PYTHONPYCACHEPREFIX"`)); string(res.Stdout) != "/workspace|/tmp|/tmp/pycache\n" {
+			t.Errorf("default environment: %q", res.Stdout)
+		}
+		without, prefix := measure(py, map[string]string{"PYTHONPYCACHEPREFIX": ""}, 5)
+		if prefix != "None" {
+			t.Errorf("per-command env PYTHONPYCACHEPREFIX=\"\" did not override the default: sys.pycache_prefix=%s", prefix)
+		}
+		first, prefix := measure(py, nil, 1)
+		if prefix != "/tmp/pycache" {
+			t.Errorf("sys.pycache_prefix = %s, want /tmp/pycache", prefix)
+		}
+		with, _ := measure(py, nil, 5)
+		t.Logf("MEASURED 30 stdlib imports in a py sandbox (1 CPU, read-only root), ms: without the bytecode cache %v (median %.1f); "+
+			"with PYTHONPYCACHEPREFIX=/tmp/pycache first process %v, later processes %v (median %.1f)",
+			without, median(without), first, with, median(with))
+		if median(with) > median(without)/2 {
+			t.Errorf("cached imports %.1f ms against %.1f ms uncached: expected at least 2x", median(with), median(without))
+		}
+		acme.must(204, "DELETE", "/v1/sandboxes/"+py.ID, nil, "")
+
+		// A session env set at create wins over the default as well.
+		off := acme.create(map[string]any{"template_id": "py", "env": map[string]string{"PYTHONPYCACHEPREFIX": "/workspace/.pyc", "HOME": "/tmp"}})
+		if res := acme.exec(off, shell(`echo "$HOME|$PYTHONPYCACHEPREFIX"`)); string(res.Stdout) != "/tmp|/workspace/.pyc\n" {
+			t.Errorf("create-time env did not override the defaults: %q", res.Stdout)
+		}
+		acme.must(204, "DELETE", "/v1/sandboxes/"+off.ID, nil, "")
 	})
 
 	t.Run("IdleTimeout", func(t *testing.T) {
@@ -916,6 +1020,10 @@ except Exception as e:
 		acme.must(201, "POST", "/v1/sandboxes/"+sb.ID+"/commands", map[string]any{"cmd": "sleep", "args": []string{"600"}}, sb.AccessToken)
 		other := acme.create(map[string]any{"template_id": "py", "network": map[string]any{"mode": "allowlist"}})
 		waitFor(t, "the py pool to refill", 60*time.Second, func() bool { return acme.warm("py") == 3 })
+		// Deletes are asynchronous: let the teardowns of the previous
+		// subtests finish, so that what is on the host is exactly the 7
+		// warm sandboxes and the two sessions.
+		waitFor(t, "earlier teardowns to finish", 60*time.Second, func() bool { return len(e.runDirs(t)) == 9 && len(e.containers(t)) == 9 })
 		before := e.containers(t)
 		dirsBefore := e.runDirs(t)
 		warmBefore := map[string]bool{}
@@ -948,9 +1056,24 @@ except Exception as e:
 		run(t, "podman", "rm", "-f", "-t", "0", "sbx-"+lost)
 		orphan := "sb-" + randHex(8)
 		run(t, "podman", "run", "-d", "--name", "sbx-"+orphan, "--network", "none", "--label", "sbx.managed=true",
+			"--label", "sbx.host_id="+e.hostID,
 			"--label", "sbx.sandbox_id="+orphan, "--label", "sbx.generation=0", imgAlpine, "sleep", "600")
 		if err := os.Mkdir(filepath.Join(e.runDir, orphan), 0o700); err != nil {
 			t.Fatal(err)
+		}
+		// Two managed containers that are NOT this server's: one of another
+		// host id (another scheduler of the same Podman user) and one from
+		// before the host label existed. No row accounts for either, and
+		// the server must leave both strictly alone.
+		foreign, legacy := "sb-"+randHex(8), "sb-"+randHex(8)
+		run(t, "podman", "run", "-d", "--name", "sbx-"+foreign, "--network", "none", "--label", "sbx.managed=true",
+			"--label", "sbx.host_id=someone-else-"+run1,
+			"--label", "sbx.sandbox_id="+foreign, "--label", "sbx.generation=0", imgAlpine, "sleep", "600")
+		run(t, "podman", "run", "-d", "--name", "sbx-"+legacy, "--network", "none", "--label", "sbx.managed=true",
+			"--label", "sbx.sandbox_id="+legacy, "--label", "sbx.generation=0", imgAlpine, "sleep", "600")
+		t.Cleanup(func() { _ = exec.Command("podman", "rm", "-f", "-t", "0", "sbx-"+foreign, "sbx-"+legacy).Run() })
+		notOurs := func() string {
+			return run(t, "podman", "ps", "--filter", "name=^sbx-("+foreign+"|"+legacy+")$", "--filter", "status=running", "--format", "{{.Names}}")
 		}
 
 		restart := time.Now()
@@ -989,6 +1112,34 @@ except Exception as e:
 			}
 			return true
 		})
+		// The reconciler has run at start-up and several times since (every
+		// 2 s); the two containers that are not this server's are untouched.
+		time.Sleep(5 * time.Second)
+		if out := notOurs(); !strings.Contains(out, "sbx-"+foreign) || !strings.Contains(out, "sbx-"+legacy) {
+			t.Errorf("containers of another host id / without a host id were touched; still running: %q", out)
+		}
+		if got := acme.metric("sbx_pool_orphans_destroyed_total"); got != 1 {
+			t.Errorf("%v orphans destroyed, want exactly the 1 that carried this host id", got)
+		}
+		// Each was reported once, not once per reconcile pass: at debug
+		// level for another host id, as a warning for a missing one.
+		reported := func(sandboxID, level string) (n int) {
+			for _, line := range strings.Split(e.logTail(1<<30), "\n") {
+				if strings.Contains(line, "leaving it alone") && strings.Contains(line, "sandbox="+sandboxID+" ") {
+					n++
+					if !strings.Contains(line, "level="+level) {
+						t.Errorf("log line for %s is not at level %s: %s", sandboxID, level, line)
+					}
+				}
+			}
+			return n
+		}
+		if n := reported(foreign, "DEBUG"); n != 1 {
+			t.Errorf("the container of another host id was reported %d times, want once", n)
+		}
+		if n := reported(legacy, "WARN"); n != 1 {
+			t.Errorf("the container without a host label was reported %d times, want once", n)
+		}
 		kept := 0
 		for _, id := range dirs {
 			if warmBefore[id] {
@@ -1075,8 +1226,8 @@ except Exception as e:
 		if err := e.stop(syscall.SIGTERM); err != nil {
 			t.Fatalf("final stop: %v", err)
 		}
-		if out := run(t, "podman", "ps", "-a", "--filter", "label=sbx.managed=true", "--format", "{{.Names}}"); strings.TrimSpace(out) != "" {
-			t.Logf("managed containers still on the host (not from this run unless listed above): %s", strings.TrimSpace(out))
+		if out := run(t, "podman", "ps", "-a", "--filter", "label=sbx.host_id="+e.hostID, "--format", "{{.Names}}"); strings.TrimSpace(out) != "" {
+			t.Errorf("containers of this run are still on the host: %s", strings.TrimSpace(out))
 		}
 	})
 }

@@ -26,11 +26,14 @@ func createGeneration(sb core.Sandbox) int64 {
 
 // Reconcile runs one level-triggered pass that converges what the runtime
 // has with what the store says this host should have. Desired is the
-// host's non-terminal rows; actual is Backend.List.
+// host's non-terminal rows; actual is the part of Backend.List that
+// carries this controller's host id (see ownInstances). Instances of
+// another host id, and instances with no host id at all, are never
+// inspected, adopted or destroyed here.
 //
 // Instances:
 //   - no row, or the row is terminal or belongs to another host: destroyed
-//     as an orphan;
+//     as an orphan (it carries this host id, so it is this host's to reap);
 //   - generation label or instance id disagrees with the row: destroyed as
 //     an orphan (the row is then handled as having no instance);
 //   - not running while its row is WARM, ASSIGNED or RUNNING: the row is
@@ -87,7 +90,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list rows: %w", err)
 	}
-	instances, err := c.backend.List(ctx)
+	instances, err := c.ownInstances(ctx)
 	if err != nil {
 		return fmt.Errorf("list instances: %w", err)
 	}
@@ -226,8 +229,66 @@ func (c *Controller) CheckInstance(ctx context.Context, sandboxID string, genera
 	return true, nil
 }
 
-// destroyOrphan destroys an instance that no live row accounts for.
+// ownInstances lists the backend's instances and returns those labelled
+// with this controller's host id. It is the only way this package reads
+// Backend.List: several schedulers may share one backend (two servers of
+// the same Podman user, or a server and a test run), each with its own
+// store, and an instance of another scheduler has no row here, so without
+// this filter it would look exactly like an orphan.
+//
+// Everything else is left strictly alone and reported once per instance:
+// at debug level when it names another host id, and as a warning when it
+// has no host id at all. The latter is a container made by a version that
+// did not label ownership (or by hand); nobody can tell whose it is, so it
+// is not destroyed, and the operator is told how to remove it.
+func (c *Controller) ownInstances(ctx context.Context) ([]runtime.Instance, error) {
+	all, err := c.backend.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	own := make([]runtime.Instance, 0, len(all))
+	var foreign []runtime.Instance
+	for _, inst := range all {
+		if inst.HostID == c.cfg.HostID {
+			own = append(own, inst)
+		} else {
+			foreign = append(foreign, inst)
+		}
+	}
+	// Remember what was reported, and forget instances that are gone so
+	// the set stays as small as the backend's list.
+	c.mu.Lock()
+	seen := make(map[string]struct{}, len(foreign))
+	var fresh []runtime.Instance
+	for _, inst := range foreign {
+		if _, ok := c.foreign[inst.ID]; !ok {
+			fresh = append(fresh, inst)
+		}
+		seen[inst.ID] = struct{}{}
+	}
+	c.foreign = seen
+	c.mu.Unlock()
+	for _, inst := range fresh {
+		if inst.HostID == "" {
+			c.log.Warn("instance has no "+runtime.LabelHostID+" label; leaving it alone (if it is a leftover of an older version, remove it by hand)",
+				"instance", inst.ID, "sandbox", inst.SandboxID, "running", inst.Running)
+		} else {
+			c.log.Debug("instance belongs to another host id; leaving it alone",
+				"instance", inst.ID, "sandbox", inst.SandboxID, "instance_host", inst.HostID)
+		}
+	}
+	return own, nil
+}
+
+// destroyOrphan destroys an instance of this host id that no live row
+// accounts for.
 func (c *Controller) destroyOrphan(ctx context.Context, inst runtime.Instance, why string) {
+	if inst.HostID != c.cfg.HostID {
+		// Not reachable through ownInstances; kept so that no future
+		// caller can destroy somebody else's instance by mistake.
+		c.log.Error("reconcile: refusing to destroy an instance of another host id", "instance", inst.ID, "instance_host", inst.HostID)
+		return
+	}
 	if err := c.backend.Destroy(ctx, inst.ID); err != nil {
 		c.log.Warn("reconcile: destroy orphan", "instance", inst.ID, "sandbox", inst.SandboxID, "err", err)
 		return

@@ -1,5 +1,7 @@
 # Phase-0 benchmark results
 
+> The published run predates later changes to the product spec (`memory.high` is no longer set, `PYTHONPYCACHEPREFIX=/tmp/pycache` is set by default, creates are retried); `bench/sbxbench.py` now matches the spec, the numbers below were not re-measured.
+
 Measured on one machine with `bench/sbxbench.py`. Every number below is copied from the
 result files named in "Runs"; nothing is estimated unless the sentence says so. All
 latencies are wall-clock milliseconds.

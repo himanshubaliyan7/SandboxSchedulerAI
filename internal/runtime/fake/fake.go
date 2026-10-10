@@ -47,6 +47,7 @@ type Backend struct {
 	createHang    bool // Create blocks until its context is done
 	hangNext      int  // hang only the next N creates
 	destroyErr    error
+	destroyGate   chan struct{} // while non-nil, Destroy blocks until it is closed
 	listErr       error
 	caps          runtime.Capabilities
 	now           func() time.Time
@@ -123,6 +124,27 @@ func (b *Backend) SetDestroyError(err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.destroyErr = err
+}
+
+// HoldDestroys makes every Destroy block until the returned function is
+// called (or the Destroy's context is done). It stands in for a slow
+// container removal.
+func (b *Backend) HoldDestroys() (release func()) {
+	gate := make(chan struct{})
+	b.mu.Lock()
+	b.destroyGate = gate
+	b.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.mu.Lock()
+			if b.destroyGate == gate {
+				b.destroyGate = nil
+			}
+			b.mu.Unlock()
+			close(gate)
+		})
+	}
 }
 
 // SetListError makes every List fail with err until cleared with nil.
@@ -326,6 +348,7 @@ func (b *Backend) Create(ctx context.Context, spec runtime.Spec) (runtime.Instan
 	inst := runtime.Instance{
 		ID:         fmt.Sprintf("fake-%06d", b.seq),
 		SandboxID:  spec.SandboxID,
+		HostID:     spec.HostID,
 		Generation: spec.Generation,
 		AgentEpoch: spec.AgentEpoch,
 		TemplateID: spec.Template.ID,
@@ -337,6 +360,15 @@ func (b *Backend) Create(ctx context.Context, spec runtime.Spec) (runtime.Instan
 }
 
 func (b *Backend) Destroy(ctx context.Context, instanceID string) error {
+	b.mu.Lock()
+	gate := b.destroyGate
+	b.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+		}
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.counters.Destroys++

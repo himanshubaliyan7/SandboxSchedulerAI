@@ -5,7 +5,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"debug/elf"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/agentclient"
@@ -23,6 +26,7 @@ import (
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/egress"
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/pool"
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/preflight"
+	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime"
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/runtime/podman"
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/store"
 )
@@ -52,6 +56,18 @@ type Config struct {
 	DatabaseURL string
 	// Listen is the API listen address. Default 127.0.0.1:8080.
 	Listen string
+	// MetricsListen, when set, serves GET /metrics on a listener of its
+	// own and removes the route from Listen. MetricsToken, when set, is
+	// the bearer token GET /metrics requires, wherever it is served.
+	//
+	// The metrics are operational data about every tenant (template ids,
+	// pool sizes, request and failure counts). With neither option set
+	// they are served unauthenticated on Listen, which is fine for the
+	// loopback default. Run refuses to start when that would expose them:
+	// Listen is not a loopback address, /metrics is on it and there is no
+	// token. Set MetricsToken, or move the metrics to MetricsListen.
+	MetricsListen string
+	MetricsToken  string
 	// AgentBinary is the host path of the static sbx-agent binary that is
 	// bind-mounted into every sandbox.
 	AgentBinary string
@@ -62,7 +78,11 @@ type Config struct {
 	// PodmanSocket is the Libpod API socket. Default
 	// $XDG_RUNTIME_DIR/podman/podman.sock.
 	PodmanSocket string
-	// HostID names this host in the store. Default: the hostname.
+	// HostID is this scheduler's identity: the host_id of its rows in the
+	// store and the sbx.host_id label of its containers. The pool
+	// controller only ever touches rows and containers that carry it, so
+	// it must be stable across restarts and different for every scheduler
+	// that shares a Podman user or a database. Default: DefaultHostID.
 	HostID string
 
 	SkipPreflight bool
@@ -103,6 +123,8 @@ type Config struct {
 	// OnListen, if set, is called with the bound address once the API is
 	// accepting connections.
 	OnListen func(net.Addr)
+	// OnMetricsListen is the same for the metrics listener.
+	OnMetricsListen func(net.Addr)
 }
 
 // DefaultRunDir is $XDG_RUNTIME_DIR/sbx, or "" when XDG_RUNTIME_DIR is unset.
@@ -111,6 +133,82 @@ func DefaultRunDir() string {
 		return filepath.Join(dir, "sbx")
 	}
 	return ""
+}
+
+// DefaultHostID is the host id used when none is configured:
+//
+//	<hostname>-u<uid>-<first 8 hex digits of SHA-256(absolute run dir)>
+//
+// It is derived, never random, so a restart finds its own sandboxes
+// again. Machine and user are in it because one database may serve
+// several hosts and several users of one host. The run dir is in it
+// because that is what tells two schedulers of the same user apart: they
+// cannot share a run dir (it holds the per-sandbox sockets, and each
+// would delete the other's), and a warm sandbox is bound to the run dir
+// it was created under (its sockets are bind-mounted from there), so a
+// scheduler started on another run dir could not adopt the old one's
+// sandboxes anyway. Consequently, moving the run dir without passing
+// --host-id abandons the sandboxes of the old one.
+func DefaultHostID(runDir string) (string, error) {
+	abs, err := filepath.Abs(runDir)
+	if err != nil {
+		return "", fmt.Errorf("run dir: %w", err)
+	}
+	name, err := os.Hostname()
+	if err != nil || name == "" {
+		return "", errors.New("could not determine the hostname; set --host-id")
+	}
+	// Keep the hostname within the host id alphabet and leave room for
+	// the two suffixes (63 bytes in all).
+	b := []byte(name)
+	for i, ch := range b {
+		ok := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '.' || ch == '_' || ch == '-'
+		if !ok || (i == 0 && (ch == '.' || ch == '_' || ch == '-')) {
+			b[i] = 'x'
+		}
+	}
+	if len(b) > 32 {
+		b = b[:32]
+	}
+	sum := sha256.Sum256([]byte(abs))
+	return fmt.Sprintf("%s-u%d-%s", b, os.Getuid(), hex.EncodeToString(sum[:4])), nil
+}
+
+// lockRunDir takes an exclusive advisory lock on RunDir/sbxd.lock for the
+// life of the process. Two schedulers on one run dir would have the same
+// default host id and would remove each other's sockets and containers;
+// this turns that mistake into a start-up error. The kernel drops the
+// lock when the process dies, however it dies.
+func lockRunDir(dir string) (release func(), err error) {
+	path := filepath.Join(dir, "sbxd.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("run dir %s is in use by another sbxd (lock %s is held); give each server its own --run-dir", dir, path)
+		}
+		return nil, fmt.Errorf("lock %s: %w", path, err)
+	}
+	return func() { f.Close() }, nil
+}
+
+// isLoopbackAddr reports whether a listen address can only be reached
+// from this machine. A host name other than "localhost" is not resolved:
+// it counts as reachable from elsewhere, as does an empty host (all
+// interfaces).
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // maxRunDirLen keeps RunDir + "/sb-<16 hex>/egress.sock" within the 107
@@ -142,9 +240,12 @@ func (c *Config) defaults() error {
 			c.RunDir, maxRunDirLen)
 	}
 	if c.HostID == "" {
-		if c.HostID, err = os.Hostname(); err != nil || c.HostID == "" {
-			return errors.New("could not determine the hostname; set --host-id")
+		if c.HostID, err = DefaultHostID(c.RunDir); err != nil {
+			return err
 		}
+	}
+	if err := runtime.ValidHostID(c.HostID); err != nil {
+		return fmt.Errorf("--host-id: %w", err)
 	}
 	switch c.ShutdownPolicy {
 	case "":
@@ -152,6 +253,10 @@ func (c *Config) defaults() error {
 	case ShutdownDrain, ShutdownLeave:
 	default:
 		return fmt.Errorf("unknown shutdown policy %q (want %s or %s)", c.ShutdownPolicy, ShutdownDrain, ShutdownLeave)
+	}
+	if c.MetricsListen == "" && c.MetricsToken == "" && !isLoopbackAddr(c.Listen) {
+		return fmt.Errorf("refusing to serve unauthenticated /metrics on the non-loopback address %s: "+
+			"set --metrics-token, or move the metrics to their own listener with --metrics-listen (for example 127.0.0.1:9090)", c.Listen)
 	}
 	if c.ShutdownTimeout <= 0 {
 		c.ShutdownTimeout = 30 * time.Second
@@ -196,6 +301,43 @@ func Preflight(ctx context.Context, podmanSocket string, requireLinger bool) pre
 	return preflight.Run(ctx, preflight.Options{PodmanSocket: podmanSocket, RequireLinger: requireLinger})
 }
 
+// plannedSandboxes is how many sandboxes the templates allow to exist at
+// once (the sum of max_total), and which templates set no cap at all.
+func plannedSandboxes(templates []core.Template) (planned int64, uncapped []string) {
+	for _, t := range templates {
+		if t.MaxTotal > 0 {
+			planned += int64(t.MaxTotal)
+		} else {
+			uncapped = append(uncapped, t.ID)
+			planned += int64(t.WarmTarget) // the least such a pool holds
+		}
+	}
+	return planned, uncapped
+}
+
+// checkCapacity warns when the configured pools can outgrow a per-user
+// kernel quota (kernel keys, inotify instances). It never fails the
+// start: the pool works up to the ceiling, and creates beyond it fail,
+// are retried and trip the circuit breaker like any other create error.
+func checkCapacity(ctx context.Context, log *slog.Logger, podmanSocket string, templates []core.Template) {
+	planned, uncapped := plannedSandboxes(templates)
+	if len(uncapped) > 0 {
+		log.Warn("templates without max_total: their pools are bounded only by tenant quotas, so the host's per-user limits "+
+			"(kernel keys, inotify instances) cannot be checked against them; set max_total", "templates", uncapped)
+	}
+	if planned == 0 {
+		return
+	}
+	report := preflight.Capacity(ctx, preflight.Options{PodmanSocket: podmanSocket, PlannedSandboxes: planned})
+	for _, c := range report.Checks {
+		if c.Status == preflight.StatusWarn {
+			log.Warn("capacity warning", "check", c.Name, "detail", c.Detail, "remediation", c.Remediation)
+		} else {
+			log.Debug("capacity check", "check", c.Name, "detail", c.Detail)
+		}
+	}
+}
+
 // Run starts the server and blocks until ctx is cancelled, then stops
 // gracefully according to cfg.ShutdownPolicy. It returns an error if the
 // server could not start or stopped for another reason than ctx.
@@ -234,6 +376,16 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer st.Close()
 
+	// The per-user kernel quotas that each running sandbox draws on can
+	// only be judged against the size of the pools, which is known now.
+	if !cfg.SkipPreflight {
+		if templates, err := st.ListTemplates(ctx); err != nil {
+			log.Warn("could not read the templates for the capacity check", "err", err)
+		} else {
+			checkCapacity(ctx, log, cfg.PodmanSocket, templates)
+		}
+	}
+
 	// 3. Run dir and seccomp profile.
 	if err := os.MkdirAll(cfg.RunDir, 0o700); err != nil {
 		return fmt.Errorf("create run dir: %w", err)
@@ -241,6 +393,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := os.Chmod(cfg.RunDir, 0o700); err != nil {
 		return fmt.Errorf("chmod run dir: %w", err)
 	}
+	unlock, err := lockRunDir(cfg.RunDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	seccomp := cfg.SeccompProfile
 	switch seccomp {
 	case "":
@@ -293,7 +450,7 @@ func Run(ctx context.Context, cfg Config) error {
 	// 7. API.
 	apiSrv, err := api.New(api.Config{
 		Store: st, Pool: ctrl, Stats: backend, ValidatePolicy: egress.ValidatePolicy, Logger: log,
-		ExtraMetrics: em.write,
+		ExtraMetrics: em.write, MetricsToken: cfg.MetricsToken, NoMetricsRoute: cfg.MetricsListen != "",
 		Ready: func(ctx context.Context) error {
 			if err := st.Ping(ctx); err != nil {
 				return fmt.Errorf("store: %w", err)
@@ -325,8 +482,36 @@ func Run(ctx context.Context, cfg Config) error {
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
-	serveErr := make(chan error, 1)
+	serveErr := make(chan error, 2)
 	go func() { serveErr <- httpSrv.Serve(ln) }()
+	var metricsSrv *http.Server
+	if cfg.MetricsListen != "" {
+		mln, err := net.Listen("tcp", cfg.MetricsListen)
+		if err != nil {
+			_ = httpSrv.Close()
+			return fmt.Errorf("listen on %s (metrics): %w", cfg.MetricsListen, err)
+		}
+		metricsSrv = &http.Server{
+			Handler:           apiSrv.MetricsHandler(),
+			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second,
+			IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10,
+			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		}
+		defer metricsSrv.Close()
+		go func() {
+			if err := metricsSrv.Serve(mln); !errors.Is(err, http.ErrServerClosed) {
+				serveErr <- fmt.Errorf("metrics listener: %w", err)
+			}
+		}()
+		log.Info("metrics listening", "addr", mln.Addr().String(), "token_required", cfg.MetricsToken != "")
+		if cfg.MetricsToken == "" && !isLoopbackAddr(cfg.MetricsListen) {
+			log.Warn("/metrics is served without authentication on a non-loopback address; set --metrics-token unless the network already restricts who can reach it",
+				"addr", mln.Addr().String())
+		}
+		if cfg.OnMetricsListen != nil {
+			cfg.OnMetricsListen(mln.Addr())
+		}
+	}
 	log.Info("sbxd listening", "addr", ln.Addr().String(), "host", cfg.HostID, "run_dir", cfg.RunDir,
 		"podman_api", apiVersion, "seccomp", orDefault(seccomp, SeccompDefault), "agent_binary", agentBinary,
 		"shutdown_policy", cfg.ShutdownPolicy)
@@ -353,6 +538,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := <-shutdownDone; err != nil {
 		log.Warn("http shutdown did not finish cleanly", "err", err)
 		_ = httpSrv.Close()
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Close()
 	}
 	if cfg.ShutdownPolicy == ShutdownDrain {
 		drain(sctx, log, st, ctrl, cfg.HostID)

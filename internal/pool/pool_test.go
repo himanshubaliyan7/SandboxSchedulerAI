@@ -33,6 +33,10 @@ type harness struct {
 	egress *pooltest.FakeEgress
 	dir    string
 	c      *pool.Controller
+	// attempts is pool.Config.CreateAttempts. The harness default is 1 so
+	// that every failed backend create is one failed row, which is what
+	// the breaker and cleanup tests count; the retry tests raise it.
+	attempts int
 }
 
 func baseTemplate() core.Template {
@@ -51,7 +55,7 @@ func newHarness(t *testing.T, edit func(*core.Template)) *harness {
 	t.Helper()
 	clock := pooltest.NewFakeClock()
 	h := &harness{t: t, clock: clock, st: pooltest.NewMemStore(clock.Now), be: fake.New(),
-		agent: &pooltest.FakeAgent{}, egress: &pooltest.FakeEgress{}, dir: t.TempDir()}
+		agent: &pooltest.FakeAgent{}, egress: &pooltest.FakeEgress{}, dir: t.TempDir(), attempts: 1}
 	tmpl := baseTemplate()
 	if edit != nil {
 		edit(&tmpl)
@@ -68,6 +72,7 @@ func (h *harness) controller(epoch string) *pool.Controller {
 		Store: h.st, Backend: h.be, Agent: h.agent, Egress: h.egress, Clock: h.clock,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		HostID: host, AgentEpoch: epoch, RunDirBase: h.dir, AgentBinaryPath: "/opt/sbx-agent",
+		CreateAttempts: h.attempts, CreateRetryBackoff: time.Millisecond,
 	})
 	if err != nil {
 		h.t.Fatalf("pool.New: %v", err)
@@ -611,7 +616,7 @@ func TestSweeperFailsOrphanedCreatingRow(t *testing.T) {
 	deadline := now.Add(core.CreatingDeadline)
 	h.st.InsertRaw(core.Sandbox{ID: "sb-stuck", TemplateID: tmplID, TemplateVersion: 1, HostID: host,
 		State: core.StateCreating, CreatedAt: now, DeadlineAt: &deadline})
-	half := h.be.AddInstance(runtime.Instance{SandboxID: "sb-stuck", AgentEpoch: "epoch-1", Running: true})
+	half := h.be.AddInstance(runtime.Instance{HostID: host, SandboxID: "sb-stuck", AgentEpoch: "epoch-1", Running: true})
 
 	if err := h.c.Sweep(ctxBg()); err != nil {
 		t.Fatal(err)
@@ -842,10 +847,10 @@ func TestReconcilerDestroysOrphansAndFailsLostRows(t *testing.T) {
 
 	// Orphans: no row at all; a row that is already DESTROYED; a second
 	// instance claiming a live sandbox id with the wrong generation.
-	ghost := h.be.AddInstance(runtime.Instance{SandboxID: "sb-ghost", AgentEpoch: "epoch-0", Running: true})
+	ghost := h.be.AddInstance(runtime.Instance{HostID: host, SandboxID: "sb-ghost", AgentEpoch: "epoch-0", Running: true})
 	h.st.InsertRaw(core.Sandbox{ID: "sb-gone", TemplateID: tmplID, TemplateVersion: 1, HostID: host, State: core.StateDestroyed})
-	zombie := h.be.AddInstance(runtime.Instance{SandboxID: "sb-gone", AgentEpoch: "epoch-1", Running: true})
-	imposter := h.be.AddInstance(runtime.Instance{SandboxID: keep.ID, Generation: 5, AgentEpoch: "epoch-1", Running: true})
+	zombie := h.be.AddInstance(runtime.Instance{HostID: host, SandboxID: "sb-gone", AgentEpoch: "epoch-1", Running: true})
+	imposter := h.be.AddInstance(runtime.Instance{HostID: host, SandboxID: keep.ID, Generation: 5, AgentEpoch: "epoch-1", Running: true})
 	// Lost rows: instance removed out of band (one WARM, one RUNNING); one exited after an OOM kill.
 	h.be.Vanish(lost.InstanceID)
 	h.be.Vanish(running.InstanceID)
@@ -1061,7 +1066,7 @@ func TestRestartDoesNotAdoptUnreadyOrMismatchedWarm(t *testing.T) {
 		return nil
 	})
 	h.be.Vanish(warm[1].InstanceID)
-	fakeInst := h.be.AddInstance(runtime.Instance{SandboxID: warm[1].ID, Generation: 0, AgentEpoch: "epoch-1", Running: true})
+	fakeInst := h.be.AddInstance(runtime.Instance{HostID: host, SandboxID: warm[1].ID, Generation: 0, AgentEpoch: "epoch-1", Running: true})
 
 	h.c = h.controller("epoch-2")
 	h.start()

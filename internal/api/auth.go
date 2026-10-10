@@ -349,6 +349,10 @@ func (s *Server) ownedSandbox(ctx context.Context, tenantID, id string) (store.S
 
 func notRunning(sb core.Sandbox) *Error {
 	e := errf(http.StatusConflict, CodeSandboxNotRunning, "sandbox %s is %s", sb.ID, publicState(sb.State))
+	if sb.State == core.StatePaused {
+		// Reported as "running" (publicState), which would read oddly here.
+		e.Message = "sandbox " + sb.ID + " is suspended"
+	}
 	e.Details = map[string]any{"state": publicState(sb.State)}
 	if sb.Reason != "" {
 		e.Details["reason"] = string(sb.Reason)

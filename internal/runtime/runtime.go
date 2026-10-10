@@ -8,6 +8,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/himanshubaliyan7/SandboxSchedulerAI/internal/core"
@@ -16,7 +18,13 @@ import (
 // Labels every instance carries, so a host agent can rebuild its view from
 // the runtime alone after a crash.
 const (
-	LabelManaged    = "sbx.managed" // always "true"
+	LabelManaged = "sbx.managed" // always "true"
+	// LabelHostID is the identity of the scheduler that owns the instance
+	// (Spec.HostID). One Podman user may serve several schedulers (two
+	// servers, a server and a test run), so sbx.managed alone does not say
+	// whose an instance is: a scheduler acts only on instances carrying
+	// its own host id and leaves every other one strictly alone.
+	LabelHostID     = "sbx.host_id"
 	LabelSandboxID  = "sbx.sandbox_id"
 	LabelGeneration = "sbx.generation"
 	LabelAgentEpoch = "sbx.agent_epoch"
@@ -33,6 +41,18 @@ const (
 	AgentBinary  = "/usr/local/bin/sbx-agent"
 	Workdir      = "/workspace"
 )
+
+// hostIDRE is what a host id may look like: it is a label value, a log
+// field and a database key, so it is kept to a conservative alphabet.
+var hostIDRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
+
+// ValidHostID checks a host id (Spec.HostID, LabelHostID).
+func ValidHostID(id string) error {
+	if !hostIDRE.MatchString(id) {
+		return fmt.Errorf("invalid host id %q: want 1 to 63 letters, digits, '_', '.' or '-', starting with a letter or digit", id)
+	}
+	return nil
+}
 
 var (
 	ErrNotFound    = errors.New("runtime: instance not found")
@@ -57,7 +77,10 @@ type Capabilities struct {
 
 // Spec is everything needed to create one instance.
 type Spec struct {
-	SandboxID  string
+	SandboxID string
+	// HostID is the owning scheduler's host id; it is required and ends
+	// up in LabelHostID.
+	HostID     string
 	Generation int64
 	AgentEpoch string
 	Template   core.Template
@@ -73,8 +96,11 @@ type Spec struct {
 
 // Instance is a backend instance as seen by the host agent.
 type Instance struct {
-	ID         string // backend id (container id)
-	SandboxID  string
+	ID        string // backend id (container id)
+	SandboxID string
+	// HostID is the instance's LabelHostID; empty for an instance created
+	// before the label existed.
+	HostID     string
 	Generation int64
 	AgentEpoch string
 	TemplateID string
@@ -114,7 +140,9 @@ type Backend interface {
 	// of its writable storage. It is idempotent: destroying a missing
 	// instance returns nil.
 	Destroy(ctx context.Context, instanceID string) error
-	// List returns every instance carrying LabelManaged, running or not.
+	// List returns every instance carrying LabelManaged, running or not,
+	// whichever scheduler owns it. Callers must compare Instance.HostID
+	// with their own host id before acting on an instance.
 	List(ctx context.Context) ([]Instance, error)
 	Inspect(ctx context.Context, instanceID string) (Instance, error)
 	Stats(ctx context.Context, instanceID string) (Stats, error)

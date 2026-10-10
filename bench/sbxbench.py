@@ -285,15 +285,22 @@ def plain_flags(runtime="crun", network="none"):
 
 
 def hardened_flags(runtime="crun", network="none", userns=f"keep-id:uid={CUID},gid={CGID}", seccomp="custom",
-                   rundir=None, agent=None, agent_cmd=False, res=RES):
-    """CLI equivalent of podman.BuildCreateSpec (internal/runtime/podman/spec.go)."""
+                   rundir=None, agent=None, agent_cmd=False, res=RES, pycache=True):
+    """CLI equivalent of podman.BuildCreateSpec (internal/runtime/podman/spec.go).
+
+    Like the product spec it does not set memory.high (with swap disabled it
+    only stalls a sandbox on its way to the hard limit) and it sets
+    PYTHONPYCACHEPREFIX; pycache=False leaves that variable out, for the
+    workload columns that measure what it is worth. The session keyring is
+    not a flag: it follows the Podman service's containers.conf, as in the
+    product.
+    """
     f = ["--runtime", runtime, "--network", network,
          "--cap-drop", "all", "--security-opt", "no-new-privileges",
          "--read-only", "--read-only-tmpfs=true",
          "--user", f"{CUID}:{CGID}",
          "--cpus", str(res["cpus"]), "--memory", str(res["memory"]), "--memory-swap", str(res["memory"]),
          "--pids-limit", str(res["pids"]),
-         "--cgroup-conf", f"memory.high={res['memory'] // 100 * 90 // 4096 * 4096}",
          "--cgroup-conf", "memory.oom.group=1",
          "--ulimit", f"nofile={res['nofile']}:{res['nofile']}",
          "--log-driver", "none", "--shm-size", str(res["shm"]), "--hostname", "sandbox",
@@ -303,6 +310,8 @@ def hardened_flags(runtime="crun", network="none", userns=f"keep-id:uid={CUID},g
          "--mount", f"type=tmpfs,destination=/tmp,tmpfs-size={res['tmp']},tmpfs-mode=1777",
          "--mount", "type=tmpfs,destination=/var/tmp,tmpfs-size=1048576,tmpfs-mode=1777,noexec",
          "--mount", "type=tmpfs,destination=/run,tmpfs-size=1048576,tmpfs-mode=0755,noexec"]
+    if pycache:
+        f += ["-e", "PYTHONPYCACHEPREFIX=/tmp/pycache"]
     if userns:
         f += ["--userns", userns]
     if seccomp == "custom":
@@ -336,7 +345,8 @@ def api_spec(name, image, rundir, agent, runtime="crun", command=None, res=RES):
     ns = lambda m: dict(nsmode=m)  # noqa: E731
     return dict(
         name=name, image=image, entrypoint=command[:1], command=command[1:],
-        env={"HOME": "/workspace", "TMPDIR": "/tmp"}, work_dir="/workspace", hostname="sandbox",
+        env={"HOME": "/workspace", "TMPDIR": "/tmp", "PYTHONPYCACHEPREFIX": "/tmp/pycache"},
+        work_dir="/workspace", hostname="sandbox",
         labels={"sbxbench": "true"},
         terminal=False, stdin=False, remove=False, env_host=False, httpproxy=False, init=False,
         stop_timeout=0, restart_policy="no", log_configuration=dict(driver="none"), oci_runtime=runtime,
@@ -352,7 +362,7 @@ def api_spec(name, image, rundir, agent, runtime="crun", command=None, res=RES):
             cpu=dict(quota=int(res["cpus"] * 100000), period=100000),
             memory=dict(limit=res["memory"], swap=res["memory"]),
             pids=dict(limit=res["pids"]),
-            unified={"memory.high": str(res["memory"] // 100 * 90 // 4096 * 4096), "memory.oom.group": "1"}),
+            unified={"memory.oom.group": "1"}),
         r_limits=[dict(type="nofile", hard=res["nofile"], soft=res["nofile"])],
     )
 
@@ -1395,10 +1405,12 @@ def bench_workload(a):
     rd = new_rundir("wl")
     variants = [("plain (overlay workdir)", plain_flags(rt) + ["--stop-timeout", "0"]),
                 ("plain + tmpfs workdir", plain_flags(rt) + ["--stop-timeout", "0", "--tmpfs", "/workspace"]),
-                ("hardened, Podman default seccomp", hardened_flags(rt, rundir=rd, seccomp="default")),
-                ("hardened, product seccomp profile", hardened_flags(rt, rundir=rd, seccomp="custom")),
+                # The product spec sets PYTHONPYCACHEPREFIX; the first two hardened
+                # columns leave it out so that its effect stays measurable.
+                ("hardened, Podman default seccomp", hardened_flags(rt, rundir=rd, seccomp="default", pycache=False)),
+                ("hardened, product seccomp profile", hardened_flags(rt, rundir=rd, seccomp="custom", pycache=False)),
                 ("hardened, product seccomp + PYTHONPYCACHEPREFIX=/tmp/pycache",
-                 hardened_flags(rt, rundir=rd, seccomp="custom") + ["-e", "PYTHONPYCACHEPREFIX=/tmp/pycache"])]
+                 hardened_flags(rt, rundir=rd, seccomp="custom"))]
     names = {}
     for label, flags in variants:
         name = new_name("wl")

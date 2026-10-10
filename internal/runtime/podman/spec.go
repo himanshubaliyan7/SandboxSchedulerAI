@@ -19,6 +19,25 @@ import (
 // exist on only one of them are not used. Security-relevant booleans carry
 // no omitempty on purpose: the server seeds some of them (privileged, for
 // one) from containers.conf before decoding, so they are always sent.
+//
+// Two things a sandbox gets from the Podman service cannot be changed from
+// this request, on v4.9 or on main; both are the service's containers.conf
+// (read when the service starts) and are reported by package preflight:
+//
+//   - The session keyring. Libpod passes --no-new-keyring to the OCI
+//     runtime only when containers.conf has `keyring = false`
+//     (ConmonOCIRuntime.enableKeyring); the SpecGenerator has no field for
+//     it. Each running container therefore holds one key of the user's
+//     kernel.keys.maxkeys quota (200 by default), which caps the number of
+//     running sandboxes per user before memory does.
+//   - The default sysctls. containers.conf `default_sysctls` (as shipped:
+//     net.ipv4.ping_group_range=0 0) is added to every container whose
+//     network namespace is not the host's, a pod's or another container's,
+//     so also to these, which use "none". The "sysctl" field can replace a
+//     value but cannot remove the entry, so crun always writes
+//     /proc/sys/net/ipv4/ping_group_range at start. That write was seen to
+//     fail with EINVAL in 2 of 640 concurrent starts; the pool retries a
+//     failed create for that reason (pool.Config.CreateAttempts).
 type createSpec struct {
 	Name       string            `json:"name"`
 	Image      string            `json:"image"`
@@ -138,9 +157,58 @@ const (
 	smallTmpfsBytes = 1 << 20
 )
 
+// PycachePrefix is where Python keeps bytecode in a sandbox.
+const PycachePrefix = "/tmp/pycache"
+
+// DefaultEnv is the environment every sandbox starts with, on top of the
+// image's own ENV (Libpod applies the image's variables first, so these
+// win over an image that sets the same names). It is the one place where
+// sandbox defaults are set, and it is here, in the create spec, rather
+// than in the in-sandbox agent, because each value is a consequence of
+// this spec: which paths are writable is decided by the mounts below, and
+// a backend with another layout would need other values. The agent
+// inherits them as PID 1 and starts every process from its own
+// environment, with the session env (POST /v1/sandboxes "env") and then
+// the per-command env layered on top, so a caller's value for any of
+// these names still wins.
+//
+//   - HOME and TMPDIR point at the two writable, exec-capable tmpfs
+//     mounts. Tools that keep per-user state or caches (pip, npm, git)
+//     put them under HOME, i.e. in the work directory, which is the larger
+//     of the two; XDG_CACHE_HOME, PIP_CACHE_DIR and npm_config_cache are
+//     deliberately left at those defaults instead of being moved to /tmp,
+//     whose cap is smaller and which build tools also need.
+//   - PYTHONPYCACHEPREFIX: with a read-only root Python cannot write
+//     __pycache__ next to the standard library, and the official images
+//     ship no .pyc files, so without this every interpreter recompiles
+//     every module it imports (measured: 30 stdlib imports 1153 ms
+//     instead of 173 ms, interpreter start 24.7 ms instead of 16.8 ms).
+//     With the prefix the first import of a module in a sandbox compiles
+//     it once and later processes load the cached bytecode. It is under
+//     /tmp, not the work directory, so that the cache does not show up
+//     among the user's files; it counts against the /tmp cap, and Python
+//     ignores a failed bytecode write, so a full /tmp costs speed, not
+//     correctness. The cost: an image that ships precompiled __pycache__
+//     directories has them ignored (the prefix replaces the lookup, it
+//     does not add to it); callers of such a template can pass
+//     PYTHONPYCACHEPREFIX="" in the sandbox env, which Python treats as
+//     unset.
+func DefaultEnv() map[string]string {
+	return map[string]string{
+		"HOME":                runtime.Workdir,
+		"TMPDIR":              "/tmp",
+		"PYTHONPYCACHEPREFIX": PycachePrefix,
+	}
+}
+
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,200}$`)
 
-// ContainerName is the Podman container name of a sandbox.
+// ContainerName is the Podman container name of a sandbox. It does not
+// include the host id: sandbox ids carry 64 random bits, so two schedulers
+// sharing a Podman user do not collide in practice, and if they ever did
+// the second create would fail with a name conflict (and be retried under
+// a new id) without touching the first scheduler's container, because
+// ownership is decided by the sbx.host_id label and never by the name.
 func ContainerName(sandboxID string) string { return "sbx-" + sandboxID }
 
 // BuildCreateSpec maps a runtime.Spec to the hardened Libpod create
@@ -157,6 +225,11 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 	res := tpl.Resources
 	if !nameRE.MatchString(spec.SandboxID) {
 		return nil, fmt.Errorf("podman: invalid sandbox id %q", spec.SandboxID)
+	}
+	// Every instance must say whose it is: the reconciler of another
+	// scheduler on the same Podman user would otherwise have to guess.
+	if err := runtime.ValidHostID(spec.HostID); err != nil {
+		return nil, fmt.Errorf("podman: %w", err)
 	}
 	if tpl.Image == "" {
 		return nil, errors.New("podman: template has no image")
@@ -215,11 +288,10 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		// entrypoint suppresses the image CMD in Libpod's makeCommand.
 		Entrypoint: command[:1],
 		Command:    command[1:],
-		// HOME and TMPDIR point at the only two writable places. The
-		// host environment and host proxy variables are never forwarded
-		// (env_host, httpproxy): the proxy is configured per session by
-		// the agent, and host variables may hold secrets.
-		Env:      map[string]string{"HOME": runtime.Workdir, "TMPDIR": "/tmp"},
+		// The host environment and host proxy variables are never
+		// forwarded (env_host, httpproxy): the proxy is configured per
+		// session by the agent, and host variables may hold secrets.
+		Env:      DefaultEnv(),
 		WorkDir:  runtime.Workdir,
 		Hostname: DefaultHostname,
 
@@ -227,6 +299,7 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		// runtime alone and find orphans.
 		Labels: map[string]string{
 			runtime.LabelManaged:    "true",
+			runtime.LabelHostID:     spec.HostID,
 			runtime.LabelSandboxID:  spec.SandboxID,
 			runtime.LabelGeneration: strconv.FormatInt(spec.Generation, 10),
 			runtime.LabelAgentEpoch: spec.AgentEpoch,

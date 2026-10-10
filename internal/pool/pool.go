@@ -112,7 +112,11 @@ type Config struct {
 	Clock   Clock  // default RealClock
 	Logger  *slog.Logger
 
-	// HostID names this host in the sandboxes table.
+	// HostID names this host in the sandboxes table and in every
+	// instance's sbx.host_id label. It must be stable across restarts
+	// (a new id orphans everything the old one made) and unique among the
+	// schedulers that share a backend or a store: the controller only
+	// touches instances and rows that carry it.
 	HostID string
 	// AgentEpoch identifies this run of the host agent; it is written to
 	// every instance's sbx.agent_epoch label. Default: random per process.
@@ -132,6 +136,15 @@ type Config struct {
 	InitTimeout    time.Duration // egress attach + agent init budget; default core.AssignedDeadline
 	DestroyTimeout time.Duration // teardown budget; default core.RecyclingDeadline
 	OpTimeout      time.Duration // one refill/sweep/reconcile pass; default 15s
+
+	// CreateAttempts is how many times one create (instance create and
+	// start, then agent readiness) is tried before the row is failed and
+	// the circuit breaker counts a failure; default 3, 1 disables the
+	// retry. All attempts share the row's CreateTimeout.
+	// CreateRetryBackoff is the pause before the second attempt, doubling
+	// for each further one; default 100ms.
+	CreateAttempts     int
+	CreateRetryBackoff time.Duration
 
 	// ClaimWait is how long a claim waits on an empty pool when
 	// ClaimOptions.Wait is zero; default 5s.
@@ -169,6 +182,8 @@ func (c *Config) defaults() error {
 		return errors.New("pool: Config.Agent is required")
 	case c.HostID == "":
 		return errors.New("pool: Config.HostID is required")
+	case runtime.ValidHostID(c.HostID) != nil:
+		return fmt.Errorf("pool: %w", runtime.ValidHostID(c.HostID))
 	case c.RunDirBase == "":
 		return errors.New("pool: Config.RunDirBase is required")
 	}
@@ -201,6 +216,10 @@ func (c *Config) defaults() error {
 	def(&c.DestroyTimeout, core.RecyclingDeadline)
 	def(&c.OpTimeout, 15*time.Second)
 	def(&c.ClaimWait, 5*time.Second)
+	def(&c.CreateRetryBackoff, 100*time.Millisecond)
+	if c.CreateAttempts <= 0 {
+		c.CreateAttempts = 3
+	}
 	def(&c.BreakerBaseBackoff, time.Second)
 	def(&c.BreakerMaxBackoff, time.Minute)
 	def(&c.AdoptProbeTimeout, 2*time.Second)
@@ -248,6 +267,7 @@ type Controller struct {
 	queues    map[string]*waitQueue
 	adopted   map[string]struct{} // WARM sandboxes inherited from an older epoch and probed
 	proxied   map[string]struct{} // sandboxes this process attached to the egress proxy
+	foreign   map[string]struct{} // instance ids of other host ids already reported in the log
 	counts    map[string]map[core.State]int
 	templates []core.Template
 	lastGC    time.Time
@@ -276,6 +296,7 @@ func New(cfg Config) (*Controller, error) {
 		queues:    map[string]*waitQueue{},
 		adopted:   map[string]struct{}{},
 		proxied:   map[string]struct{}{},
+		foreign:   map[string]struct{}{},
 		counts:    map[string]map[core.State]int{},
 		m:         newCounters(),
 	}, nil
@@ -437,22 +458,34 @@ func (c *Controller) busyRow(sb core.Sandbox) bool {
 // RECYCLING and the sweeper retries it after the deadline. The returned
 // error is the store's verdict on the transition, e.g. ErrStaleGeneration.
 func (c *Controller) recycle(ctx context.Context, sb core.Sandbox, reason core.TerminationReason, data map[string]any) error {
+	rec, err := c.fence(ctx, sb, reason, data)
+	if err != nil {
+		return err
+	}
+	if err := c.teardown(rec); err != nil {
+		c.log.Warn("teardown failed; the sweeper will retry", "sandbox", rec.ID, "err", err)
+	}
+	return nil
+}
+
+// fence moves a row to RECYCLING. From that moment the sandbox is no
+// longer its tenant's: the access token stops working, the row cannot be
+// claimed or go back, and the RECYCLING deadline makes the sweeper finish
+// the teardown if nobody else does.
+func (c *Controller) fence(ctx context.Context, sb core.Sandbox, reason core.TerminationReason, data map[string]any) (core.Sandbox, error) {
 	rec, err := c.store.Transition(ctx, store.TransitionParams{
 		ID: sb.ID, Generation: sb.Generation, From: sb.State, To: core.StateRecycling,
 		Reason: reason, Deadline: c.cfg.DestroyTimeout, Data: data,
 	})
 	if err != nil {
-		return err
+		return core.Sandbox{}, err
 	}
 	c.mu.Lock()
 	c.m.terminations[rec.Reason]++
 	c.mu.Unlock()
 	c.log.Info("sandbox recycling", "sandbox", rec.ID, "template", rec.TemplateID, "tenant", rec.TenantID,
 		"from", sb.State, "reason", rec.Reason)
-	if err := c.teardown(rec); err != nil {
-		c.log.Warn("teardown failed; the sweeper will retry", "sandbox", rec.ID, "err", err)
-	}
-	return nil
+	return rec, nil
 }
 
 // teardown releases everything a RECYCLING row holds on the host, in this
@@ -485,7 +518,7 @@ func (c *Controller) teardown(sb core.Sandbox) error {
 	} else {
 		// The create never reported an instance id (it failed or hung).
 		// Look for a half-created instance by label.
-		list, err := c.backend.List(ctx)
+		list, err := c.ownInstances(ctx)
 		if err != nil {
 			return fmt.Errorf("list instances: %w", err)
 		}

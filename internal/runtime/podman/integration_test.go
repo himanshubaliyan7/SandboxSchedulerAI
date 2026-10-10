@@ -12,12 +12,15 @@ package podman
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -31,6 +34,49 @@ const (
 	itAlpine = "docker.io/library/alpine:3.20"
 	itPython = "docker.io/library/python:3.12-alpine"
 )
+
+// itHostID labels every container of this test process. A scheduler
+// running for the same Podman user at the same time (a dev server, the
+// end-to-end test) acts only on its own host id, so it leaves these
+// alone; the name carries the pid so that two test processes differ too.
+var itHostID = fmt.Sprintf("it-podman-%d", os.Getpid())
+
+// itWatchOOMFile cleans up after conmon. When a container is OOM-killed,
+// conmon (2.1.10) creates an empty file named "oom" in its working
+// directory, in addition to the one in --persist-dir when that is given;
+// Podman 4.9.3 gives neither a persist dir nor a working directory, so
+// conmon inherits the working directory of the process that started the
+// container. With the API socket that is the Podman service, not this
+// test: for the systemd-activated service it is the user's home (shown to
+// be the service's directory by running a service elsewhere: the file
+// followed it). No create option moves it, and this test cannot move the
+// service, so it removes the file afterwards, and only if the file was
+// not there before, is empty and is a regular file. An operator who minds
+// the file can give podman.service a WorkingDirectory in a systemd
+// drop-in.
+func itWatchOOMFile(t *testing.T) {
+	t.Helper()
+	var dirs []string
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, home)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, wd) // conmon started by the podman CLI on this test's behalf
+	}
+	for _, dir := range dirs {
+		path := filepath.Join(dir, "oom")
+		if _, err := os.Lstat(path); err == nil {
+			continue // not ours to remove
+		}
+		t.Cleanup(func() {
+			if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() && fi.Size() == 0 {
+				if os.Remove(path) == nil {
+					t.Logf("removed %s, left by conmon for an OOM-killed container", path)
+				}
+			}
+		})
+	}
+}
 
 func itResources() core.Resources {
 	return core.Resources{
@@ -95,6 +141,7 @@ func itCreate(t *testing.T, b *Backend, image string, res core.Resources) runtim
 	defer cancel()
 	inst, err := b.Create(ctx, runtime.Spec{
 		SandboxID:  id,
+		HostID:     itHostID,
 		Generation: 7,
 		AgentEpoch: "epoch-it",
 		Template:   core.Template{ID: "tpl-it", Image: image, Resources: res, Network: core.NetworkAllowlist},
@@ -113,6 +160,9 @@ func itCreate(t *testing.T, b *Backend, image string, res core.Resources) runtim
 			t.Errorf("cleanup Destroy: %v", err)
 		}
 	})
+	if inst.HostID != itHostID {
+		t.Fatalf("Create returned host id %q, want %q", inst.HostID, itHostID)
+	}
 	if inst.SandboxID != id || inst.Generation != 7 || inst.AgentEpoch != "epoch-it" || inst.TemplateID != "tpl-it" || !inst.Running {
 		t.Fatalf("Create returned %+v", inst)
 	}
@@ -172,6 +222,37 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 		} else {
 			t.Logf("%s = %s", file, got)
 		}
+	}
+
+	// Ownership label and default environment.
+	if out, err := exec.Command("podman", "inspect", "-f", `{{index .Config.Labels "sbx.host_id"}}`, inst.ID).Output(); err != nil ||
+		strings.TrimSpace(string(out)) != itHostID {
+		t.Errorf("sbx.host_id label = %q (%v), want %q", strings.TrimSpace(string(out)), err, itHostID)
+	}
+	if got := itMustExec(t, inst.ID, `echo "$HOME $TMPDIR $PYTHONPYCACHEPREFIX"`); got != "/workspace /tmp /tmp/pycache" {
+		t.Errorf("default environment = %q, want /workspace /tmp /tmp/pycache", got)
+	}
+	// What the API cannot switch off: the default sysctl of the service's
+	// containers.conf is in the OCI spec although the network is "none",
+	// and (unless the service runs with keyring = false) the container
+	// holds a kernel key. Logged, not asserted: both depend on the host's
+	// containers.conf.
+	if out, err := exec.Command("podman", "inspect", "-f", "{{.OCIConfigPath}}", inst.ID).Output(); err == nil {
+		// The bundle belongs to a subordinate uid under keep-id, hence unshare.
+		if raw, err := exec.Command("podman", "unshare", "cat", strings.TrimSpace(string(out))).Output(); err == nil {
+			var oci struct {
+				Linux struct {
+					Sysctl map[string]string `json:"sysctl"`
+				} `json:"linux"`
+			}
+			if json.Unmarshal(raw, &oci) == nil {
+				t.Logf("sysctls in the generated OCI spec (netns none): %v", oci.Linux.Sysctl)
+			}
+		} else {
+			t.Logf("OCI spec not readable: %v", err)
+		}
+	} else {
+		t.Logf("podman inspect OCIConfigPath: %v", err)
 	}
 
 	// Identity and privilege.
@@ -273,7 +354,7 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 	found := false
 	for _, i := range list {
 		if i.ID == inst.ID {
-			found = i.SandboxID == inst.SandboxID && i.Running && i.Generation == 7
+			found = i.SandboxID == inst.SandboxID && i.HostID == itHostID && i.Running && i.Generation == 7
 		}
 	}
 	if !found {
@@ -386,6 +467,7 @@ func TestIntegrationLimitsAreEnforced(t *testing.T) {
 	res.MemoryBytes = 128 << 20
 	res.WorkdirBytes = 32 << 20
 	res.TmpBytes = 16 << 20
+	itWatchOOMFile(t) // the memory bomb below makes conmon drop an "oom" file
 	inst := itCreate(t, b, itPython, res)
 	ctx := context.Background()
 
@@ -489,5 +571,82 @@ func TestIntegrationUsernsModes(t *testing.T) {
 				t.Errorf("mode %s: write to run dir succeeded=%v, documented=%v", tc.mode, err == nil, tc.runDirOK)
 			}
 		})
+	}
+}
+
+// thirtyStdlibModules is the import list of the benchmark that found the
+// recompilation problem (bench/sbxbench.py, python_import_30_stdlib_modules).
+const thirtyStdlibModules = "json,re,ssl,sqlite3,asyncio,http.client,decimal,datetime,subprocess,argparse,logging,unittest," +
+	"email.parser,xml.etree.ElementTree,csv,hashlib,urllib.request,zipfile,tempfile,pathlib," +
+	"multiprocessing,ctypes,uuid,random,statistics,gzip,shutil,socket,threading,dataclasses"
+
+// TestIntegrationPythonBytecodeCache measures what PYTHONPYCACHEPREFIX in
+// the default environment is worth on the read-only root: a fresh
+// interpreter importing 30 standard-library modules, with the sandbox's
+// default environment and with the variable emptied (which Python treats
+// as unset, i.e. the behaviour before the default existed).
+func TestIntegrationPythonBytecodeCache(t *testing.T) {
+	b := itBackend(t, nil)
+	inst := itCreate(t, b, itPython, itResources())
+
+	// The import time is taken inside the interpreter, so the cost of
+	// `podman exec` is not in it; start-up is the wall time of a child
+	// `python3 -c pass`, measured by a parent interpreter.
+	const probe = `python3 -c 'import time; t=time.perf_counter(); import ` + thirtyStdlibModules + `; print(round((time.perf_counter()-t)*1000, 1))'`
+	measure := func(env string, n int) []float64 {
+		t.Helper()
+		var out []float64
+		for i := 0; i < n; i++ {
+			v, err := strconv.ParseFloat(itMustExec(t, inst.ID, env+probe), 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, v)
+		}
+		return out
+	}
+	median := func(v []float64) float64 {
+		s := append([]float64(nil), v...)
+		sort.Float64s(s)
+		return s[len(s)/2]
+	}
+	startup := func(env string) float64 {
+		t.Helper()
+		out := itMustExec(t, inst.ID, env+`python3 -c 'import subprocess, sys, time
+t = time.perf_counter()
+for _ in range(20):
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+print(round((time.perf_counter() - t) * 1000 / 20, 1))'`)
+		ms, err := strconv.ParseFloat(out, 64)
+		if err != nil {
+			t.Fatalf("start-up probe: %q", out)
+		}
+		return ms
+	}
+
+	if got := itMustExec(t, inst.ID, `python3 -c 'import sys; print(sys.pycache_prefix)'`); got != PycachePrefix {
+		t.Fatalf("sys.pycache_prefix = %q, want %q", got, PycachePrefix)
+	}
+	if got := itMustExec(t, inst.ID, `PYTHONPYCACHEPREFIX= python3 -c 'import sys; print(sys.pycache_prefix)'`); got != "None" {
+		t.Fatalf("an empty PYTHONPYCACHEPREFIX gives sys.pycache_prefix = %q, want None", got)
+	}
+
+	const noCache = "PYTHONPYCACHEPREFIX= "
+	without := measure(noCache, 5)
+	first := measure("", 1) // compiles and fills the cache
+	with := measure("", 5)
+	startWithout, startWith := startup(noCache), startup("")
+	t.Logf("MEASURED 30 stdlib imports, read-only root, ms: without PYTHONPYCACHEPREFIX %v (median %.1f); "+
+		"with it, first process %v, later processes %v (median %.1f)", without, median(without), first, with, median(with))
+	t.Logf("MEASURED python3 -c pass, mean of 20, ms: without %.1f, with %.1f", startWithout, startWith)
+	if n := itMustExec(t, inst.ID, "find /tmp/pycache -name '*.pyc' | wc -l"); n == "0" {
+		t.Error("no bytecode was written under /tmp/pycache")
+	} else {
+		t.Logf("bytecode files under %s: %s (%s)", PycachePrefix, n, itMustExec(t, inst.ID, "du -sh /tmp/pycache | cut -f1"))
+	}
+	// The benchmark saw 1153 ms against 173 ms. Machines and load differ,
+	// so only a clear win is asserted.
+	if median(with) > median(without)/2 {
+		t.Errorf("cached imports took %.1f ms, uncached %.1f ms: expected at least a 2x improvement", median(with), median(without))
 	}
 }

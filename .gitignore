@@ -12,3 +12,6 @@ __pycache__/
 .vscode/
 /sbx-agent
 /oom
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/

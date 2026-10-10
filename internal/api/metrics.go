@@ -202,6 +202,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"sbx_pool_releases_total", "Sandboxes released by their tenant.", pm.Releases},
 		{"sbx_pool_creates_total", "Sandbox creates that reached WARM.", pm.Creates},
 		{"sbx_pool_create_failures_total", "Sandbox creates that failed.", pm.CreateFailures},
+		{"sbx_pool_create_retries_total", "Sandbox create attempts that failed and were retried.", pm.CreateRetries},
 		{"sbx_pool_destroyed_total", "Sandboxes destroyed.", pm.Destroyed},
 		{"sbx_pool_orphans_destroyed_total", "Instances destroyed by the reconciler because no row accounted for them.", pm.OrphansDestroyed},
 		{"sbx_pool_instances_lost_total", "Sandboxes failed because their instance vanished or died.", pm.InstancesLost},

@@ -61,7 +61,8 @@ type Metrics struct {
 	ClaimWait         Histogram
 	Releases          uint64
 	Creates           uint64 // creates that reached WARM
-	CreateFailures    uint64
+	CreateFailures    uint64 // creates that ended FAILED, after every attempt
+	CreateRetries     uint64 // create attempts that failed and were tried again
 	Destroyed         uint64
 	OrphansDestroyed  uint64 // instances destroyed by the reconciler
 	InstancesLost     uint64 // rows failed because their instance vanished or died

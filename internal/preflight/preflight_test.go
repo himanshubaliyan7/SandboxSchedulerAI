@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -39,6 +40,15 @@ func (h *host) remove(path string) {
 	}
 }
 
+// keyUsers is /proc/key-users with 6 keys charged to uid 1000 (and other
+// users around it, one of them with a uid that has 1000 as a prefix).
+func keyUsers(maxKeys string) string {
+	return "    0:   569 568/568 112/1000000 2391/25000000\n" +
+		"  120:     3 3/3 3/200 31/20000\n" +
+		" 1000:     6 6/6 6/" + maxKeys + " 176/20000\n" +
+		"10001:    50 50/50 50/200 900/20000\n"
+}
+
 const userCgroup = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.controllers"
 
 // healthyHost builds a host on which every check is ok or info.
@@ -53,6 +63,8 @@ func healthyHost(t *testing.T) *host {
 	h.write("/proc/sys/user/max_user_namespaces", "62000\n")
 	h.write("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "0\n")
 	h.write("/proc/sys/fs/inotify/max_user_instances", "8192\n")
+	h.write("/proc/sys/kernel/keys/maxkeys", "20000\n")
+	h.write("/proc/key-users", keyUsers("20000"))
 	h.write("/proc/sys/kernel/osrelease", "6.8.0-45-generic\n")
 	h.write("/proc/swaps", "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n")
 	h.write("/dev/kvm", "")
@@ -110,8 +122,8 @@ func TestHealthyHost(t *testing.T) {
 	if !r.OK() || r.Err() != nil || len(r.Warnings()) != 0 {
 		t.Fatalf("healthy host: failed=%v warnings=%v", r.Failed(), r.Warnings())
 	}
-	if len(r.Checks) != 19 {
-		t.Errorf("%d checks, want 19", len(r.Checks))
+	if len(r.Checks) != 20 {
+		t.Errorf("%d checks, want 20", len(r.Checks))
 	}
 	seen := map[string]bool{}
 	for _, c := range r.Checks {
@@ -196,6 +208,66 @@ func TestChecks(t *testing.T) {
 			CheckAppArmorUserns, StatusOK, "not present", ""},
 		{"low inotify", func(h *host) { h.write("/proc/sys/fs/inotify/max_user_instances", "128\n") },
 			CheckInotify, StatusWarn, "max_user_instances=128 (< 1024)", "sysctl -w fs.inotify.max_user_instances=8192"},
+		{"inotify headroom below the planned pool size", func(h *host) {
+			h.opts.PlannedSandboxes = 600
+			h.write("/proc/sys/fs/inotify/max_user_instances", "512\n")
+			h.opts.InotifyInUse = func() (int64, error) { return 42, nil }
+		}, CheckInotify, StatusWarn, "max_user_instances=512, 42 in use by alice: room for 470 more; each running sandbox holds one, and the pools may run 600", "max_total"},
+		{"inotify headroom covers the planned pool size", func(h *host) {
+			h.opts.PlannedSandboxes = 400
+			h.write("/proc/sys/fs/inotify/max_user_instances", "512\n")
+			h.opts.InotifyInUse = func() (int64, error) { return 42, nil }
+		}, CheckInotify, StatusOK, "room for 470 more", ""},
+		{"inotify usage unreadable", func(h *host) {
+			h.opts.PlannedSandboxes = 10
+			h.opts.InotifyInUse = func() (int64, error) { return 0, errors.New("no /proc") }
+		}, CheckInotify, StatusWarn, "cannot count the instances in use", ""},
+		{"default key quota", func(h *host) {
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", keyUsers("200"))
+		}, CheckKeys, StatusWarn, "kernel.keys.maxkeys=200, 6 in use by alice: at most 194 more containers can run for this user", "keyring = false"},
+		{"key quota below the planned pool size", func(h *host) {
+			h.opts.PlannedSandboxes = 300
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", keyUsers("200"))
+		}, CheckKeys, StatusWarn, "at most 194 more containers can run for this user (one session keyring each), but the pools may run 300 sandboxes", "sysctl -w kernel.keys.maxkeys"},
+		{"key quota covers the planned pool size", func(h *host) {
+			h.opts.PlannedSandboxes = 100
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", keyUsers("200"))
+		}, CheckKeys, StatusOK, "at most 194 more containers can run for this user (one session keyring each); the pools may run 100", ""},
+		{"user holds no keys", func(h *host) {
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", "    0:   569 568/568 112/1000000 2391/25000000\n10001: 5 5/5 5/200 9/20000\n")
+		}, CheckKeys, StatusWarn, "0 in use by alice: at most 200 more", ""},
+		{"key quota exhausted", func(h *host) {
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", " 1000:   201 201/201 201/200 9000/20000\n")
+		}, CheckKeys, StatusWarn, "at most 0 more", ""},
+		{"keyring disabled in containers.conf", func(h *host) {
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", keyUsers("200"))
+			h.opts.PlannedSandboxes = 1000
+			h.write("/usr/share/containers/containers.conf", "[containers]\n#keyring = true\n[engine]\nkeyring = false\n")
+			h.write("/etc/containers/containers.conf.d/10-sbx.conf", "[containers]\n  keyring = false # density\n")
+		}, CheckKeys, StatusOK, "/etc/containers/containers.conf.d/10-sbx.conf sets keyring = false, so sandboxes take no key", ""},
+		{"keyring re-enabled by a later file", func(h *host) {
+			h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+			h.write("/proc/key-users", keyUsers("200"))
+			h.write("/etc/containers/containers.conf", "[containers]\nkeyring = false\n")
+			h.write("/home/alice/.config/containers/containers.conf", "[containers]\nkeyring = true\n")
+			get := h.opts.Getenv
+			h.opts.Getenv = func(k string) string {
+				if k == "HOME" {
+					return "/home/alice"
+				}
+				return get(k)
+			}
+		}, CheckKeys, StatusWarn, "at most 194 more", "keyring = false"},
+		{"no maxkeys sysctl", func(h *host) { h.remove("/proc/sys/kernel/keys/maxkeys") },
+			CheckKeys, StatusWarn, "cannot read /proc/sys/kernel/keys/maxkeys", ""},
+		{"no key-users", func(h *host) { h.remove("/proc/key-users") },
+			CheckKeys, StatusWarn, "cannot read the user's usage", ""},
 		{"low nofile soft", func(h *host) { h.opts.Rlimit = func() (uint64, uint64, error) { return 1024, 1048576, nil } },
 			CheckNofile, StatusWarn, "soft=1024 hard=1048576", "LimitNOFILE"},
 		{"low nofile hard", func(h *host) { h.opts.Rlimit = func() (uint64, uint64, error) { return 1024, 4096, nil } },
@@ -274,7 +346,7 @@ func TestReportString(t *testing.T) {
 		"-> loginctl enable-linger alice",
 		"OK    cgroup_v2",
 		"INFO  kvm",
-		"19 checks: 1 failed, 1 warnings",
+		"20 checks: 1 failed, 1 warnings",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report lacks %q:\n%s", want, out)
@@ -345,12 +417,54 @@ func TestParseVersion(t *testing.T) {
 func TestRealHost(t *testing.T) {
 	r := Run(context.Background(), Options{})
 	t.Logf("real host preflight (OK=%v):\n%s", r.OK(), r)
-	if len(r.Checks) != 19 {
-		t.Errorf("%d checks, want 19", len(r.Checks))
+	if len(r.Checks) != 20 {
+		t.Errorf("%d checks, want 20", len(r.Checks))
 	}
 	for _, c := range r.Checks {
 		if c.Name == "" || c.Detail == "" || c.Status == "" {
 			t.Errorf("malformed check: %+v", c)
 		}
 	}
+}
+
+func TestCapacityRunsOnlyTheQuotaChecks(t *testing.T) {
+	h := healthyHost(t)
+	h.write("/proc/sys/kernel/keys/maxkeys", "200\n")
+	h.write("/proc/key-users", keyUsers("200"))
+	opts := h.opts
+	opts.PlannedSandboxes = 250
+	opts.InotifyInUse = func() (int64, error) { return 10, nil }
+	r := Capacity(context.Background(), opts)
+	if len(r.Checks) != 2 || !r.OK() {
+		t.Fatalf("capacity report: %+v", r)
+	}
+	if c, _ := r.Get(CheckKeys); c.Status != StatusWarn || !strings.Contains(c.Detail, "the pools may run 250") {
+		t.Errorf("keys: %+v", c)
+	}
+	if c, _ := r.Get(CheckInotify); c.Status != StatusOK || !strings.Contains(c.Detail, "room for 8182 more") {
+		t.Errorf("inotify: %+v", c)
+	}
+}
+
+// TestInotifyInUseCountsThisProcess: the real /proc scan sees an inotify
+// instance this test opens.
+func TestInotifyInUseCountsThisProcess(t *testing.T) {
+	before, err := inotifyInUse(os.Getuid())
+	if err != nil {
+		t.Skipf("cannot scan /proc: %v", err)
+	}
+	fd, err := syscall.InotifyInit1(syscall.IN_CLOEXEC)
+	if err != nil {
+		t.Skipf("inotify_init1: %v", err)
+	}
+	defer syscall.Close(fd)
+	after, err := inotifyInUse(os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Other processes of the user come and go; ours alone guarantees >= 1.
+	if after < 1 {
+		t.Errorf("inotify instances in use: %d before, %d after opening one", before, after)
+	}
+	t.Logf("inotify instances held by uid %d: %d", os.Getuid(), after)
 }

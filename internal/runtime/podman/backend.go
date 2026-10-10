@@ -125,7 +125,8 @@ func (b *Backend) Destroy(ctx context.Context, instanceID string) error {
 }
 
 // List implements runtime.Backend: every container labelled
-// sbx.managed=true, in any state.
+// sbx.managed=true, in any state and of any host id. Instance.HostID tells
+// the caller whose each one is.
 func (b *Backend) List(ctx context.Context) ([]runtime.Instance, error) {
 	filters, err := json.Marshal(map[string][]string{"label": {runtime.LabelManaged + "=true"}})
 	if err != nil {
@@ -258,6 +259,7 @@ func instanceFrom(id string, labels map[string]string, running bool, created tim
 	return runtime.Instance{
 		ID:         id,
 		SandboxID:  labels[runtime.LabelSandboxID],
+		HostID:     labels[runtime.LabelHostID],
 		Generation: gen,
 		AgentEpoch: labels[runtime.LabelAgentEpoch],
 		TemplateID: labels[runtime.LabelTemplateID],

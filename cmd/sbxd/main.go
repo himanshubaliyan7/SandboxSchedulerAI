@@ -189,13 +189,20 @@ func cmdServe(args []string, stderr io.Writer) error {
 	)
 	fs.StringVar(&cfg.DatabaseURL, "database-url", envStr("SBX_DATABASE_URL", ""), "Postgres URL [SBX_DATABASE_URL] (required)")
 	fs.StringVar(&cfg.Listen, "listen", envStr("SBX_LISTEN", "127.0.0.1:8080"), "API listen address [SBX_LISTEN]")
+	fs.StringVar(&cfg.MetricsListen, "metrics-listen", envStr("SBX_METRICS_LISTEN", ""),
+		"serve /metrics on this address instead of the API listener, e.g. 127.0.0.1:9090 [SBX_METRICS_LISTEN]")
+	fs.StringVar(&cfg.MetricsToken, "metrics-token", envStr("SBX_METRICS_TOKEN", ""),
+		"bearer token required by /metrics; without it and without --metrics-listen, sbxd refuses a non-loopback --listen [SBX_METRICS_TOKEN]")
 	fs.StringVar(&cfg.AgentBinary, "agent-binary", envStr("SBX_AGENT_BINARY", defaultAgentBinary()),
 		"path of the static sbx-agent binary [SBX_AGENT_BINARY] (default: sbx-agent next to sbxd)")
 	fs.StringVar(&cfg.RunDir, "run-dir", envStr("SBX_RUN_DIR", server.DefaultRunDir()),
 		"directory for per-sandbox sockets; keep it short [SBX_RUN_DIR]")
 	fs.StringVar(&cfg.PodmanSocket, "podman-socket", envStr("SBX_PODMAN_SOCKET", ""),
 		"Podman API socket [SBX_PODMAN_SOCKET] (default $XDG_RUNTIME_DIR/podman/podman.sock)")
-	fs.StringVar(&cfg.HostID, "host-id", envStr("SBX_HOST_ID", ""), "name of this host in the store [SBX_HOST_ID] (default: hostname)")
+	fs.StringVar(&cfg.HostID, "host-id", envStr("SBX_HOST_ID", ""),
+		"identity of this scheduler: the host_id of its rows and the sbx.host_id label of its containers; it only touches "+
+			"what carries it, so keep it stable across restarts and unique per server [SBX_HOST_ID] "+
+			"(default: <hostname>-u<uid>-<hash of the run dir>)")
 	fs.BoolVar(&cfg.SkipPreflight, "skip-preflight", envBool("SBX_SKIP_PREFLIGHT", false), "start even if a host check fails [SBX_SKIP_PREFLIGHT]")
 	fs.BoolVar(&cfg.RequireLinger, "require-linger", envBool("SBX_REQUIRE_LINGER", false),
 		"fail preflight when systemd lingering is off for this user [SBX_REQUIRE_LINGER]")

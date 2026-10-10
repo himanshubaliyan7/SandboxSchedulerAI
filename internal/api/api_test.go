@@ -204,7 +204,9 @@ func TestSandboxLifecycleAndListing(t *testing.T) {
 	h.want(h.do("GET", "/v1/sandboxes?limit=0", nil, withKey(keyA)), 400, api.CodeBadRequest)
 
 	// Delete destroys, is idempotent, and the sandbox stays readable.
-	h.want(h.do("DELETE", "/v1/sandboxes/"+a.ID, nil, withKey(keyA)), 204, "")
+	// With ?wait=true the teardown is over when the answer arrives.
+	h.want(h.do("DELETE", "/v1/sandboxes/"+a.ID+"?wait=maybe", nil, withKey(keyA)), 400, api.CodeBadRequest)
+	h.want(h.do("DELETE", "/v1/sandboxes/"+a.ID+"?wait=true", nil, withKey(keyA)), 204, "")
 	h.want(h.do("DELETE", "/v1/sandboxes/"+a.ID, nil, withKey(keyA)), 204, "")
 	var gone api.SandboxView
 	h.want(h.do("GET", "/v1/sandboxes/"+a.ID, nil, withKey(keyA)), 200, "").json(t, &gone)

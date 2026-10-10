@@ -30,8 +30,18 @@ const (
 )
 
 // publicState is the API spelling of a lifecycle state: the core state
-// in lower case.
-func publicState(s core.State) string { return strings.ToLower(string(s)) }
+// in lower case. PAUSED is not part of the public API: no route pauses a
+// sandbox, so the state machine's PAUSED is unreachable today. Should a
+// row ever be in it (a future pause feature, an operator's hand), the
+// sandbox is still held by its tenant and still counts and expires like
+// a running one, so it is reported as "running" rather than as a value
+// clients were never told about.
+func publicState(s core.State) string {
+	if s == core.StatePaused {
+		s = core.StateRunning
+	}
+	return strings.ToLower(string(s))
+}
 
 // SandboxView is the public view of a sandbox. It deliberately has no
 // generation, host or instance id: those are internal.
@@ -249,8 +259,15 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request, ten
 		for _, name := range strings.Split(state, ",") {
 			st := core.State(strings.ToUpper(strings.TrimSpace(name)))
 			switch st {
-			case core.StateAssigned, core.StateRunning, core.StatePaused, core.StateRecycling,
+			case core.StateRunning:
+				// A paused sandbox is reported as running (publicState),
+				// so the running filter has to find it.
+				f.States = append(f.States, core.StateRunning, core.StatePaused)
+			case core.StateAssigned, core.StatePaused, core.StateRecycling,
 				core.StateDestroyed, core.StateFailed, core.StateUnknown:
+				// "paused" is no longer documented; it is still accepted so
+				// that a client written against the older enum is not
+				// answered with a 400.
 				f.States = append(f.States, st)
 			default:
 				return badRequest("unknown state %q", name)
@@ -299,7 +316,21 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request, tenant
 	return nil
 }
 
+// handleDeleteSandbox answers 204 as soon as the sandbox is fenced (state
+// recycling: its access token is dead and its egress is detached) and
+// lets the pool destroy the container in the background, which is the
+// slow part of a release. With ?wait=true it answers only after the
+// teardown has been attempted, which is what the route did before; the
+// sandbox is then normally already destroyed.
 func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request, tenant store.Tenant) error {
+	wait := false
+	switch v := r.URL.Query().Get("wait"); v {
+	case "", "false":
+	case "true":
+		wait = true
+	default:
+		return badRequest("wait must be true or false")
+	}
 	ctx, cancel := s.opCtx(r)
 	defer cancel()
 	acc, err := s.ownedSandbox(ctx, tenant.ID, r.PathValue("id"))
@@ -310,7 +341,11 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request, ten
 	s.sessions.drop(sb.ID)
 	switch sb.State {
 	case core.StateAssigned, core.StateRunning, core.StatePaused:
-		if err := s.pool.Release(ctx, sb.ID, sb.Generation, core.ReasonReleased); err != nil {
+		release := s.pool.ReleaseAsync
+		if wait {
+			release = s.pool.Release
+		}
+		if err := release(ctx, sb.ID, sb.Generation, core.ReasonReleased); err != nil {
 			return err
 		}
 	default:

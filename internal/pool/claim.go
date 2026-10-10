@@ -295,6 +295,25 @@ func (c *Controller) grant(templateID string) {
 // run. If the teardown failed the row stays RECYCLING and the sweeper
 // retries; Release still returns nil because the release itself is durable.
 func (c *Controller) Release(ctx context.Context, sandboxID string, generation int64, reason core.TerminationReason) error {
+	return c.release(ctx, sandboxID, generation, reason, true)
+}
+
+// ReleaseAsync is Release without the wait for the teardown. It returns
+// as soon as the sandbox is fenced: the row is RECYCLING (durably, so the
+// access token is dead and the release cannot be lost) and the egress
+// proxy is detached, so the sandbox has no way out any more. Killing and
+// removing the instance, which is the slow part (about 90 ms for a
+// Podman container, more under load), and removing the run dir then
+// happen on a background goroutine of the controller. If that goroutine
+// fails or the process dies first, the sweeper retries the teardown at
+// the RECYCLING deadline and the reconciler finishes it after a restart,
+// exactly as for a synchronous release whose teardown failed. Stop waits
+// for teardowns that are in flight.
+func (c *Controller) ReleaseAsync(ctx context.Context, sandboxID string, generation int64, reason core.TerminationReason) error {
+	return c.release(ctx, sandboxID, generation, reason, false)
+}
+
+func (c *Controller) release(ctx context.Context, sandboxID string, generation int64, reason core.TerminationReason, wait bool) error {
 	sb, err := c.store.GetSandbox(ctx, sandboxID)
 	if err != nil {
 		return err
@@ -311,13 +330,31 @@ func (c *Controller) Release(ctx context.Context, sandboxID string, generation i
 	if reason == "" {
 		reason = core.ReasonReleased
 	}
-	if err := c.recycle(context.WithoutCancel(ctx), sb, reason, nil); err != nil {
+	rec, err := c.fence(context.WithoutCancel(ctx), sb, reason, nil)
+	if err != nil {
 		return err
 	}
 	c.mu.Lock()
 	c.m.Releases++
 	c.mu.Unlock()
-	c.Kick()
+	finish := func() {
+		if err := c.teardown(rec); err != nil {
+			c.log.Warn("teardown failed; the sweeper will retry", "sandbox", rec.ID, "err", err)
+		}
+		c.Kick()
+	}
+	if wait {
+		finish()
+		return nil
+	}
+	// Cut the network before answering; teardown detaches again, which is
+	// a no-op.
+	if err := c.egress.Detach(rec.ID); err != nil {
+		c.log.Debug("egress detach failed", "sandbox", rec.ID, "err", err)
+	}
+	if !c.goAsync(finish) {
+		finish() // stopping: no background work is accepted any more
+	}
 	return nil
 }
 

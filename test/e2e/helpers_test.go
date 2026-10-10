@@ -184,14 +184,14 @@ func (e *env) logTail(n int) string {
 	return "--- sbxd log tail ---\n" + strings.Join(lines, "\n")
 }
 
-// ourContainers lists the Podman containers of sandboxes of this
-// environment: every sandbox has a directory in the run dir, and its
-// container is named after it. Containers of sandboxes whose run dir is
-// already gone are found by comparing with known, which the caller may
-// pass to check specific ids.
+// containers lists the Podman containers that belong to this
+// environment's server, by sandbox id: the ones labelled with its host
+// id. Other schedulers of the same Podman user (a developer's server,
+// another test run) have their own host id and are not in the result.
 func (e *env) containers(t *testing.T) map[string]string {
 	t.Helper()
-	out := run(t, "podman", "ps", "-a", "--filter", "label=sbx.managed=true", "--format", "{{.Names}} {{.State}}")
+	out := run(t, "podman", "ps", "-a", "--filter", "label=sbx.managed=true", "--filter", "label=sbx.host_id="+e.hostID,
+		"--format", "{{.Names}} {{.State}}")
 	found := map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		name, state, ok := strings.Cut(strings.TrimSpace(line), " ")
@@ -226,13 +226,48 @@ func (e *env) cleanup() {
 		_ = e.cmd.Process.Kill()
 		<-e.done
 	}
-	entries, _ := os.ReadDir(e.runDir)
-	for _, en := range entries {
-		if strings.HasPrefix(en.Name(), "sb-") {
-			_ = exec.Command("podman", "rm", "-f", "-t", "0", "sbx-"+en.Name()).Run()
+	// Whatever still carries this run's host id is this run's.
+	if out, err := exec.Command("podman", "ps", "-a", "-q", "--filter", "label=sbx.host_id="+e.hostID).Output(); err == nil {
+		if ids := strings.Fields(string(out)); len(ids) > 0 {
+			_ = exec.Command("podman", append([]string{"rm", "-f", "-t", "0"}, ids...)...).Run()
 		}
 	}
 	_ = os.RemoveAll(e.runDir)
+}
+
+// watchOOMFile cleans up after conmon. When a container is OOM-killed,
+// conmon (2.1.10) creates an empty file named "oom" in its working
+// directory. Podman 4.9.3 sets neither a working directory nor
+// --persist-dir for conmon, so that is the working directory of whatever
+// started the container: for a sandbox the Podman API service (the user's
+// home, when systemd socket-activates it), for a `podman run` of this
+// test the test's own directory. Nothing in the create request moves it
+// and sbxd cannot move the service, so the test removes the file
+// afterwards, and only when it was not there before, is empty and is a
+// regular file. (An operator can give podman.service a WorkingDirectory
+// in a systemd drop-in to send it elsewhere.)
+func watchOOMFile(t *testing.T) {
+	t.Helper()
+	var dirs []string
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, home)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, wd)
+	}
+	for _, dir := range dirs {
+		path := filepath.Join(dir, "oom")
+		if _, err := os.Lstat(path); err == nil {
+			continue // not this test's to remove
+		}
+		t.Cleanup(func() {
+			if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() && fi.Size() == 0 {
+				if os.Remove(path) == nil {
+					t.Logf("removed %s, left by conmon for an OOM-killed container", path)
+				}
+			}
+		})
+	}
 }
 
 // --- HTTP client ---------------------------------------------------------------
@@ -242,6 +277,10 @@ type client struct {
 	base string
 	key  string
 	hc   *http.Client
+	// metricsBase and metricsToken say where GET /metrics lives when it
+	// is not on the API listener (--metrics-listen, --metrics-token).
+	metricsBase  string
+	metricsToken string
 }
 
 type result struct {
@@ -446,8 +485,28 @@ func lastEvent(events []streamEvent) streamEvent {
 // prefix (a metric name with its full label set), or -1.
 func (c *client) metric(prefix string) float64 {
 	c.t.Helper()
-	r := c.do("GET", "/metrics", nil, "")
-	for _, line := range strings.Split(string(r.Body), "\n") {
+	var body []byte
+	if c.metricsBase == "" {
+		body = c.do("GET", "/metrics", nil, "").Body
+	} else {
+		req, err := http.NewRequest("GET", c.metricsBase+"/metrics", nil)
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		if c.metricsToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.metricsToken)
+		}
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			c.t.Fatalf("GET %s/metrics: %v", c.metricsBase, err)
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			c.t.Fatalf("GET %s/metrics: %d %s", c.metricsBase, resp.StatusCode, body)
+		}
+	}
+	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(line, prefix+" ") {
 			v, err := strconv.ParseFloat(strings.TrimPrefix(line, prefix+" "), 64)
 			if err == nil {

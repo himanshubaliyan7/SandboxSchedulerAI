@@ -184,37 +184,109 @@ func (c *Controller) startCreate(ctx context.Context, tmpl core.Template) error 
 	return nil
 }
 
-// runCreate makes the run dir, creates the instance, waits for the agent
-// and only then marks the row WARM. Any failure ends in FAILED and an
-// immediate teardown.
+// createOnce is one attempt at bringing a CREATING row's instance up:
+// make the run dir, create the instance, wait for the agent. On failure
+// it returns whatever instance the backend reported, for cleanup.
+func (c *Controller) createOnce(ctx context.Context, sb core.Sandbox, tmpl core.Template) (inst runtime.Instance, err error) {
+	runDir := c.RunDir(sb.ID)
+	if err = os.MkdirAll(c.cfg.RunDirBase, 0o700); err != nil {
+		return inst, fmt.Errorf("create run dir base: %w", err)
+	}
+	if err = os.Mkdir(runDir, 0o700); err != nil {
+		return inst, fmt.Errorf("create run dir: %w", err)
+	}
+	if err = os.Chmod(runDir, 0o700); err != nil { // Mkdir is subject to the umask
+		return inst, fmt.Errorf("chmod run dir: %w", err)
+	}
+	inst, err = c.backend.Create(ctx, runtime.Spec{
+		SandboxID: sb.ID, HostID: c.cfg.HostID, Generation: sb.Generation, AgentEpoch: c.cfg.AgentEpoch, Template: tmpl,
+		HostRunDir: runDir, AgentBinaryPath: c.cfg.AgentBinaryPath,
+	})
+	if err != nil {
+		return inst, fmt.Errorf("backend create: %w", err)
+	}
+	if err = c.agent.WaitReady(ctx, runDir); err != nil {
+		return inst, fmt.Errorf("agent readiness: %w", err)
+	}
+	return inst, nil
+}
+
+// cleanFailedAttempt removes what a failed create attempt left behind so
+// that the next attempt starts from nothing: the instance the backend
+// reported, any other instance of this host labelled with the sandbox id
+// (a create that failed half-way reports none, and its container would
+// make the next one fail on the name), and the run dir with its stale
+// socket. It reports whether the slate is clean.
+func (c *Controller) cleanFailedAttempt(sb core.Sandbox, inst runtime.Instance) error {
+	ctx, cancel := c.cleanupCtx()
+	defer cancel()
+	ids := map[string]struct{}{}
+	if inst.ID != "" {
+		ids[inst.ID] = struct{}{}
+	}
+	list, err := c.ownInstances(ctx)
+	if err != nil {
+		return fmt.Errorf("list instances: %w", err)
+	}
+	for _, in := range list {
+		if in.SandboxID == sb.ID {
+			ids[in.ID] = struct{}{}
+		}
+	}
+	for id := range ids {
+		if err := c.backend.Destroy(ctx, id); err != nil {
+			return fmt.Errorf("destroy instance %s: %w", id, err)
+		}
+	}
+	if err := os.RemoveAll(c.RunDir(sb.ID)); err != nil {
+		return fmt.Errorf("remove run dir: %w", err)
+	}
+	return nil
+}
+
+// runCreate brings the instance up and only then marks the row WARM.
+//
+// A failed attempt is retried, up to Config.CreateAttempts attempts in
+// all, after its leftovers have been removed. Container start fails now
+// and then for reasons that have nothing to do with the template (for one,
+// crun's write of the net.ipv4.ping_group_range sysctl returned EINVAL in
+// 2 of 640 concurrent starts on Podman 4.9.3), and a second attempt
+// succeeds. The retries all happen under the row's one CREATING deadline
+// and before anything is recorded: only when the last attempt has failed,
+// or the deadline or a shutdown ends the create, does the row go FAILED
+// (and get torn down) and the circuit breaker count one failure.
 func (c *Controller) runCreate(ctx context.Context, sb core.Sandbox, tmpl core.Template) {
 	var (
-		start  = c.clock.Now()
-		runDir = c.RunDir(sb.ID)
-		inst   runtime.Instance
+		start = c.clock.Now()
+		inst  runtime.Instance
+		err   error
 	)
-	err := func() (err error) {
-		if err = os.MkdirAll(c.cfg.RunDirBase, 0o700); err != nil {
-			return fmt.Errorf("create run dir base: %w", err)
+	for attempt := 1; ; attempt++ {
+		if inst, err = c.createOnce(ctx, sb, tmpl); err == nil {
+			break
 		}
-		if err = os.Mkdir(runDir, 0o700); err != nil {
-			return fmt.Errorf("create run dir: %w", err)
+		if attempt >= c.cfg.CreateAttempts || ctx.Err() != nil {
+			break
 		}
-		if err = os.Chmod(runDir, 0o700); err != nil { // Mkdir is subject to the umask
-			return fmt.Errorf("chmod run dir: %w", err)
+		if cerr := c.cleanFailedAttempt(sb, inst); cerr != nil {
+			// Not retrying on top of leftovers; failCreate tears down.
+			err = fmt.Errorf("%w (and the cleanup before a retry failed: %v)", err, cerr)
+			break
 		}
-		inst, err = c.backend.Create(ctx, runtime.Spec{
-			SandboxID: sb.ID, Generation: sb.Generation, AgentEpoch: c.cfg.AgentEpoch, Template: tmpl,
-			HostRunDir: runDir, AgentBinaryPath: c.cfg.AgentBinaryPath,
-		})
-		if err != nil {
-			return fmt.Errorf("backend create: %w", err)
+		inst = runtime.Instance{}
+		c.mu.Lock()
+		c.m.CreateRetries++
+		c.mu.Unlock()
+		c.log.Warn("sandbox create attempt failed; retrying", "sandbox", sb.ID, "template", tmpl.ID,
+			"attempt", attempt, "of", c.cfg.CreateAttempts, "err", err)
+		select {
+		case <-c.clock.After(c.cfg.CreateRetryBackoff << (attempt - 1)):
+		case <-ctx.Done():
 		}
-		if err = c.agent.WaitReady(ctx, runDir); err != nil {
-			return fmt.Errorf("agent readiness: %w", err)
+		if ctx.Err() != nil {
+			break // err still names the failed attempt
 		}
-		return nil
-	}()
+	}
 	if err == nil {
 		dctx, cancel := c.cleanupCtx()
 		_, err = c.store.MarkWarm(dctx, sb.ID, sb.Generation, inst.ID)

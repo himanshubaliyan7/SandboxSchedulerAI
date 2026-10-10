@@ -192,9 +192,11 @@ paths:
           in: query
           description: |
             Comma-separated states to include (`assigned`, `running`,
-            `paused`, `recycling`, `destroyed`, `failed`, `unknown`), or
-            `all`. Default: `assigned,running,paused`. Destroyed sandboxes
-            are kept for 7 days.
+            `recycling`, `destroyed`, `failed`, `unknown`), or `all`.
+            Default: `assigned,running`, i.e. the sandboxes the tenant
+            still holds. Destroyed sandboxes are kept for 7 days. (The
+            value `paused`, listed by earlier versions of this document,
+            is still accepted and matches nothing a client can observe.)
           schema: { type: string }
         - name: template_id
           in: query
@@ -238,11 +240,36 @@ paths:
       operationId: deleteSandbox
       summary: Kill and destroy a sandbox
       description: |
-        Synchronous: when it returns, the container has been killed
-        (SIGKILL, no grace period) and removed with all of its storage.
-        Idempotent: deleting a sandbox that is already terminated is `204`.
+        Asynchronous by default: the `204` is sent as soon as the sandbox
+        is fenced, which means its state is `recycling` with reason
+        `released`, its access token no longer works, every data-plane
+        route answers `409 sandbox_not_running`, its egress is detached
+        and it no longer counts against the tenant's concurrency quota.
+        The container is then killed (SIGKILL, no grace period) and
+        removed with all of its storage in the background, normally
+        within a few hundred milliseconds; the state then becomes
+        `destroyed`. A client that needs to know when that has happened
+        polls `GET /v1/sandboxes/{id}` or passes `wait=true`. The
+        destruction cannot be lost: if the background step fails or the
+        server restarts, it is retried until it succeeds.
+
+        With `wait=true` the response is sent only after the teardown has
+        been attempted, as this route did before the parameter existed;
+        the sandbox is then normally `destroyed` (it stays `recycling`,
+        and is retried in the background, only if the removal failed).
+
+        Idempotent: deleting a sandbox that is already terminated, or
+        already being destroyed, is `204`.
+      parameters:
+        - name: wait
+          in: query
+          description: |
+            `true`: answer after the container has been removed. `false`
+            (default): answer once the sandbox is fenced.
+          schema: { type: boolean, default: false }
       responses:
-        "204": { description: Destroyed (reason `released`). }
+        "204": { description: "Released (reason `released`): fenced and being destroyed, or with `wait=true` destroyed." }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/RateLimited" }
@@ -733,7 +760,14 @@ paths:
       operationId: metrics
       summary: Prometheus metrics (text exposition format 0.0.4)
       description: |
-        Not authenticated; expose the listener accordingly. Series:
+        Not authenticated by default, which the server only allows while
+        the API listens on a loopback address. When the server is started
+        with `--metrics-token`, this route requires
+        `Authorization: Bearer <that token>` (tenant API keys and sandbox
+        access tokens are not accepted) and answers `401` otherwise. When
+        it is started with `--metrics-listen`, the route is not served on
+        the API listener at all (`404`) but on that separate address,
+        with the same optional token. Series:
         `sbx_http_requests_total{method,route,code}`,
         `sbx_http_request_duration_seconds{method,route}` (histogram),
         `sbx_http_active_streams{kind}` (`ndjson`, `wait`, `ws`),
@@ -743,7 +777,8 @@ paths:
         `sbx_pool_create_breaker_open{template}`, `sbx_pool_claims_total{result}`,
         `sbx_pool_claims_waited_total`, `sbx_pool_claim_wait_seconds` (histogram),
         `sbx_pool_releases_total`, `sbx_pool_creates_total`,
-        `sbx_pool_create_failures_total`, `sbx_pool_destroyed_total`,
+        `sbx_pool_create_failures_total`, `sbx_pool_create_retries_total`,
+        `sbx_pool_destroyed_total`,
         `sbx_pool_orphans_destroyed_total`, `sbx_pool_instances_lost_total`,
         `sbx_pool_adopted_total`, `sbx_pool_reconcile_failures_total`,
         `sbx_pool_terminations_total{reason}`,
@@ -752,11 +787,17 @@ paths:
         `sbx_egress_requests_total{verdict}` (`allowed`, `denied`, `error`),
         `sbx_egress_decisions_total{verdict,reason}`,
         `sbx_egress_bytes_total{direction}`.
-      security: []
+      security: [{}, { MetricsToken: [] }]
       responses:
         "200":
           description: Metrics.
           content: { text/plain: { schema: { type: string } } }
+        "401":
+          description: "`unauthorized`: the server requires a metrics token and the request has none or a wrong one."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "404":
+          description: "`not_found`: the metrics are served on a separate listener (`--metrics-listen`)."
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
 
 components:
   securitySchemes:
@@ -765,6 +806,7 @@ components:
     AccessToken: { type: apiKey, in: header, name: X-Access-Token, description: "Sandbox access token (data-plane routes of that sandbox only)." }
     BearerToken: { type: http, scheme: bearer, description: "Sandbox access token as a bearer token (recognised by its `sbt_` prefix)." }
     QueryToken: { type: apiKey, in: query, name: token, description: "Sandbox access token in the URL, for clients that cannot set headers." }
+    MetricsToken: { type: http, scheme: bearer, description: "Operator-chosen metrics token (`--metrics-token`), for `GET /metrics` only. Not a tenant credential." }
     WSSubprotocolToken: { type: apiKey, in: header, name: Sec-WebSocket-Protocol, description: "`sbx.v1, sbx.token.<access token>`." }
   headers:
     RetryAfter:
@@ -867,12 +909,13 @@ components:
           description: "Code-specific. `state` and `reason` for `sandbox_not_running` and `sandbox_terminated`; `class` for `rate_limited`; `max_timeout_ms` for `invalid_timeout`."
     SandboxState:
       type: string
-      enum: [assigned, running, paused, recycling, destroyed, failed, unknown]
+      enum: [assigned, running, recycling, destroyed, failed, unknown]
       description: |
-        `assigned` (transient, being initialised), `running`, `paused`
-        (reserved; no route pauses a sandbox yet), `failed` and `unknown`
-        (transient, on the way to destruction), `recycling` (being
-        destroyed), `destroyed` (terminal).
+        `assigned` (transient, being initialised), `running`, `failed`
+        and `unknown` (transient, on the way to destruction), `recycling`
+        (fenced and being destroyed: no longer usable), `destroyed`
+        (terminal). Earlier versions of this document also listed
+        `paused`; no route could reach it and the API never returns it.
     TerminationReason:
       type: string
       enum: [released, idle_timeout, max_lifetime, oom_killed, instance_lost, deadline_exceeded, host_drain, error, create_failed, warm_ttl, template_changed, orphan]

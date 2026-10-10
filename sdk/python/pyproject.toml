@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sbx"
+description = "Python SDK for SandboxSchedulerAI: run LLM-generated code in warm, self-hosted sandboxes"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dynamic = ["version"]
+keywords = ["sandbox", "code-interpreter", "llm", "agents", "podman"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    # HTTP/1.1 client with sync and async APIs, streaming bodies in both
+    # directions and pluggable transports (used by the tests).
+    "httpx>=0.27,<1",
+    # WebSocket client with sync and async APIs, for the PTY path.
+    "websockets>=14,<18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+]
+
+[tool.hatch.version]
+path = "src/sbx/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sbx"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "scripts", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: integration tests against a real sbxd server (need SBX_LIVE_BASE_URL and SBX_LIVE_API_KEY)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
+ignore = [
+    "ASYNC109", # `timeout` parameters mirror the E2B SDK surface
+    "SIM105",   # try/except/pass around an awaited close reads better than suppress()
+    "UP007",    # type aliases evaluated at runtime keep typing.Union for Python 3.10
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ASYNC", "B017", "E501"]
+
+[tool.pyright]
+include = ["src", "tests", "examples", "scripts"]
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
+reportPrivateUsage = false
+reportUnnecessaryIsInstance = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false

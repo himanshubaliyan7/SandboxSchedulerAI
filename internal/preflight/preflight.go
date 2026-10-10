@@ -124,6 +124,7 @@ const (
 	CheckUserNamespaces   = "user_namespaces"
 	CheckAppArmorUserns   = "apparmor_userns"
 	CheckInotify          = "inotify_instances"
+	CheckKeys             = "kernel_keys"
 	CheckNofile           = "nofile_rlimit"
 	CheckKernel           = "kernel_version"
 	CheckPodman           = "podman_binary"
@@ -174,6 +175,22 @@ type Options struct {
 	MinSubIDs           int64  // default 65536
 	MinInotifyInstances int64  // default 1024
 	MinNofile           uint64 // default 65536 (soft limit)
+	// MinKeyHeadroom is how many more kernel keys the user must be able
+	// to hold before the keys check stops warning, when PlannedSandboxes
+	// is not known. Default 1024.
+	MinKeyHeadroom int64
+
+	// PlannedSandboxes is how many sandboxes the configured pools may
+	// run at once (the sum of the templates' max_total). When positive,
+	// the per-user quotas that every running sandbox draws on (kernel
+	// keys, inotify instances) are compared with it instead of with the
+	// fixed thresholds. Zero means unknown.
+	PlannedSandboxes int64
+	// InotifyInUse returns how many inotify instances the user holds
+	// now. Default: count the anon_inode:inotify descriptors of the
+	// user's processes in /proc. It is only called when PlannedSandboxes
+	// is positive.
+	InotifyInUse func() (int64, error)
 }
 
 // Controllers the pool user must (and should) have delegated.
@@ -193,6 +210,10 @@ type env struct {
 // Run performs every check and returns the report. It does not modify
 // the host.
 func Run(ctx context.Context, opts Options) Report {
+	return newEnv(ctx, opts).run()
+}
+
+func newEnv(ctx context.Context, opts Options) env {
 	e := env{Options: opts, ctx: ctx}
 	if e.Root == "" {
 		e.Root = "/"
@@ -238,7 +259,26 @@ func Run(ctx context.Context, opts Options) Report {
 	if e.MinNofile == 0 {
 		e.MinNofile = 65536
 	}
+	if e.MinKeyHeadroom == 0 {
+		e.MinKeyHeadroom = 1024
+	}
+	if e.InotifyInUse == nil {
+		e.InotifyInUse = func() (int64, error) { return inotifyInUse(e.UID) }
+	}
 
+	return e
+}
+
+// Capacity runs only the checks of the per-user quotas that every
+// running sandbox draws on (kernel keys, inotify instances), against
+// opts.PlannedSandboxes. The server calls it once it knows how large its
+// pools may grow, which it does not when Run is called.
+func Capacity(ctx context.Context, opts Options) Report {
+	e := newEnv(ctx, opts)
+	return Report{Checks: []Check{e.keys(), e.inotify()}}
+}
+
+func (e env) run() Report {
 	return Report{Checks: []Check{
 		e.cgroupV2(),
 		e.cgroupDelegation(),
@@ -251,6 +291,7 @@ func Run(ctx context.Context, opts Options) Report {
 		e.userNamespaces(),
 		e.appArmorUserns(),
 		e.inotify(),
+		e.keys(),
 		e.nofile(),
 		e.kernel(),
 		e.podman(),
@@ -461,18 +502,193 @@ func (e env) appArmorUserns() Check {
 		"install the distribution's podman package (it ships the profile), add a profile granting `userns,` to the podman binary in use, or as root: sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
 }
 
-// inotify: instances are a per-user limit shared by every sandbox.
+// inotify: instances are a per-user limit shared by every sandbox. Each
+// running sandbox holds one (conmon's), so with a known pool size the
+// check is headroom against that size; otherwise a fixed threshold.
 func (e env) inotify() Check {
 	const p = "/proc/sys/fs/inotify/max_user_instances"
 	n, err := e.readInt(p)
 	if err != nil {
 		return warn(CheckInotify, fmt.Sprintf("cannot read %s: %v", p, errText(err)), "")
 	}
+	if e.PlannedSandboxes > 0 {
+		used, err := e.InotifyInUse()
+		if err != nil {
+			return warn(CheckInotify, fmt.Sprintf("fs.inotify.max_user_instances=%d; cannot count the instances in use: %v", n, errText(err)), "")
+		}
+		detail := fmt.Sprintf("fs.inotify.max_user_instances=%d, %d in use by %s: room for %d more; each running sandbox holds one, and the pools may run %d",
+			n, used, e.userOrUID(), max(n-used, 0), e.PlannedSandboxes)
+		if n-used < e.PlannedSandboxes {
+			return warn(CheckInotify, detail+" (instances held by sandboxes that are already running are counted as in use)",
+				fmt.Sprintf("as root: sysctl -w fs.inotify.max_user_instances=%d (persist it in /etc/sysctl.d), or lower the templates' max_total",
+					max(e.MinInotifyInstances*8, 2*(used+e.PlannedSandboxes))))
+		}
+		return ok(CheckInotify, detail)
+	}
 	if n < e.MinInotifyInstances {
 		return warn(CheckInotify, fmt.Sprintf("fs.inotify.max_user_instances=%d (< %d): shared by all sandboxes of the user, a dense pool will exhaust it", n, e.MinInotifyInstances),
 			fmt.Sprintf("as root: sysctl -w fs.inotify.max_user_instances=%d (persist it in /etc/sysctl.d)", e.MinInotifyInstances*8))
 	}
 	return ok(CheckInotify, fmt.Sprintf("fs.inotify.max_user_instances=%d", n))
+}
+
+// inotifyInUse counts the inotify instances held by the processes of uid.
+// Processes that cannot be inspected are skipped, so it can undercount.
+func inotifyInUse(uid int) (int64, error) {
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	for _, p := range procs {
+		if _, err := strconv.Atoi(p.Name()); err != nil || !p.IsDir() {
+			continue
+		}
+		dir := filepath.Join("/proc", p.Name())
+		fi, err := os.Stat(dir)
+		if err != nil {
+			continue
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != uid {
+			continue
+		}
+		fds, err := os.ReadDir(filepath.Join(dir, "fd"))
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			if target, err := os.Readlink(filepath.Join(dir, "fd", fd.Name())); err == nil && target == "anon_inode:inotify" {
+				n++
+			}
+		}
+	}
+	return n, nil
+}
+
+const keyringFix = "set `keyring = false` under `[containers]` in ~/.config/containers/containers.conf and restart the Podman service " +
+	"(`systemctl --user restart podman.service`) so that containers stop taking a session keyring, " +
+	"or as root raise the quota: sysctl -w kernel.keys.maxkeys=<n> (persist it in /etc/sysctl.d); " +
+	"until then keep the sum of the templates' max_total below the room that is left"
+
+// keys: kernel keyrings are a per-user quota (kernel.keys.maxkeys, 200
+// for a non-root user by default). Unless the Podman service runs with
+// `keyring = false`, the OCI runtime creates one session keyring per
+// container, so the quota is a hard ceiling on running sandboxes that is
+// reached long before memory is: the next start fails with
+// "crun: create keyring ...: Disk quota exceeded". The Libpod API has no
+// per-container switch for it (see package podman), so this check can
+// only report the ceiling and how to lift it.
+func (e env) keys() Check {
+	const p = "/proc/sys/kernel/keys/maxkeys"
+	maxKeys, err := e.readInt(p)
+	if err != nil {
+		return warn(CheckKeys, fmt.Sprintf("cannot read %s: %v", p, errText(err)), "")
+	}
+	used, err := e.keysInUse()
+	if err != nil {
+		return warn(CheckKeys, fmt.Sprintf("kernel.keys.maxkeys=%d; cannot read the user's usage from /proc/key-users: %v", maxKeys, errText(err)), "")
+	}
+	room := max(maxKeys-used, 0)
+	if file := e.keyringDisabledIn(); file != "" {
+		return ok(CheckKeys, fmt.Sprintf("kernel.keys.maxkeys=%d, %d in use by %s; %s sets keyring = false, so sandboxes take no key "+
+			"(provided the Podman service was started after that was set)", maxKeys, used, e.userOrUID(), file))
+	}
+	detail := fmt.Sprintf("kernel.keys.maxkeys=%d, %d in use by %s: at most %d more containers can run for this user (one session keyring each)",
+		maxKeys, used, e.userOrUID(), room)
+	switch {
+	case e.PlannedSandboxes > 0 && room < e.PlannedSandboxes:
+		return warn(CheckKeys, fmt.Sprintf("%s, but the pools may run %d sandboxes (the sum of the templates' max_total); "+
+			"creates beyond the ceiling will fail (keys held by sandboxes that are already running are counted as in use)", detail, e.PlannedSandboxes), keyringFix)
+	case e.PlannedSandboxes > 0:
+		return ok(CheckKeys, fmt.Sprintf("%s; the pools may run %d", detail, e.PlannedSandboxes))
+	case room < e.MinKeyHeadroom:
+		return warn(CheckKeys, detail, keyringFix)
+	}
+	return ok(CheckKeys, detail)
+}
+
+// keysInUse is the number of keys charged to the user's quota: the
+// "qnkeys" of its line in /proc/key-users, whose format is
+//
+//	<uid>: <usage> <nkeys>/<nikeys> <qnkeys>/<maxkeys> <qnbytes>/<maxbytes>
+//
+// A user with no line holds none.
+func (e env) keysInUse() (int64, error) {
+	raw, err := e.read("/proc/key-users")
+	if err != nil {
+		return 0, err
+	}
+	prefix := strconv.Itoa(e.UID) + ":"
+	for _, line := range strings.Split(raw, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[0] != prefix {
+			continue
+		}
+		q, _, found := strings.Cut(f[3], "/")
+		n, err := strconv.ParseInt(q, 10, 64)
+		if !found || err != nil {
+			return 0, fmt.Errorf("unexpected line %q", line)
+		}
+		return n, nil
+	}
+	return 0, nil
+}
+
+// keyringDisabledIn returns the containers.conf file that turns the
+// per-container keyring off for the pool user, or "". The files are read
+// in the order Podman merges them, so the last one that sets the key
+// wins. This is a best-effort reading of the files, not of the running
+// service, which may have been started with CONTAINERS_CONF_OVERRIDE or
+// before the file was changed.
+func (e env) keyringDisabledIn() string {
+	files := []string{"/usr/share/containers/containers.conf", "/etc/containers/containers.conf"}
+	dropIns := func(dir string) {
+		entries, _ := os.ReadDir(e.path(dir))
+		for _, en := range entries { // ReadDir sorts by name, as Podman does
+			if strings.HasSuffix(en.Name(), ".conf") {
+				files = append(files, filepath.Join(dir, en.Name()))
+			}
+		}
+	}
+	dropIns("/etc/containers/containers.conf.d")
+	cfgHome := e.Getenv("XDG_CONFIG_HOME")
+	if cfgHome == "" {
+		if home := e.Getenv("HOME"); home != "" {
+			cfgHome = filepath.Join(home, ".config")
+		}
+	}
+	if cfgHome != "" {
+		files = append(files, filepath.Join(cfgHome, "containers", "containers.conf"))
+		dropIns(filepath.Join(cfgHome, "containers", "containers.conf.d"))
+	}
+	disabledIn := ""
+	for _, f := range files {
+		raw, err := e.read(f)
+		if err != nil {
+			continue
+		}
+		section := ""
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if i := strings.IndexByte(line, '#'); i >= 0 {
+				line = strings.TrimSpace(line[:i])
+			}
+			if strings.HasPrefix(line, "[") {
+				section = strings.Trim(line, "[] ")
+				continue
+			}
+			k, v, found := strings.Cut(line, "=")
+			if !found || section != "containers" || strings.TrimSpace(k) != "keyring" {
+				continue
+			}
+			if strings.TrimSpace(v) == "false" {
+				disabledIn = f
+			} else {
+				disabledIn = ""
+			}
+		}
+	}
+	return disabledIn
 }
 
 func (e env) nofile() Check {

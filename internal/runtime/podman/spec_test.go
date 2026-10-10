@@ -26,6 +26,7 @@ func testCfg(t *testing.T, mutate func(*Config)) Config {
 func testSpec() runtime.Spec {
 	return runtime.Spec{
 		SandboxID:  "sb-123",
+		HostID:     "host-a",
 		Generation: 4,
 		AgentEpoch: "epoch-9",
 		Template: core.Template{
@@ -49,12 +50,13 @@ const wantCreateJSON = `{
   "image": "registry.example/py:3.12",
   "entrypoint": ["/usr/local/bin/sbx-agent"],
   "command": ["serve", "--socket", "/run/sbx/agent.sock"],
-  "env": {"HOME": "/workspace", "TMPDIR": "/tmp"},
+  "env": {"HOME": "/workspace", "PYTHONPYCACHEPREFIX": "/tmp/pycache", "TMPDIR": "/tmp"},
   "work_dir": "/workspace",
   "hostname": "sandbox",
   "labels": {
     "sbx.agent_epoch": "epoch-9",
     "sbx.generation": "4",
+    "sbx.host_id": "host-a",
     "sbx.managed": "true",
     "sbx.sandbox_id": "sb-123",
     "sbx.template_id": "py312"
@@ -263,6 +265,8 @@ func TestSpecVariants(t *testing.T) {
 func TestBuildCreateSpecRejects(t *testing.T) {
 	for name, mutate := range map[string]func(*runtime.Spec){
 		"empty sandbox id":   func(s *runtime.Spec) { s.SandboxID = "" },
+		"empty host id":      func(s *runtime.Spec) { s.HostID = "" },
+		"bad host id":        func(s *runtime.Spec) { s.HostID = "host a" },
 		"bad sandbox id":     func(s *runtime.Spec) { s.SandboxID = "a/b" },
 		"no image":           func(s *runtime.Spec) { s.Template.Image = "" },
 		"relative run dir":   func(s *runtime.Spec) { s.HostRunDir = "run" },
