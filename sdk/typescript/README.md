@@ -315,6 +315,62 @@ A `ReadableStream` upload needs a runtime with streaming request bodies
 (Node, Deno, Bun, workerd; in browsers only Chromium over HTTP/2) and cannot
 be retried automatically — use a `Blob` in browsers.
 
+## Webhooks
+
+Instead of polling, let the server call you when a sandbox is created, starts
+running, terminates, or a command finishes. Managing webhooks needs the tenant
+API key:
+
+```ts
+import { Webhooks } from 'sbx-sdk'
+
+const webhooks = new Webhooks() // apiKey / baseUrl as for Sandbox
+const hook = await webhooks.create('https://hooks.example.com/warmbox', {
+  eventTypes: ['sandbox.terminated', 'command.finished'], // omit for all
+})
+saveSomewhereSafe(hook.secret) // whsec_...; the server shows it this once
+
+await webhooks.test(hook.webhookId) // sends a webhook.test event now -> { delivered, status, ... }
+await webhooks.update(hook.webhookId, { enabled: false }) // url, eventTypes, description, enabled
+await webhooks.get(hook.webhookId) // consecutiveFailures, failingSince, droppedEvents, ...
+await webhooks.deliveries(hook.webhookId, { limit: 20 }) // recent attempts
+await webhooks.rotateSecret(hook.webhookId) // new .secret; the old one keeps signing for 24h
+await webhooks.list()
+await webhooks.delete(hook.webhookId)
+```
+
+`secret` is a non-enumerable property: `JSON.stringify(hook)` and `console.log(hook)` do not print it.
+
+In the handler that receives the requests, verify each one before you use it.
+`verifyWebhook` needs no client and no network, only WebCrypto, so it runs on
+Node 20+, Deno, Bun, Cloudflare Workers and in browsers. Pass it the **raw**
+body (a string or bytes, never a parsed object), the headers and the secret:
+
+```ts
+import { verifyWebhook, WebhookVerificationError } from 'sbx-sdk'
+
+export async function handler(request: Request): Promise<Response> {
+  try {
+    const event = await verifyWebhook(await request.text(), request.headers, WEBHOOK_SECRET)
+    if (event.type === 'sandbox.terminated') console.log(event.sandboxId, event.data.reason)
+    return new Response(null, { status: 204 })
+  } catch (e) {
+    if (e instanceof WebhookVerificationError) return new Response(null, { status: 400 })
+    throw e
+  }
+}
+```
+
+`headers` may be a `Headers` object, Node's `req.headers` or a plain record.
+The signature (HMAC-SHA256) is checked by `crypto.subtle.verify`, in constant
+time, and a `Webhook-Timestamp` more than `toleranceSeconds` (300 by default)
+from the local clock is refused. The signatures follow the
+[Standard Webhooks](https://www.standardwebhooks.com) specification, so that
+project's `standardwebhooks` package verifies them too. Deliveries are at
+least once: deduplicate on `event.id`. The event catalogue, the retry schedule
+and what happens when your endpoint is down are in
+[`docs/webhooks.md`](../../docs/webhooks.md).
+
 ## Errors
 
 Every error from the server is a `SandboxError` subclass with `code` (the

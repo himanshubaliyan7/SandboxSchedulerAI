@@ -25,6 +25,7 @@ const adminUsage = `usage: sbxd admin <resource> <action> [flags]
   tenant   create | update | list | delete
   key      create | list | revoke
   template apply | list | show | delete
+  webhook  create | list | delete
   host     destroy
 
 Every action takes --database-url (or SBX_DATABASE_URL) and --json.
@@ -36,6 +37,8 @@ examples:
       --cpus 1 --memory 512m --pids 256 --workdir-size 128m --tmp-size 64m \
       --network allowlist --idle-timeout 10m --max-lifetime 1h --warm-target 3 --max-total 20
   sbxd admin template apply --file templates.json   # one object or an array
+  sbxd admin webhook create --tenant acme --url https://hooks.example.com/warmbox \
+      --events sandbox.terminated,command.finished   # prints the signing secret once
   sbxd admin host destroy --run-dir /run/user/1000/sbx   # server stopped: remove its containers,
                                                          # run dirs and live sandbox rows
 `
@@ -122,6 +125,12 @@ func cmdAdmin(args []string, stdout, stderr io.Writer) error {
 		return adminTemplateShow(a, rest)
 	case "template delete":
 		return adminTemplateDelete(a, rest)
+	case "webhook create":
+		return adminWebhookCreate(a, rest)
+	case "webhook list":
+		return adminWebhookList(a, rest)
+	case "webhook delete":
+		return adminWebhookDelete(a, rest)
 	case "host destroy":
 		return adminHostDestroy(a, rest)
 	}

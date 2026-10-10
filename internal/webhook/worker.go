@@ -196,6 +196,7 @@ type Worker struct {
 	wg    sync.WaitGroup
 	done  chan struct{} // closed when the poll loop has returned
 
+	pollMu    sync.Mutex // serialises polls: the loop, Drain and tests
 	startOnce sync.Once
 	stopOnce  sync.Once
 }
@@ -317,9 +318,16 @@ func (w *Worker) housekeeping(prune bool) {
 // every free slot, in which case more webhooks may be due. The poll loop
 // calls it; tests call it directly to step the worker.
 func (w *Worker) Poll(ctx context.Context) (saturated bool) {
+	_, saturated = w.poll(ctx)
+	return saturated
+}
+
+func (w *Worker) poll(ctx context.Context) (claimedN int, saturated bool) {
+	w.pollMu.Lock()
+	defer w.pollMu.Unlock()
 	free := cap(w.slots) - len(w.slots)
 	if free <= 0 {
-		return true
+		return 0, true
 	}
 	w.m.polled(w.cfg.Clock.Now())
 	claimed, err := w.cfg.Store.ClaimWebhooks(ctx, store.WebhookClaim{Limit: free, Lease: w.cfg.lease(), TenantID: w.cfg.TenantID})
@@ -327,10 +335,10 @@ func (w *Worker) Poll(ctx context.Context) (saturated bool) {
 		if ctx.Err() == nil {
 			w.log.Warn("could not claim webhooks", "err", err)
 		}
-		return false
+		return 0, false
 	}
 	for _, wh := range claimed {
-		w.slots <- struct{}{} // never blocks: at most `free` were claimed and only Poll adds
+		w.slots <- struct{}{} // never blocks: at most `free` were claimed, and polls are serialised
 		w.wg.Add(1)
 		w.m.flight(1)
 		go func() {
@@ -343,7 +351,29 @@ func (w *Worker) Poll(ctx context.Context) (saturated bool) {
 			w.deliver(wh)
 		}()
 	}
-	return len(claimed) == free
+	return len(claimed), len(claimed) == free
+}
+
+// Drain delivers what is due right now and returns when a poll finds
+// nothing more to claim and nothing is in flight, or when ctx ends. A
+// server calls it before Stop, so that the events of its own shutdown
+// (sandboxes released because the host is draining) are sent by the
+// process that produced them instead of waiting for the next start.
+// Webhooks that are backing off are not waited for.
+func (w *Worker) Drain(ctx context.Context) {
+	for ctx.Err() == nil && w.runCtx.Err() == nil {
+		n, _ := w.poll(ctx)
+		idle := make(chan struct{})
+		go func() { w.wg.Wait(); close(idle) }()
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			return
+		}
+		if n == 0 {
+			return
+		}
+	}
 }
 
 // Wait blocks until every delivery started by Poll has finished. Tests

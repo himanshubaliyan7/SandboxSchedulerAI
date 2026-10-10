@@ -324,7 +324,7 @@ func (c *Controller) lose(ctx context.Context, row core.Sandbox, reason core.Ter
 	c.mu.Lock()
 	c.m.InstancesLost++
 	c.mu.Unlock()
-	c.log.Warn("reconcile: sandbox lost", "sandbox", row.ID, "was", row.State, "tenant", row.TenantID, "reason", reason)
+	c.log.Warn("reconcile: sandbox lost", "sandbox", row.ID, "was", row.State, "tenant", row.TenantID, "reason", reason, "data", data)
 	if err := c.recycle(ctx, failed, "", nil); err != nil {
 		c.log.Warn("reconcile: recycle lost sandbox", "sandbox", row.ID, "err", err)
 	}

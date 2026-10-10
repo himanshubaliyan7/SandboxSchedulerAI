@@ -46,7 +46,7 @@ REPLACEMENTS: list[tuple[str, str]] = [
     (r"\baiter_bytes\b", "iter_bytes"),
     (r"\bhttpx\.AsyncClient\b", "httpx.Client"),
     (r"\bhttpx\.AsyncBaseTransport\b", "httpx.BaseTransport"),
-    (r"\bAsync(Sandbox|Commands|CommandHandle|Files|FileStream|PtyHandle|Pty|ApiClient)\b", r"\1"),
+    (r"\bAsync(Sandbox|Commands|CommandHandle|Files|FileStream|PtyHandle|Pty|ApiClient|Webhooks)\b", r"\1"),
     (r"\bsbx\._async\b", "sbx._sync"),
     (
         r"The asyncio flavour of the SDK\. ``sbx\._sync`` is generated from it\.",

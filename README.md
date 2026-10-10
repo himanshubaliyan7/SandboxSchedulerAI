@@ -296,6 +296,11 @@ events and Prometheus metrics. Two credentials exist: a tenant API key for the
 control plane, and a per-sandbox access token, returned at create, that only
 works on that sandbox's data-plane routes.
 
+Sandbox and command events can also be pushed to you: **lifecycle webhooks**
+are signed HTTPS callbacks (Standard Webhooks signatures), delivered in order
+and at least once, with retries. The event catalogue, verification examples
+and delivery guarantees are in [`docs/webhooks.md`](docs/webhooks.md).
+
 Running a server for real (host ids, shutdown policies, density limits, metrics,
 CORS) is covered in [`docs/operations.md`](docs/operations.md).
 
@@ -368,8 +373,8 @@ enough" objection answerable without changing the scheduler.
    `pip install`, fork-heavy shell) and publish it next to the crun numbers.
 3. Give `sbxd` its own private Podman service and config, which removes the
    190-sandbox ceiling and two smaller Podman quirks.
-4. Lifecycle webhooks, and migration guides from archived Daytona and from
-   self-hosted E2B.
+4. ~~Lifecycle webhooks~~ (done: [`docs/webhooks.md`](docs/webhooks.md)), and
+   migration guides from archived Daytona and from self-hosted E2B.
 5. Re-run everything on Podman 6 and on a server-class host.
 
 **After that: scale and a KVM tier.** Multi-host placement with leases and
@@ -400,6 +405,7 @@ The reasoning behind this order is in
 | `internal/pool` | Pool controller, refill, timers, sweeper and reconciler |
 | `internal/agentapi`, `internal/agentclient` | Host-to-agent wire contract and client |
 | `internal/egress` | Allowlist egress proxy |
+| `internal/webhook` | Lifecycle webhooks: delivery worker, signing, SSRF-safe sender |
 | `sdk/python`, `sdk/typescript` | Client SDKs (`sbx`, `sbx-sdk`) |
 | `test/e2e` | End-to-end tests against real Podman and Postgres |
 | `bench` | Benchmark harness and results |

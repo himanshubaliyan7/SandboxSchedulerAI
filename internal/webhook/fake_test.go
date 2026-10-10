@@ -25,3 +25,9 @@ func evTransition(sb string, from, to core.State, reason core.TerminationReason)
 func evCommand(sb string, n int) store.Event {
 	return store.Event{SandboxID: sb, Type: internalCommandFinished, Data: map[string]any{"pid": n, "cmd": "true", "exit_code": 0, "reason": "exited"}}
 }
+
+func webhookEventForInterop() store.WebhookEvent {
+	e := evTransition("sb-1", core.StateRunning, core.StateRecycling, core.ReasonIdleTimeout)
+	e.ID = 42
+	return store.WebhookEvent{Event: e, Txid: 42, TemplateID: "python", Metadata: map[string]string{"job": "9"}}
+}

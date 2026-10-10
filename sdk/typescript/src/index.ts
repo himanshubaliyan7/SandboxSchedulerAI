@@ -66,3 +66,17 @@ export type {
   TerminationReason,
 } from './types.js'
 export { VERSION } from './version.js'
+export type {
+  VerifyWebhookOptions,
+  WebhookCreateOptions,
+  WebhookDelivery,
+  WebhookEvent,
+  WebhookEventType,
+  WebhookHeaders,
+  WebhookInfo,
+  WebhookRotateOptions,
+  WebhookTestResult,
+  WebhookUpdateOptions,
+  WebhookWithSecret,
+} from './webhooks.js'
+export { verifyWebhook, WEBHOOK_EVENT_TYPES, Webhooks, WebhookVerificationError } from './webhooks.js'

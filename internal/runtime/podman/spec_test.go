@@ -206,7 +206,10 @@ func TestUsernsModes(t *testing.T) {
 
 func TestSpecVariants(t *testing.T) {
 	// Runtime selection.
-	cfg := testCfg(t, func(c *Config) { c.Runtimes = []string{"crun", "runsc"} })
+	cfg := testCfg(t, func(c *Config) {
+		c.Runtimes = []string{"crun", "runsc"}
+		c.RuntimeSockets = map[string]string{"runsc": "/g"}
+	})
 	spec := testSpec()
 	spec.Template.Runtime = "runsc"
 	s, err := buildCreateSpec(cfg, spec)
@@ -331,7 +334,7 @@ func TestCapabilitiesSharedKernel(t *testing.T) {
 		{[]string{"/usr/local/bin/runsc"}, "/usr/local/bin/runsc", false},
 		{[]string{"mystery"}, "mystery", true},
 	} {
-		b, err := New(Config{SocketPath: "/s", Runtimes: tc.runtimes, DefaultRuntime: tc.def})
+		b, err := New(Config{SocketPath: "/s", Runtimes: tc.runtimes, DefaultRuntime: tc.def, RuntimeSockets: map[string]string{"runsc": "/g"}})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -271,6 +271,60 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Webhooks
+
+Instead of polling, let the server call you when a sandbox is created, starts
+running, terminates, or a command finishes. Managing webhooks needs the tenant
+API key:
+
+```python
+from sbx import Webhooks
+
+with Webhooks() as webhooks:  # api_key / base_url as for Sandbox
+    hook = webhooks.create(
+        "https://hooks.example.com/warmbox",
+        event_types=["sandbox.terminated", "command.finished"],  # omit for all
+    )
+    save_somewhere_safe(hook.secret)  # whsec_...; the server shows it this once
+
+    webhooks.test(hook.id)  # sends a webhook.test event now -> .delivered, .status
+    webhooks.update(hook.id, enabled=False)  # url, event_types, description, enabled
+    webhooks.get(hook.id)  # consecutive_failures, failing_since, dropped_events, ...
+    webhooks.deliveries(hook.id, limit=20)  # recent attempts: status, response_status, error
+    webhooks.rotate_secret(hook.id)  # new .secret; the old one keeps signing for 24h
+    webhooks.list()
+    webhooks.delete(hook.id)
+```
+
+`AsyncWebhooks` is the same with `await`.
+
+In the handler that receives the requests, verify each one before you use it.
+`verify_webhook` needs no client and no network: pass it the **raw** body, the
+headers and the secret.
+
+```python
+from sbx import WebhookVerificationError, verify_webhook
+
+
+def handle(body: bytes, headers) -> int:  # your framework's raw body and headers
+    try:
+        event = verify_webhook(body, headers, WEBHOOK_SECRET)
+    except WebhookVerificationError:
+        return 400
+    if event.type == "sandbox.terminated":
+        print(event.sandbox_id, event.data.get("reason"))
+    return 204
+```
+
+It checks the HMAC-SHA256 signature in constant time and refuses a
+`Webhook-Timestamp` more than `tolerance` seconds (300 by default) from the
+local clock. The signatures follow the
+[Standard Webhooks](https://www.standardwebhooks.com) specification, so that
+project's `standardwebhooks` package verifies them too. Deliveries are at
+least once: deduplicate on `event.id`. The event catalogue, the retry schedule
+and what happens when your endpoint is down are in
+[`docs/webhooks.md`](../../docs/webhooks.md).
+
 ## Errors
 
 Every exception derives from `SbxError`. Server errors are `ApiError`

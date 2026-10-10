@@ -292,10 +292,31 @@ func (b *Backend) oomKilled(exitCode int, end time.Time, slack time.Duration) bo
 	return b.oom.killed(end, slack)
 }
 
+// exitSettle is how long inspect waits for a container whose process is
+// gone to reach the "exited" state. In between ("stopping", "stopped")
+// Podman has not yet recorded how it ended, and a caller that asked "why
+// did it die" would be told "exit code 0, not OOM-killed".
+const exitSettle = time.Second
+
 func (b *Backend) inspect(ctx context.Context, instanceID string) (runtime.Instance, inspectState, error) {
 	if instanceID == "" {
 		return runtime.Instance{}, inspectState{}, errors.New("podman: inspect: empty instance id")
 	}
+	deadline := time.Now().Add(exitSettle)
+	for {
+		inst, st, err := b.inspectOnce(ctx, instanceID)
+		if err != nil || (st.Status != "stopping" && st.Status != "stopped") || time.Now().After(deadline) {
+			return inst, st, err
+		}
+		select {
+		case <-ctx.Done():
+			return inst, st, nil
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func (b *Backend) inspectOnce(ctx context.Context, instanceID string) (runtime.Instance, inspectState, error) {
 	var data struct {
 		ID         string        `json:"Id"`
 		Created    time.Time     `json:"Created"`
@@ -318,7 +339,7 @@ func (b *Backend) inspect(ctx context.Context, instanceID string) (runtime.Insta
 		labels = data.Config.Labels
 	}
 	inst := instanceFrom(data.ID, labels, st.Running || st.Paused, data.Created)
-	if !inst.Running && st.Status == "exited" {
+	if !inst.Running && (st.Status == "exited" || st.Status == "stopped") {
 		inst.ExitCode = st.ExitCode
 		inst.OOMKilled = st.OOMKilled || b.oomKilled(st.ExitCode, st.FinishedAt, 0)
 	}

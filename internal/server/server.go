@@ -144,6 +144,9 @@ type Config struct {
 	CORSAllowedOrigins []string
 	CORSAllowAPIKey    bool
 
+	// Webhooks configures lifecycle webhooks; see WebhookConfig.
+	Webhooks WebhookConfig
+
 	// API settings; zero values take the api package's defaults.
 	MaxUploadBytes   int64
 	TouchInterval    time.Duration
@@ -510,11 +513,21 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer ctrl.Stop()
 
+	// Webhook delivery. It only reads the event log, so it runs next to
+	// the controller and outlives it during a shutdown (see below).
+	hooks, err := startWebhooks(cfg.Webhooks, st, log)
+	if err != nil {
+		return err
+	}
+	defer hooks.abort()
+
 	// 7. API.
 	apiSrv, err := api.New(api.Config{
 		Store: st, Pool: ctrl, Stats: backend, ValidatePolicy: egress.ValidatePolicy, Logger: log,
 		RuntimeInfo:  runtimeInfo(backend.Capabilities()),
-		ExtraMetrics: em.write, MetricsToken: cfg.MetricsToken, NoMetricsRoute: cfg.MetricsListen != "",
+		Webhooks:     hooks.service(),
+		ExtraMetrics: func(w io.Writer) { em.write(w); hooks.writeMetrics(w) },
+		MetricsToken: cfg.MetricsToken, NoMetricsRoute: cfg.MetricsListen != "",
 		Ready: func(ctx context.Context) error {
 			if err := st.Ping(ctx); err != nil {
 				return fmt.Errorf("store: %w", err)
@@ -627,6 +640,9 @@ func Run(ctx context.Context, cfg Config) error {
 		dcancel()
 	}
 	ctrl.Stop()
+	// Last, so that the events of this very shutdown (host_drain) are
+	// offered to the webhooks before the process goes.
+	hooks.stop(sctx)
 	egressMgr.Close()
 	log.Info("sbxd stopped")
 	return nil

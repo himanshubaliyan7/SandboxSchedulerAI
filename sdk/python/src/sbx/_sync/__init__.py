@@ -5,6 +5,7 @@ from .commands import CommandHandle, Commands
 from .files import Files, FileStream
 from .pty import Pty, PtyHandle
 from .sandbox import Sandbox
+from .webhooks import Webhooks
 
 __all__ = [
     "CommandHandle",
@@ -14,4 +15,5 @@ __all__ = [
     "Pty",
     "PtyHandle",
     "Sandbox",
+    "Webhooks",
 ]

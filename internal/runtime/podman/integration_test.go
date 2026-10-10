@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -22,12 +24,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/himanshubaliyan7/warmbox/internal/core"
 	"github.com/himanshubaliyan7/warmbox/internal/runtime"
+	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman/runscshim"
 )
 
 const (
@@ -89,21 +93,108 @@ func itResources() core.Resources {
 	}
 }
 
-// itBackend returns a Backend on the real socket, or skips.
+// itRuntime is the OCI runtime (isolation tier) the integration tests
+// run on: SBX_TEST_RUNTIME, crun by default. With runsc the gVisor binary
+// is SBX_TEST_RUNSC, or runsc from PATH.
+func itRuntime() string {
+	if r := os.Getenv("SBX_TEST_RUNTIME"); r != "" {
+		return r
+	}
+	return DefaultRuntime
+}
+
+func itGVisor() bool { return itRuntime() == RunscRuntime }
+
+// itManaged is the managed Podman services of this test process: one per
+// runtime, as sbxd runs them, started on first use and stopped by
+// TestMain. With SBX_PODMAN_SOCKET set the tests use that external
+// service instead (crun only).
+var itManaged struct {
+	once     sync.Once
+	err      error
+	dir      string
+	services []*Service
+	conf     string // CONTAINERS_CONF_OVERRIDE for the podman CLI
+	sockets  map[string]string
+	workDirs []string
+}
+
+func itStartManaged() {
+	m := &itManaged
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		m.err = errors.New("XDG_RUNTIME_DIR is not set")
+		return
+	}
+	if m.dir, m.err = os.MkdirTemp(base, "sbx-it-"); m.err != nil {
+		return
+	}
+	enabled := []OCIRuntime{{Name: DefaultRuntime}}
+	var shim []string
+	if itGVisor() {
+		self, err := os.Executable()
+		if err != nil {
+			m.err = err
+			return
+		}
+		// TestMain makes the test binary act as the shim.
+		shim = []string{self, "runsc-shim"}
+		enabled = append(enabled, OCIRuntime{Name: RunscRuntime, Path: os.Getenv("SBX_TEST_RUNSC")})
+	}
+	table, err := PrepareRuntimes(m.dir, enabled, shim, strings.Fields(os.Getenv("SBX_TEST_RUNSC_FLAGS")))
+	if err != nil {
+		m.err = err
+		return
+	}
+	m.sockets = map[string]string{}
+	for _, r := range enabled {
+		svc, err := StartService(context.Background(), ServiceConfig{
+			Dir: filepath.Join(m.dir, "svc-"+r.Name), SocketPath: filepath.Join(m.dir, r.Name+".sock"),
+			Runtimes: table, DefaultRuntime: r.Name, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err != nil {
+			m.err = fmt.Errorf("runtime %s: %w", r.Name, err)
+			return
+		}
+		m.services = append(m.services, svc)
+		m.sockets[r.Name] = svc.SocketPath()
+		m.workDirs = append(m.workDirs, svc.WorkDir())
+		if r.Name == DefaultRuntime {
+			m.conf = svc.ConfPath()
+		}
+	}
+}
+
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "runsc-shim" {
+		os.Exit(runscshim.Main(os.Args[2:], os.Stderr))
+	}
+	code := m.Run()
+	for _, svc := range itManaged.services {
+		_ = svc.Stop(context.Background())
+	}
+	if itManaged.dir != "" {
+		_ = os.RemoveAll(itManaged.dir)
+	}
+	os.Exit(code)
+}
+
+// itPodman builds a podman CLI command that sees the test's containers
+// with the runtime table they were created with.
+func itPodman(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	if itManaged.conf != "" {
+		cmd.Env = append(os.Environ(), "CONTAINERS_CONF_OVERRIDE="+itManaged.conf)
+	}
+	return cmd
+}
+
+// itBackend returns a Backend on real Podman, or skips: on managed
+// services of this test process, or on $SBX_PODMAN_SOCKET.
 func itBackend(t *testing.T, mutate func(*Config)) *Backend {
 	t.Helper()
-	socket := os.Getenv("SBX_PODMAN_SOCKET")
-	if socket == "" {
-		socket = DefaultSocketPath()
-	}
-	if socket == "" {
-		t.Skip("no Podman socket: XDG_RUNTIME_DIR is not set")
-	}
-	if _, err := os.Stat(socket); err != nil {
-		t.Skipf("no Podman socket at %s", socket)
-	}
 	if _, err := exec.LookPath("podman"); err != nil {
-		t.Skip("podman CLI not found (needed for in-container checks)")
+		t.Skip("podman CLI not found")
 	}
 	// The profile must outlive the test's containers but need not outlive
 	// the test, so the test's temp dir is the right place.
@@ -111,7 +202,33 @@ func itBackend(t *testing.T, mutate func(*Config)) *Backend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{SocketPath: socket, SeccompProfilePath: profile, Command: []string{"sleep", "600"}}
+	cfg := Config{SeccompProfilePath: profile, Command: []string{"sleep", "600"}}
+	if socket := os.Getenv("SBX_PODMAN_SOCKET"); socket != "" {
+		if itGVisor() {
+			t.Fatal("SBX_TEST_RUNTIME=runsc needs managed services: unset SBX_PODMAN_SOCKET")
+		}
+		if _, err := os.Stat(socket); err != nil {
+			t.Skipf("no Podman socket at %s", socket)
+		}
+		cfg.SocketPath = socket
+	} else {
+		if os.Getenv("XDG_RUNTIME_DIR") == "" {
+			t.Skip("XDG_RUNTIME_DIR is not set")
+		}
+		itManaged.once.Do(itStartManaged)
+		if itManaged.err != nil {
+			if itGVisor() {
+				t.Fatalf("managed Podman services for runsc: %v", itManaged.err)
+			}
+			t.Skipf("no managed Podman service: %v", itManaged.err)
+		}
+		cfg.SocketPath = itManaged.sockets[DefaultRuntime]
+		cfg.OOMEvidenceDirs = itManaged.workDirs
+		if itGVisor() {
+			cfg.Runtimes = []string{DefaultRuntime, RunscRuntime}
+			cfg.RuntimeSockets = map[string]string{RunscRuntime: itManaged.sockets[RunscRuntime]}
+		}
+	}
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -119,13 +236,14 @@ func itBackend(t *testing.T, mutate func(*Config)) *Backend {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(b.Close)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	v, err := b.Ping(ctx)
 	if err != nil {
-		t.Skipf("Podman socket %s does not answer: %v", socket, err)
+		t.Skipf("Podman does not answer: %v", err)
 	}
-	t.Logf("Libpod API version %s", v)
+	t.Logf("Libpod API version %s, runtime %s", v, itRuntime())
 	return b
 }
 
@@ -144,11 +262,17 @@ func itCreate(t *testing.T, b *Backend, image string, res core.Resources) runtim
 		HostID:     itHostID,
 		Generation: 7,
 		AgentEpoch: "epoch-it",
-		Template:   core.Template{ID: "tpl-it", Image: image, Resources: res, Network: core.NetworkAllowlist},
+		Template:   core.Template{ID: "tpl-it", Image: image, Runtime: itRuntime(), Resources: res, Network: core.NetworkAllowlist},
 		HostRunDir: runDir,
 	})
 	if IsStatus(err, http.StatusNotFound) {
 		t.Skipf("image %s is not present locally (podman pull it to run this test): %v", image, err)
+	}
+	if err != nil && strings.Contains(err.Error(), "not enough unused IDs in user namespace") {
+		// userns=auto needs a free block of subordinate IDs, and every
+		// keep-id container of this user (a warm pool left by a server,
+		// another test) holds the whole range.
+		t.Skipf("userns auto cannot be tested while other containers of this user hold the subordinate ID range: %v", err)
 	}
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -175,7 +299,7 @@ func itExec(t *testing.T, id, script string) (string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "podman", "exec", id, "sh", "-c", script).CombinedOutput()
+	out, err := itPodman(ctx, "exec", id, "sh", "-c", script).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -208,14 +332,21 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 	inst := itCreate(t, b, itAlpine, res)
 	ctx := context.Background()
 
-	// Limits, read from the host side of the cgroup.
+	// Limits, read from the host side of the cgroup. Under gVisor the
+	// cgroup is the scope the runsc shim made, and its pids.max is the
+	// sentry's backstop (gvisorSpec); the sandbox's own process limit is
+	// RLIMIT_NPROC, checked below.
+	wantPids := "64"
+	if itGVisor() {
+		wantPids = strconv.Itoa(64*gvisorTasksPerPid + gvisorTasksReserve)
+	}
 	for file, want := range map[string]string{
 		"memory.max":       "268435456",
 		"memory.swap.max":  "0",
 		"memory.high":      "max", // deliberately unset, see buildCreateSpec
 		"memory.oom.group": "1",
 		"cpu.max":          "50000 100000",
-		"pids.max":         "64",
+		"pids.max":         wantPids,
 	} {
 		if got := itCgroupFile(t, b, inst.ID, file); got != want {
 			t.Errorf("%s = %q, want %q", file, got, want)
@@ -224,8 +355,24 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 		}
 	}
 
+	// The runtime that was asked for is the one Podman used, and under
+	// gVisor the kernel the sandbox sees is the sentry.
+	if out, err := itPodman(ctx, "inspect", "-f", "{{.OCIRuntime}}", inst.ID).Output(); err != nil || strings.TrimSpace(string(out)) != itRuntime() {
+		t.Errorf("OCIRuntime = %q (%v), want %q", strings.TrimSpace(string(out)), err, itRuntime())
+	}
+	kernel := itMustExec(t, inst.ID, "uname -r; cat /proc/version; dmesg 2>&1 | head -1")
+	t.Logf("kernel as seen from the sandbox:\n%s", kernel)
+	if gv := strings.Contains(kernel, "gvisor") && strings.Contains(kernel, "Starting gVisor"); gv != itGVisor() {
+		t.Errorf("runtime %s, but the sandbox's kernel is:\n%s", itRuntime(), kernel)
+	}
+	if itGVisor() {
+		if got := itMustExec(t, inst.ID, "ulimit -u"); got != "64" {
+			t.Errorf("RLIMIT_NPROC = %q, want 64 (the sandbox's process limit under gVisor)", got)
+		}
+	}
+
 	// Ownership label and default environment.
-	if out, err := exec.Command("podman", "inspect", "-f", `{{index .Config.Labels "sbx.host_id"}}`, inst.ID).Output(); err != nil ||
+	if out, err := itPodman(context.Background(), "inspect", "-f", `{{index .Config.Labels "sbx.host_id"}}`, inst.ID).Output(); err != nil ||
 		strings.TrimSpace(string(out)) != itHostID {
 		t.Errorf("sbx.host_id label = %q (%v), want %q", strings.TrimSpace(string(out)), err, itHostID)
 	}
@@ -237,9 +384,9 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 	// and (unless the service runs with keyring = false) the container
 	// holds a kernel key. Logged, not asserted: both depend on the host's
 	// containers.conf.
-	if out, err := exec.Command("podman", "inspect", "-f", "{{.OCIConfigPath}}", inst.ID).Output(); err == nil {
+	if out, err := itPodman(context.Background(), "inspect", "-f", "{{.OCIConfigPath}}", inst.ID).Output(); err == nil {
 		// The bundle belongs to a subordinate uid under keep-id, hence unshare.
-		if raw, err := exec.Command("podman", "unshare", "cat", strings.TrimSpace(string(out))).Output(); err == nil {
+		if raw, err := itPodman(context.Background(), "unshare", "cat", strings.TrimSpace(string(out))).Output(); err == nil {
 			var oci struct {
 				Linux struct {
 					Sysctl map[string]string `json:"sysctl"`
@@ -269,8 +416,12 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 			t.Errorf("%s = %s, want all zero", k, v)
 		case k == "NoNewPrivs" && v != "1":
 			t.Errorf("NoNewPrivs = %s, want 1", v)
-		case k == "Seccomp" && v != "2":
+		case k == "Seccomp" && v != "2" && !itGVisor():
 			t.Errorf("Seccomp = %s, want 2 (filter)", v)
+		case k == "Seccomp" && v != "0" && itGVisor():
+			// Documented difference: runsc does not load the OCI profile
+			// (gvisorSpec). If this ever changes, the docs must too.
+			t.Errorf("Seccomp = %s under gVisor, where the OCI profile is documented as not applied", v)
 		}
 	}
 
@@ -292,8 +443,16 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 	} {
 		ok := false
 		for _, line := range strings.Split(mounts, "\n") {
-			if strings.Contains(line, want.dest) {
-				ok = strings.Contains(line, want.opt) && strings.Contains(line, "nosuid") && strings.Contains(line, "nodev")
+			if !strings.Contains(line, want.dest) {
+				continue
+			}
+			ok = strings.Contains(line, want.opt) && strings.Contains(line, "nosuid") && strings.Contains(line, "nodev")
+			if itGVisor() {
+				// The sentry's /proc/mounts has no nodev (its tmpfs
+				// cannot hold host devices), and /dev/shm is a gofer
+				// mount whose cap is the host tmpfs behind it; that
+				// cap is checked by filling it, below.
+				ok = strings.Contains(line, "nosuid") && (strings.Contains(line, want.opt) || want.dest == " /dev/shm ")
 			}
 		}
 		if !ok {
@@ -319,17 +478,23 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 		t.Errorf("writing 40 MiB into a 32 MiB /tmp succeeded: %s", out)
 	}
 	itMustExec(t, inst.ID, "rm -f /tmp/fill")
+	if out, err := itExec(t, inst.ID, "dd if=/dev/zero of=/dev/shm/fill bs=1M count=20 2>&1"); err == nil {
+		t.Errorf("writing 20 MiB into a 16 MiB /dev/shm succeeded: %s", out)
+	}
+	itMustExec(t, inst.ID, "rm -f /dev/shm/fill")
 
-	// Network: loopback only.
-	if got := itMustExec(t, inst.ID, "ls /sys/class/net"); got != "lo" {
+	// Network: loopback only. (gVisor's sysfs has no /sys/class/net, so
+	// the interfaces are read from /proc/net/dev on both tiers.)
+	if got := itMustExec(t, inst.ID, "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | sort | tr '\\n' ' '"); got != "lo" {
 		t.Errorf("network interfaces = %q, want only lo", got)
 	}
 
-	// Seccomp: nested user namespaces are refused.
-	if out, err := itExec(t, inst.ID, "unshare -U true"); err == nil {
-		t.Errorf("unshare -U succeeded: %s", out)
+	// Seccomp: nested user namespaces are refused. Under gVisor they are
+	// the sentry's own and allowed; see TestIntegrationPythonUnderSeccomp.
+	if out, err := itExec(t, inst.ID, "unshare -U true"); (err == nil) != itGVisor() {
+		t.Errorf("unshare -U: err=%v output=%s", err, out)
 	} else {
-		t.Logf("unshare -U: %s", out)
+		t.Logf("unshare -U: err=%v %s", err, out)
 	}
 	if got := itMustExec(t, inst.ID, "echo a b c | tr ' ' '\\n' | sort -r | head -1"); got != "c" {
 		t.Errorf("pipeline output %q", got)
@@ -363,8 +528,12 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 	if err := b.Pause(ctx, inst.ID); err != nil {
 		t.Errorf("Pause: %v", err)
 	} else {
-		if got := itCgroupFile(t, b, inst.ID, "cgroup.freeze"); got != "1" {
+		// crun freezes the cgroup; runsc pauses inside the sentry.
+		if got := itCgroupFile(t, b, inst.ID, "cgroup.freeze"); got != "1" && !itGVisor() {
 			t.Errorf("cgroup.freeze after Pause = %q", got)
+		}
+		if out, err := itPodman(ctx, "inspect", "-f", "{{.State.Status}}", inst.ID).Output(); err != nil || strings.TrimSpace(string(out)) != "paused" {
+			t.Errorf("state after Pause = %q (%v), want paused", strings.TrimSpace(string(out)), err)
 		}
 		if i, err := b.Inspect(ctx, inst.ID); err != nil || !i.Running {
 			t.Errorf("Inspect while paused: %+v, %v", i, err)
@@ -390,7 +559,7 @@ func TestIntegrationHardeningAndLimits(t *testing.T) {
 	if err := b.Pause(ctx, inst.ID); !errors.Is(err, runtime.ErrNotFound) {
 		t.Errorf("Pause after Destroy: %v, want ErrNotFound", err)
 	}
-	if out, _ := exec.Command("podman", "ps", "-a", "--format", "{{.ID}} {{.Names}}").CombinedOutput(); strings.Contains(string(out), inst.SandboxID) {
+	if out, _ := itPodman(context.Background(), "ps", "-a", "--format", "{{.ID}} {{.Names}}").CombinedOutput(); strings.Contains(string(out), inst.SandboxID) {
 		t.Errorf("container still listed after Destroy:\n%s", out)
 	}
 }
@@ -422,7 +591,7 @@ for fam in (socket.AF_NETLINK, socket.AF_PACKET, 38):  # 38 = AF_ALG
     except OSError as e:
         print("family", fam, "refused:", errno.errorcode.get(e.errno, e.errno))
     else:
-        raise SystemExit("socket family %d was allowed" % fam)
+        print("family", fam, "allowed")
 with tempfile.NamedTemporaryFile() as f:
     f.write(b"x")
 print("python-ok")
@@ -432,15 +601,34 @@ print("python-ok")
 	if !strings.HasSuffix(out, "python-ok") {
 		t.Errorf("python checks did not complete:\n%s", out)
 	}
+	// Host-kernel attack surface. Under crun the seccomp profile refuses
+	// all three families. Under gVisor the calls never reach the host:
+	// AF_ALG does not exist in the sentry, packet sockets need a
+	// capability the sandbox does not have, and AF_NETLINK is the
+	// sentry's own (route) implementation, which is allowed.
+	wantFamilies := []string{"family 16 refused: EPERM", "family 17 refused: EPERM", "family 38 refused: EPERM"}
+	if itGVisor() {
+		wantFamilies = []string{"family 16 allowed", "family 17 refused: EPERM", "family 38 refused: EAFNOSUPPORT"}
+	}
+	for _, want := range wantFamilies {
+		if !strings.Contains(out, want) {
+			t.Errorf("want %q in:\n%s", want, out)
+		}
+	}
 	out = itMustExec(t, inst.ID, "python3 -m venv /workspace/venv && /workspace/venv/bin/python -c 'import sys; print(sys.prefix)'")
 	if out != "/workspace/venv" {
 		t.Errorf("venv prefix = %q", out)
 	}
+	// Namespaces. Under crun the profile refuses all of them. Under
+	// gVisor a user namespace is an object of the sentry, not of the host
+	// kernel, and is allowed; mount and network namespaces still need a
+	// capability the sandbox user does not have.
 	for _, c := range []string{"unshare -U true", "unshare -m true", "unshare -n true"} {
-		if out, err := itExec(t, inst.ID, c); err == nil {
-			t.Errorf("%q succeeded: %s", c, out)
+		allowed := itGVisor() && c == "unshare -U true"
+		if out, err := itExec(t, inst.ID, c); (err == nil) != allowed {
+			t.Errorf("%q: err=%v, want allowed=%v: %s", c, err, allowed, out)
 		} else {
-			t.Logf("%s: %s", c, out)
+			t.Logf("%s: err=%v %s", c, err, out)
 		}
 	}
 	// clone3 must look unimplemented, not forbidden, so libcs fall back.
@@ -448,12 +636,22 @@ print("python-ok")
 import ctypes, errno
 libc = ctypes.CDLL(None, use_errno=True)
 for name, nr in (("clone3", 435), ("io_uring_setup", 425), ("bpf", 321), ("userfaultfd", 323), ("keyctl", 250), ("mount", 165), ("ptrace", 101)):
+    ctypes.set_errno(0)
     r = libc.syscall(nr, 0, 0, 0, 0, 0)
     print(name, r, errno.errorcode.get(ctypes.get_errno()))
 '`)
 	t.Logf("raw syscalls (x86-64 numbers):\n%s", out)
 	if goarch := itMustExec(t, inst.ID, "uname -m"); goarch == "x86_64" {
-		for _, want := range []string{"clone3 -1 ENOSYS", "io_uring_setup -1 ENOSYS", "bpf -1 EPERM", "userfaultfd -1 EPERM", "keyctl -1 EPERM", "mount -1 EPERM", "ptrace -1 EPERM"} {
+		want := []string{"clone3 -1 ENOSYS", "io_uring_setup -1 ENOSYS", "bpf -1 EPERM", "userfaultfd -1 EPERM", "keyctl -1 EPERM", "mount -1 EPERM", "ptrace -1 EPERM"}
+		if itGVisor() {
+			// What the sentry answers (release-20261005.0): io_uring,
+			// userfaultfd and keyctl do not exist, bpf and mount need
+			// capabilities, clone3 exists (and rejects the null
+			// arguments), and ptrace is the sentry's own, between the
+			// sandbox's processes only.
+			want = []string{"clone3 -1 EINVAL", "io_uring_setup -1 ENOSYS", "bpf -1 EPERM", "userfaultfd -1 ENOSYS", "keyctl -1 ENOSYS", "mount -1 EPERM", "ptrace 0 None"}
+		}
+		for _, want := range want {
 			if !strings.Contains(out, want) {
 				t.Errorf("want %q in:\n%s", want, out)
 			}
@@ -465,6 +663,13 @@ func TestIntegrationLimitsAreEnforced(t *testing.T) {
 	b := itBackend(t, nil)
 	res := itResources()
 	res.MemoryBytes = 128 << 20
+	if itGVisor() {
+		// The sentry and the gofer live inside the sandbox's memory
+		// limit, and a process costs more there: 63 idle Python children
+		// do not fit in 128 MiB under gVisor (they are OOM-killed, which
+		// is the limit working, but not what this part tests).
+		res.MemoryBytes = 384 << 20
+	}
 	res.WorkdirBytes = 32 << 20
 	res.TmpBytes = 16 << 20
 	itWatchOOMFile(t) // the memory bomb below makes conmon drop an "oom" file
@@ -493,8 +698,16 @@ for k in kids: os.waitpid(k, 0)
 		t.Fatalf("Stats: %v", err)
 	}
 	t.Logf("Stats after fork bomb: %+v", st)
-	if st.PidsLimitHits == 0 {
-		t.Errorf("PidsLimitHits = 0 after a fork bomb; fork output: %s", out)
+	if !strings.Contains(out, "fork failed after") {
+		t.Errorf("the fork bomb was not stopped: %s", out)
+	}
+	// Under gVisor the limit is the sentry's RLIMIT_NPROC: fork fails the
+	// same way, but the host cgroup never sees the hit.
+	if (st.PidsLimitHits == 0) != itGVisor() {
+		t.Errorf("PidsLimitHits = %d after a fork bomb on %s; fork output: %s", st.PidsLimitHits, itRuntime(), out)
+	}
+	if i, err := b.Inspect(ctx, inst.ID); err != nil || !i.Running {
+		t.Fatalf("the sandbox did not survive the fork bomb: %+v, %v", i, err)
 	}
 
 	// Memory bomb: the cgroup OOM killer fires and memory.oom.group takes
@@ -543,6 +756,18 @@ func TestIntegrationUsernsModes(t *testing.T) {
 		{UsernsHost, func(uid int) bool { return uid != hostUID && uid >= 100000 }, false},
 		{UsernsAuto, func(uid int) bool { return uid != hostUID && uid >= 100000 }, false},
 	} {
+		if itGVisor() {
+			// The host process of a gVisor sandbox is the sentry, which
+			// runs as the container's root whatever the sandbox user is:
+			// a subordinate UID, except with "host", where container
+			// root is the pool user. The sandbox user's files in the run
+			// directory are created by the sentry on its behalf.
+			sub := func(uid int) bool { return uid != hostUID && uid >= 100000 }
+			tc.wantHostUID = sub
+			if tc.mode == UsernsHost {
+				tc.wantHostUID = func(uid int) bool { return uid == hostUID }
+			}
+		}
 		t.Run(string(tc.mode), func(t *testing.T) {
 			b := itBackend(t, func(c *Config) { c.UsernsMode = tc.mode })
 			inst := itCreate(t, b, itAlpine, itResources())
@@ -550,7 +775,7 @@ func TestIntegrationUsernsModes(t *testing.T) {
 				t.Errorf("container uid = %q, want 1000", got)
 			}
 			itMustExec(t, inst.ID, "echo x > /workspace/f && echo x > /tmp/f")
-			out, err := exec.Command("podman", "inspect", "-f", "{{.State.Pid}}", inst.ID).Output()
+			out, err := itPodman(context.Background(), "inspect", "-f", "{{.State.Pid}}", inst.ID).Output()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -648,5 +873,96 @@ print(round((time.perf_counter() - t) * 1000 / 20, 1))'`)
 	// so only a clear win is asserted.
 	if median(with) > median(without)/2 {
 		t.Errorf("cached imports took %.1f ms, uncached %.1f ms: expected at least a 2x improvement", median(with), median(without))
+	}
+}
+
+// TestIntegrationOOMEvidence checks what a managed service's working
+// directory buys: an OOM kill and a SIGKILL from the host both end the
+// sandbox's init process with exit status 137, and conmon's "oom" file
+// tells them apart.
+func TestIntegrationOOMEvidence(t *testing.T) {
+	b := itBackend(t, nil)
+	if b.oom == nil {
+		t.Skip("needs a managed Podman service (unset SBX_PODMAN_SOCKET): an external service's working directory is not ours to read")
+	}
+	ctx := context.Background()
+	res := itResources()
+	waitExit := func(id string) runtime.Instance {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			i, err := b.Inspect(ctx, id)
+			if err != nil {
+				t.Fatalf("Inspect: %v", err)
+			}
+			if !i.Running {
+				return i
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("sandbox %s is still running", id)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	// 1. SIGKILL from the host, with no OOM kill anywhere near it.
+	victim := itCreate(t, b, itAlpine, res)
+	out, err := itPodman(ctx, "inspect", "-f", "{{.State.Pid}}", victim.ID).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Through `podman unshare`: under gVisor the process is the sentry,
+	// owned by a subordinate UID.
+	if out, err := itPodman(ctx, "unshare", "kill", "-9", strings.TrimSpace(string(out))).CombinedOutput(); err != nil {
+		t.Fatalf("kill -9: %v: %s", err, out)
+	}
+	if i := waitExit(victim.ID); i.ExitCode != sigkillExitCode || i.OOMKilled {
+		t.Errorf("after a host kill -9: ExitCode=%d OOMKilled=%v, want %d and false", i.ExitCode, i.OOMKilled, sigkillExitCode)
+	}
+	list, err := b.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range list {
+		if i.ID == victim.ID && (i.Running || i.OOMKilled) {
+			t.Errorf("List after a host kill -9: %+v", i)
+		}
+	}
+	// Out of the attribution window before the OOM kills below.
+	time.Sleep(oomBefore + oomAfter + time.Second)
+
+	// 2. Several sandboxes OOM-killed at the same moment: every one of
+	// them is attributed, although they share one file name.
+	const n = 4
+	var insts []runtime.Instance
+	for i := 0; i < n; i++ {
+		insts = append(insts, itCreate(t, b, itPython, res))
+	}
+	var wg sync.WaitGroup
+	for _, inst := range insts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = itExec(t, inst.ID, `python3 -c '
+b = []
+while True:
+    b.append(bytearray(8 << 20))
+'`)
+		}()
+	}
+	wg.Wait()
+	for _, inst := range insts {
+		i := waitExit(inst.ID)
+		if i.ExitCode != sigkillExitCode || !i.OOMKilled {
+			t.Errorf("after a memory bomb: ExitCode=%d OOMKilled=%v, want %d and true", i.ExitCode, i.OOMKilled, sigkillExitCode)
+		}
+	}
+	for _, dir := range b.cfg.OOMEvidenceDirs {
+		if _, err := os.Stat(filepath.Join(dir, oomFileName)); err == nil {
+			time.Sleep(2 * oomPollInterval)
+			if _, err := os.Stat(filepath.Join(dir, oomFileName)); err == nil {
+				t.Errorf("the oom file in %s was not consumed", dir)
+			}
+		}
 	}
 }

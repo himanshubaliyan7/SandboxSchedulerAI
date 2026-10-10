@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,111 @@ type env struct {
 
 	cmd  *exec.Cmd
 	done chan error
+}
+
+// The suite runs once per isolation tier and Podman mode:
+//
+//	SBX_E2E_RUNTIME      crun (default) or runsc: the runtime of every
+//	                     template the tests create
+//	SBX_E2E_RUNSC        path of the gVisor runsc binary (default: PATH)
+//	SBX_E2E_PODMAN_MODE  managed (default: sbxd's own Podman service) or
+//	                     external (the user's socket, crun only)
+//
+// Every check runs on both tiers. Where the tiers are documented to
+// differ, the test asserts the documented behaviour of the tier it runs
+// on (look for onGVisor); nothing is skipped because of the tier.
+
+// e2eRuntime is the OCI runtime of the templates under test.
+func e2eRuntime() string {
+	if r := os.Getenv("SBX_E2E_RUNTIME"); r != "" {
+		return r
+	}
+	return "crun"
+}
+
+// onGVisor reports whether the suite runs on the gVisor tier.
+func onGVisor() bool { return e2eRuntime() == "runsc" }
+
+// findRunsc returns the gVisor binary for the tests, or "".
+func findRunsc() string {
+	if p := os.Getenv("SBX_E2E_RUNSC"); p != "" {
+		return p
+	}
+	if p, err := exec.LookPath("runsc"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// e2eSetup checks the host and puts the suite's Podman settings into the
+// environment, which every sbxd the tests start (serve, admin, preflight)
+// inherits. It returns XDG_RUNTIME_DIR.
+func e2eSetup(t *testing.T) string {
+	t.Helper()
+	xdg := os.Getenv("XDG_RUNTIME_DIR")
+	if xdg == "" {
+		t.Fatal("XDG_RUNTIME_DIR is not set")
+	}
+	for _, k := range []string{"SBX_PODMAN_MODE", "SBX_PODMAN_SOCKET", "SBX_RUNTIMES", "SBX_RUNSC_FLAGS", "SBX_RUN_DIR", "SBX_HOST_ID"} {
+		t.Setenv(k, "")
+	}
+	switch mode := os.Getenv("SBX_E2E_PODMAN_MODE"); mode {
+	case "", "managed":
+	case "external":
+		socket := filepath.Join(xdg, "podman", "podman.sock")
+		if _, err := os.Stat(socket); err != nil {
+			t.Fatalf("SBX_E2E_PODMAN_MODE=external needs the user's Podman socket: %v", err)
+		}
+		if onGVisor() {
+			t.Fatal("the gVisor tier needs managed mode: an external Podman service has one runtime")
+		}
+		t.Setenv("SBX_PODMAN_SOCKET", socket)
+	default:
+		t.Fatalf("SBX_E2E_PODMAN_MODE=%q: want managed or external", mode)
+	}
+	switch e2eRuntime() {
+	case "crun":
+	case "runsc":
+		path := findRunsc()
+		if path == "" {
+			t.Fatal("SBX_E2E_RUNTIME=runsc but there is no runsc: set SBX_E2E_RUNSC or put runsc in PATH")
+		}
+		t.Setenv("SBX_RUNTIMES", "crun,runsc="+path)
+	default:
+		t.Fatalf("SBX_E2E_RUNTIME=%q: want crun or runsc", e2eRuntime())
+	}
+	return xdg
+}
+
+// cliConf is the containers.conf of the last server started. The podman
+// CLI needs it to act on containers of the gVisor tier, whose runtime is
+// not in the user's own configuration.
+var cliConf string
+
+// podmanCLI builds a podman command that sees the sandboxes of the
+// servers under test with the runtime table they were created with.
+func podmanCLI(args ...string) *exec.Cmd {
+	cmd := exec.Command("podman", args...)
+	if cliConf != "" {
+		if _, err := os.Stat(cliConf); err == nil {
+			cmd.Env = append(os.Environ(), "CONTAINERS_CONF_OVERRIDE="+cliConf)
+		}
+	}
+	return cmd
+}
+
+func runPodman(t *testing.T, args ...string) string {
+	t.Helper()
+	out, err := podmanCLI(args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("podman %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+// withRuntime puts the suite's runtime into a JSON template list.
+func withRuntime(templatesJSON string) string {
+	return strings.ReplaceAll(templatesJSON, `{"id":`, `{"runtime":"`+e2eRuntime()+`", "id":`)
 }
 
 func run(t *testing.T, name string, args ...string) string {
@@ -106,6 +212,9 @@ func freePort(t *testing.T) string {
 // admin runs `sbxd admin ...` against the environment's database.
 func (e *env) admin(args ...string) string {
 	e.t.Helper()
+	if len(args) > 2 && args[0] == "template" && args[1] == "apply" && !slices.Contains(args, "--file") && !slices.Contains(args, "--runtime") {
+		args = append(slices.Clone(args), "--runtime", e2eRuntime())
+	}
 	cmd := exec.Command(filepath.Join(e.bin, "sbxd"), append([]string{"admin"}, args...)...)
 	cmd.Env = append(os.Environ(), "SBX_DATABASE_URL="+e.dbURL)
 	out, err := cmd.CombinedOutput()
@@ -125,6 +234,7 @@ func (e *env) start() {
 	args := append([]string{"serve", "--listen", e.listen, "--run-dir", e.runDir, "--host-id", e.hostID,
 		"--log-level", "debug", "--touch-interval", "300ms", "--reconcile-interval", "2s", "--claim-wait", "20s"}, e.extra...)
 	e.cmd = exec.Command(filepath.Join(e.bin, "sbxd"), args...)
+	cliConf = filepath.Join(e.runDir, "podman", "containers.conf")
 	// The agent binary is found next to sbxd; everything else comes from
 	// flags, so the environment only carries the database URL.
 	e.cmd.Env = append(os.Environ(), "SBX_DATABASE_URL="+e.dbURL)
@@ -190,7 +300,7 @@ func (e *env) logTail(n int) string {
 // another test run) have their own host id and are not in the result.
 func (e *env) containers(t *testing.T) map[string]string {
 	t.Helper()
-	out := run(t, "podman", "ps", "-a", "--filter", "label=sbx.managed=true", "--filter", "label=sbx.host_id="+e.hostID,
+	out := runPodman(t, "ps", "-a", "--filter", "label=sbx.managed=true", "--filter", "label=sbx.host_id="+e.hostID,
 		"--format", "{{.Names}} {{.State}}")
 	found := map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -227,9 +337,9 @@ func (e *env) cleanup() {
 		<-e.done
 	}
 	// Whatever still carries this run's host id is this run's.
-	if out, err := exec.Command("podman", "ps", "-a", "-q", "--filter", "label=sbx.host_id="+e.hostID).Output(); err == nil {
+	if out, err := podmanCLI("ps", "-a", "-q", "--filter", "label=sbx.host_id="+e.hostID).Output(); err == nil {
 		if ids := strings.Fields(string(out)); len(ids) > 0 {
-			_ = exec.Command("podman", append([]string{"rm", "-f", "-t", "0"}, ids...)...).Run()
+			_ = podmanCLI(append([]string{"rm", "-f", "-t", "0"}, ids...)...).Run()
 		}
 	}
 	_ = os.RemoveAll(e.runDir)

@@ -20,6 +20,7 @@ PAIRS = [
     (sbx.FileStream, sbx.AsyncFileStream),
     (sbx.Pty, sbx.AsyncPty),
     (sbx.PtyHandle, sbx.AsyncPtyHandle),
+    (sbx.Webhooks, sbx.AsyncWebhooks),
 ]
 RENAMED = {"__aenter__": "__enter__", "__aexit__": "__exit__", "__aiter__": "__iter__", "__anext__": "__next__",
            "aclose": "close"}  # fmt: skip
@@ -68,6 +69,8 @@ def test_the_async_client_is_really_async() -> None:
         assert inspect.iscoroutinefunction(getattr(sbx.AsyncPty, name)), name
     for name in ("wait", "send_input", "resize", "kill", "disconnect"):
         assert inspect.iscoroutinefunction(getattr(sbx.AsyncPtyHandle, name)), name
+    for name in ("create", "list", "get", "update", "delete", "rotate_secret", "test", "deliveries", "close"):
+        assert inspect.iscoroutinefunction(getattr(sbx.AsyncWebhooks, name)), name
 
 
 async def test_coroutine_callbacks() -> None:

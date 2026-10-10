@@ -806,6 +806,44 @@ func TestWorkerTurnBudget(t *testing.T) {
 	}
 }
 
+// Drain sends everything that is due and returns; a webhook that is
+// backing off is not waited for.
+func TestWorkerDrain(t *testing.T) {
+	e := newWorkerEnv(t, func(c *Config) { c.Concurrency = 1; c.BatchSize = 2 })
+	e.hook("good")
+	e.hook("bad")
+	ids := e.commands(5)
+	e.sender.respond = func(s sent) Result {
+		if strings.Contains(s.URL, "bad") {
+			return status(500)
+		}
+		return ok()
+	}
+	done := make(chan struct{})
+	go func() { e.w.Drain(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return")
+	}
+	var good []string
+	bad := 0
+	for _, s := range e.sender.all() {
+		if strings.Contains(s.URL, "good") {
+			good = append(good, s.ID)
+		} else {
+			bad++
+		}
+	}
+	eq(t, "drained to the healthy webhook", good, ids)
+	if bad != 1 {
+		t.Errorf("%d attempts at the failing webhook during a drain", bad)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.w.Drain(ctx) // returns at once
+}
+
 // Stop lets the attempt in flight finish and records it; nothing new is
 // started.
 func TestWorkerGracefulStop(t *testing.T) {

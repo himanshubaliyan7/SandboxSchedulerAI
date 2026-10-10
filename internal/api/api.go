@@ -107,6 +107,9 @@ type Config struct {
 	// ExtraMetrics is called at the end of GET /metrics to append
 	// metrics owned by other components, in Prometheus text format.
 	ExtraMetrics func(w io.Writer)
+	// Webhooks serves the /v1/webhooks routes (webhooks.go). Nil leaves
+	// the routes in place, answering 501: the server runs without webhooks.
+	Webhooks Webhooks
 	// MetricsToken, when not empty, is required as a bearer token
 	// ("Authorization: Bearer <token>") by GET /metrics, on the main
 	// handler and on MetricsHandler alike. Empty means no authentication.
@@ -269,6 +272,7 @@ func (s *Server) routes() {
 	s.tenant("GET /v1/sandboxes/{id}/events", classDefault, s.handleEvents)
 	s.tenant("GET /v1/sandboxes/{id}/stats", classDefault, s.handleStats)
 	s.tenant("GET /v1/templates", classDefault, s.handleListTemplates)
+	s.webhookRoutes()
 
 	// Data plane: tenant API key or the sandbox's access token.
 	s.data("POST /v1/sandboxes/{id}/commands", s.handleStartCommand)

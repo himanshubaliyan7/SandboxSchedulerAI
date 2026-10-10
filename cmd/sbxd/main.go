@@ -237,6 +237,7 @@ func cmdServe(args []string, stderr io.Writer) error {
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", envDuration("SBX_SHUTDOWN_TIMEOUT", 30*time.Second), "budget of a graceful stop [SBX_SHUTDOWN_TIMEOUT]")
 	fs.StringVar(&permitPrivate, "egress-permit-private-cidrs", envStr("SBX_EGRESS_PERMIT_PRIVATE_CIDRS", ""),
 		"comma-separated private ranges sandboxes may reach when their policy allows it [SBX_EGRESS_PERMIT_PRIVATE_CIDRS]")
+	finishWebhookFlags := webhookFlags(fs, &cfg.Webhooks)
 	fs.StringVar(&maxUpload, "max-upload-size", envStr("SBX_MAX_UPLOAD_SIZE", "256m"), "largest file upload or stdin write, e.g. 64m, 1g [SBX_MAX_UPLOAD_SIZE]")
 	fs.DurationVar(&cfg.TouchInterval, "touch-interval", envDuration("SBX_TOUCH_INTERVAL", 0),
 		"debounce of the activity timestamp; keep it well below the shortest idle timeout (default 5s) [SBX_TOUCH_INTERVAL]")
@@ -259,6 +260,7 @@ func cmdServe(args []string, stderr io.Writer) error {
 		return err
 	}
 	cfg.Logger = logger
+	finishWebhookFlags()
 	if cfg.Runtimes, err = podman.ParseRuntimes(runtimes); err != nil {
 		return fmt.Errorf("--runtimes: %w", err)
 	}
