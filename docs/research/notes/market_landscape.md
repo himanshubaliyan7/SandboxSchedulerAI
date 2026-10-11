@@ -68,6 +68,8 @@ Funding and traction:
 
 ## 2. Open-source projects: license, maturity, activity, isolation, and whether a rootless Podman warm pool already exists
 
+> Superseded (October 2026): the statement below that self-hosting E2B needs Packer, Terraform and Nomad is out of date. E2B now ships E2B Embed, a single-host Docker Compose self-host (Apache-2.0) that needs KVM and privileged containers; see `docs/migrating-from-e2b.md`.
+
 ### Takeaway
 No mature open-source project implements a pre-warmed pool of rootless Podman sandboxes with a scheduler; what exists is either KVM-based (E2B runtime, microsandbox, Arrakis, BoxLite, Gondolin), Kubernetes-based (kubernetes-sigs/agent-sandbox with a SandboxWarmPool CRD, OpenSandbox, OpenKruise agents), Docker-socket-based (OpenHands, llm-sandbox, AIO Sandbox), or single-user Podman wrapper scripts. Daytona's open-source repo was archived in mid-2026, which leaves a visible hole for a maintained, self-hostable, container-based option.
 
@@ -148,6 +150,8 @@ Every named target either runs its own microVM/gVisor infrastructure or buys fro
 - Manus on Firecracker is a third-party claim only.
 
 ## 4. What agent builders complain about
+
+> Superseded (October 2026): the statement below that self-hosting E2B needs Packer, Terraform and Nomad is out of date. E2B now ships E2B Embed, a single-host Docker Compose self-host (Apache-2.0) that needs KVM and privileged containers; see `docs/migrating-from-e2b.md`.
 
 ### Takeaway
 The recurring complaints are billing for idle wall-clock time, session caps and silent timeouts that destroy state, resume latency after pause, default-open networking, the weight of self-hosting, and vendor lock-in or licence changes; much of the written evidence is secondhand via vendor blogs, with a smaller amount of first-hand HN and forum material.
@@ -239,6 +243,8 @@ No credible market-size figure for agent sandboxes specifically exists in free s
 - Did not verify details of AWS Bedrock AgentCore's code-execution offering or pricing.
 
 ## 7. Defensible wedge, sensible MVP scope, and build versus reuse
+
+> Superseded (October 2026): the statement below that self-hosting E2B needs Packer, Terraform and Nomad is out of date. E2B now ships E2B Embed, a single-host Docker Compose self-host (Apache-2.0) that needs KVM and privileged containers; see `docs/migrating-from-e2b.md`.
 
 ### Takeaway
 The defensible position is not "another E2B" but "the single-binary, Apache-licensed, no-Kubernetes, no-root, no-KVM-required sandbox pool you run on your own box", aimed at teams that must host agent execution themselves; the MVP should be the scheduler and policy layer over reused runtimes, with a pluggable isolation tier so the project is not pinned to the weakest boundary.

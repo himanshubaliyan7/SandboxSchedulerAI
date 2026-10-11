@@ -26,6 +26,7 @@ import (
 	"github.com/himanshubaliyan7/warmbox/internal/egress"
 	"github.com/himanshubaliyan7/warmbox/internal/pool"
 	"github.com/himanshubaliyan7/warmbox/internal/preflight"
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
@@ -717,7 +718,7 @@ func (m *egressMetrics) write(w io.Writer) {
 	}
 	fmt.Fprint(w, "# HELP sbx_egress_requests_total Egress proxy decisions by verdict (allowed, denied, error).\n# TYPE sbx_egress_requests_total counter\n")
 	for _, v := range []string{string(egress.VerdictAllowed), string(egress.VerdictDenied), string(egress.VerdictError)} {
-		fmt.Fprintf(w, "sbx_egress_requests_total{verdict=%q} %d\n", v, totals[v])
+		fmt.Fprintf(w, "sbx_egress_requests_total{verdict=\"%s\"} %d\n", promtext.Label(v), totals[v])
 	}
 	fmt.Fprint(w, "# HELP sbx_egress_decisions_total Egress proxy decisions by verdict and reason.\n# TYPE sbx_egress_decisions_total counter\n")
 	keys := make([][2]string, 0, len(m.decisions))
@@ -726,7 +727,7 @@ func (m *egressMetrics) write(w io.Writer) {
 	}
 	sortPairs(keys)
 	for _, k := range keys {
-		fmt.Fprintf(w, "sbx_egress_decisions_total{verdict=%q,reason=%q} %d\n", k[0], k[1], m.decisions[k])
+		fmt.Fprintf(w, "sbx_egress_decisions_total{verdict=\"%s\",reason=\"%s\"} %d\n", promtext.Label(k[0]), promtext.Label(k[1]), m.decisions[k])
 	}
 	fmt.Fprint(w, "# HELP sbx_egress_bytes_total Bytes relayed by the egress proxy for finished connections.\n# TYPE sbx_egress_bytes_total counter\n")
 	fmt.Fprintf(w, "sbx_egress_bytes_total{direction=\"up\"} %d\nsbx_egress_bytes_total{direction=\"down\"} %d\n", m.up, m.down)

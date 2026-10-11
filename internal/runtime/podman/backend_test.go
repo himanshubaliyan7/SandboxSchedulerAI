@@ -28,8 +28,14 @@ type fakePodman struct {
 	version string // Libpod-API-Version header; "" omits it
 	handler func(w http.ResponseWriter, r *http.Request, body string) bool
 
-	mu   sync.Mutex
-	reqs []recorded
+	// imageEnv is the Config.Env the image inspect answers with; nil
+	// answers 404, as for an image that is not there. Image inspects are
+	// counted in imageReqs and not recorded in reqs.
+	imageEnv []string
+
+	mu        sync.Mutex
+	reqs      []recorded
+	imageReqs int
 }
 
 func (f *fakePodman) requests() []recorded {
@@ -54,6 +60,18 @@ func startFake(t *testing.T, f *fakePodman, mutate func(*Config)) *Backend {
 	}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/libpod/images/") && strings.HasSuffix(r.URL.Path, "/json") {
+			f.mu.Lock()
+			f.imageReqs++
+			env := f.imageEnv
+			f.mu.Unlock()
+			if env == nil {
+				libpodError(w, http.StatusNotFound, "image not known")
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"Config": map[string]any{"Env": env}})
+			return
+		}
 		f.mu.Lock()
 		f.reqs = append(f.reqs, recorded{r.Method, r.URL.Path, r.URL.RawQuery, string(raw)})
 		f.mu.Unlock()
@@ -525,5 +543,54 @@ func TestCreateGoesToTheRuntimesService(t *testing.T) {
 	}
 	if _, err := New(Config{SocketPath: "/s", Runtimes: []string{"crun", "runsc"}}); err == nil || !strings.Contains(err.Error(), "service of its own") {
 		t.Errorf("a second runtime without a service was accepted: %v", err)
+	}
+}
+
+// The sandbox PATH is the image's own with the user's bin directory in
+// front, read from the image once and remembered.
+func TestCreateDerivesPathFromTheImage(t *testing.T) {
+	f := &fakePodman{version: "4.9.3", imageEnv: []string{"LANG=C.UTF-8", "PATH=/go/bin:/usr/local/go/bin:/usr/bin:/bin"}}
+	var bodies []string
+	f.handler = func(w http.ResponseWriter, r *http.Request, body string) bool {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v4.9.3/libpod/containers/create":
+			bodies = append(bodies, body)
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"Id":"cid1"}`)
+		case "POST /v4.9.3/libpod/containers/cid1/start":
+			w.WriteHeader(http.StatusNoContent)
+		case "GET /v4.9.3/libpod/containers/cid1/json":
+			io.WriteString(w, inspectRunning)
+		default:
+			return false
+		}
+		return true
+	}
+	b := startFake(t, f, nil)
+	for i := 0; i < 2; i++ {
+		if _, err := b.Create(context.Background(), testSpec()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, body := range bodies {
+		var got struct {
+			Env map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatal(err)
+		}
+		if want := "/workspace/.local/bin:/go/bin:/usr/local/go/bin:/usr/bin:/bin"; got.Env["PATH"] != want {
+			t.Errorf("PATH = %q, want %q", got.Env["PATH"], want)
+		}
+		if got.Env["PYTHONUNBUFFERED"] != "1" || got.Env["HOME"] != "/workspace" {
+			t.Errorf("default env: %v", got.Env)
+		}
+	}
+	if f.imageReqs != 1 {
+		t.Errorf("the image was inspected %d times for two creates, want 1 (cached)", f.imageReqs)
+	}
+	// An image with no PATH of its own gets the standard one.
+	if got := DefaultEnv("")["PATH"]; got != "/workspace/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" {
+		t.Errorf("PATH without an image PATH = %q", got)
 	}
 }

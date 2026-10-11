@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -691,14 +692,14 @@ func TestTemplateCRUD(t *testing.T) {
 		t.Fatal(err)
 	}
 	in.Version = 1
-	if got != in {
+	if !reflect.DeepEqual(got, in) {
 		t.Fatalf("round trip:\n got %+v\nwant %+v", got, in)
 	}
 	if _, err := s.CreateTemplate(ctx, in); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate: err = %v, want ErrConflict", err)
 	}
 	fetched, err := s.GetTemplate(ctx, in.ID)
-	if err != nil || fetched != in {
+	if err != nil || !reflect.DeepEqual(fetched, in) {
 		t.Fatalf("GetTemplate = %+v, %v", fetched, err)
 	}
 	list, err := s.ListTemplates(ctx)
@@ -720,6 +721,22 @@ func TestTemplateCRUD(t *testing.T) {
 	}
 	if up.Version != 2 || up.Resources.MemoryBytes != 1<<30 || up.Timeouts.Idle != 90*time.Second {
 		t.Fatalf("update: %+v", up)
+	}
+	// The default egress allowlist round-trips, and changing it does not
+	// bump the version: it is applied at claim time, not baked into a
+	// warm sandbox.
+	in.Network = core.NetworkAllowlist
+	in.AllowDomains, in.AllowCIDRs = []string{"pypi.org", "*.pythonhosted.org"}, []string{"203.0.113.0/24"}
+	up, err = s.UpdateTemplate(ctx, in)
+	if err != nil || up.Version != 2 || !reflect.DeepEqual(up.AllowDomains, in.AllowDomains) || !reflect.DeepEqual(up.AllowCIDRs, in.AllowCIDRs) {
+		t.Fatalf("default allowlist: %+v, %v", up, err)
+	}
+	if got := up.DefaultPolicy(); got.Mode != core.NetworkAllowlist || !reflect.DeepEqual(got.AllowDomains, in.AllowDomains) {
+		t.Fatalf("DefaultPolicy = %+v", got)
+	}
+	in.AllowDomains, in.AllowCIDRs = nil, nil
+	if up, err = s.UpdateTemplate(ctx, in); err != nil || up.AllowDomains != nil || up.AllowCIDRs != nil || up.Version != 2 {
+		t.Fatalf("cleared allowlist: %+v, %v", up, err)
 	}
 	if err := s.DeleteTemplate(ctx, in.ID); err != nil {
 		t.Fatal(err)

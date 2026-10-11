@@ -318,6 +318,7 @@ export class MockServer {
             version: 3,
             image: 'docker.io/library/python:3.12-alpine',
             runtime: 'crun',
+            shared_kernel: true,
             resources: {
               cpus: 1,
               memory_bytes: 268435456,
@@ -327,6 +328,8 @@ export class MockServer {
               nofile_limit: 1024,
             },
             network: 'allowlist',
+            allow_domains: ['pypi.org', 'files.pythonhosted.org'],
+            allow_cidrs: [],
             idle_timeout_ms: 600000,
             max_lifetime_ms: 3600000,
             some_future_field: true,
@@ -383,6 +386,13 @@ export class MockServer {
         throw new HttpError(400, 'invalid_timeout', 'timeout_ms must be positive')
       }
       if (sb.state !== 'running') throw notRunning(sb)
+      // As the server: past the template's max lifetime (1 h here) is refused, not capped.
+      if (body.timeout_ms > 3_600_000) {
+        throw new HttpError(400, 'invalid_timeout', "timeout_ms would end the sandbox after the template's max lifetime", {
+          max_timeout_ms: 3_600_000,
+          max_lifetime_ms: 3_600_000,
+        })
+      }
       sb.expiresAt = new Date(Date.now() + body.timeout_ms).toISOString()
       return sendJson(res, 200, sandboxView(sb))
     }

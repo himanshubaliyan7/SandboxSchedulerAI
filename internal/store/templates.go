@@ -12,7 +12,8 @@ import (
 )
 
 const templateCols = `id, version, image, runtime, cpus, memory_bytes, pids_limit, workdir_bytes, tmp_bytes,
-	nofile_limit, network, idle_timeout_ms, max_lifetime_ms, warm_ttl_ms, warm_target, max_total, refill_rate`
+	nofile_limit, network, idle_timeout_ms, max_lifetime_ms, warm_ttl_ms, warm_target, max_total, refill_rate,
+	allow_domains, allow_cidrs`
 
 func scanTemplate(row pgx.Row) (core.Template, error) {
 	var (
@@ -22,9 +23,17 @@ func scanTemplate(row pgx.Row) (core.Template, error) {
 	)
 	err := row.Scan(&t.ID, &t.Version, &t.Image, &t.Runtime, &t.Resources.CPUs, &t.Resources.MemoryBytes,
 		&t.Resources.PidsLimit, &t.Resources.WorkdirBytes, &t.Resources.TmpBytes, &t.Resources.NofileLimit,
-		&network, &idle, &life, &warmMs, &t.WarmTarget, &t.MaxTotal, &t.RefillRate)
+		&network, &idle, &life, &warmMs, &t.WarmTarget, &t.MaxTotal, &t.RefillRate, &t.AllowDomains, &t.AllowCIDRs)
 	if err != nil {
 		return core.Template{}, err
+	}
+	// An empty array scans as an empty, non-nil slice; nil keeps
+	// templates comparable with the ones callers build.
+	if len(t.AllowDomains) == 0 {
+		t.AllowDomains = nil
+	}
+	if len(t.AllowCIDRs) == 0 {
+		t.AllowCIDRs = nil
 	}
 	t.Network = core.NetworkMode(network)
 	t.Timeouts = core.Timeouts{
@@ -47,7 +56,15 @@ func templateArgs(t core.Template) []any {
 	return []any{t.ID, t.Image, rt, t.Resources.CPUs, t.Resources.MemoryBytes, t.Resources.PidsLimit,
 		t.Resources.WorkdirBytes, t.Resources.TmpBytes, t.Resources.NofileLimit, string(network),
 		t.Timeouts.Idle.Milliseconds(), t.Timeouts.MaxLifetime.Milliseconds(), t.Timeouts.WarmTTL.Milliseconds(),
-		t.WarmTarget, t.MaxTotal, t.RefillRate}
+		t.WarmTarget, t.MaxTotal, t.RefillRate, textArray(t.AllowDomains), textArray(t.AllowCIDRs)}
+}
+
+// textArray makes a nil slice an empty array instead of NULL.
+func textArray(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
 }
 
 // CreateTemplate inserts a template. A zero Version becomes 1. Durations
@@ -62,8 +79,9 @@ func (s *Store) CreateTemplate(ctx context.Context, t core.Template) (core.Templ
 		version = 1
 	}
 	const q = `INSERT INTO templates (id, image, runtime, cpus, memory_bytes, pids_limit, workdir_bytes, tmp_bytes,
-		nofile_limit, network, idle_timeout_ms, max_lifetime_ms, warm_ttl_ms, warm_target, max_total, refill_rate, version)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		nofile_limit, network, idle_timeout_ms, max_lifetime_ms, warm_ttl_ms, warm_target, max_total, refill_rate,
+		allow_domains, allow_cidrs, version)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	RETURNING ` + templateCols
 	out, err := scanTemplate(s.pool.QueryRow(ctx, q, append(templateArgs(t), version)...))
 	if err != nil {
@@ -79,8 +97,9 @@ func (s *Store) CreateTemplate(ctx context.Context, t core.Template) (core.Templ
 // the store and t.Version is ignored: it is incremented only when
 // something that is baked into an instance changes (image, runtime,
 // resources or network mode), which makes the sweeper recycle the WARM
-// instances built from the old version. Changing only timeouts or pool
-// sizing leaves the version, and the warm pool, alone.
+// instances built from the old version. Changing only timeouts, pool
+// sizing or the default egress allowlist (which is applied at claim time)
+// leaves the version, and the warm pool, alone.
 func (s *Store) UpdateTemplate(ctx context.Context, t core.Template) (core.Template, error) {
 	const q = `UPDATE templates SET
 		version = version + CASE WHEN (image, runtime, cpus, memory_bytes, pids_limit, workdir_bytes, tmp_bytes, nofile_limit, network)
@@ -88,7 +107,7 @@ func (s *Store) UpdateTemplate(ctx context.Context, t core.Template) (core.Templ
 			THEN 1 ELSE 0 END,
 		image = $2, runtime = $3, cpus = $4, memory_bytes = $5, pids_limit = $6, workdir_bytes = $7, tmp_bytes = $8,
 		nofile_limit = $9, network = $10, idle_timeout_ms = $11, max_lifetime_ms = $12, warm_ttl_ms = $13,
-		warm_target = $14, max_total = $15, refill_rate = $16, updated_at = now()
+		warm_target = $14, max_total = $15, refill_rate = $16, allow_domains = $17, allow_cidrs = $18, updated_at = now()
 	WHERE id = $1
 	RETURNING ` + templateCols
 	out, err := scanTemplate(s.pool.QueryRow(ctx, q, templateArgs(t)...))

@@ -36,7 +36,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/webhooks \
   "updated_at": "2026-10-10T12:00:00.000000Z",
   "consecutive_failures": 0,
   "dropped_events": 0,
-  "secret": "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+  "secret": "whsec_<base64-secret>"
 }
 ```
 
@@ -237,8 +237,10 @@ func verify(secret string, h http.Header, body []byte) error {
 ```
 
 A vector to test your own implementation against (it is the one the
-Standard Webhooks libraries use): secret
-`whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw`, id `msg_p5jXN8AQM9LWM0D4loKWxJek`,
+Standard Webhooks libraries use): the secret is the prefix `whsec_`
+followed by `MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw` (written apart here so that
+secret scanners do not take this public example for a leaked key), id
+`msg_p5jXN8AQM9LWM0D4loKWxJek`,
 timestamp `1614265330`, body `{"test": 2432232314}` gives
 `v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=`.
 

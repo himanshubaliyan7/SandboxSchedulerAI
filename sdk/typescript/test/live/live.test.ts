@@ -8,6 +8,8 @@ import { createHash } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
   CommandExitError,
+  CommandStartError,
+  CommandTimeoutError,
   type FetchLike,
   NotFoundError,
   Sandbox,
@@ -80,6 +82,17 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
       expect(remaining).toBeGreaterThan(9 * 60_000)
       expect(remaining).toBeLessThan(11 * 60_000)
       await expect(sb.setTimeout(0)).rejects.toMatchObject({ code: 'invalid_timeout', status: 400 })
+      // Past the template's max lifetime: refused with the limit, not capped.
+      const tooLong = await sb.setTimeout(30 * 24 * 3_600_000).catch((e) => e)
+      expect(tooLong).toMatchObject({ name: 'ValidationError', code: 'invalid_timeout', status: 400 })
+      expect(Number(tooLong.details.max_timeout_ms)).toBeGreaterThan(0)
+      expect(Number(tooLong.details.max_timeout_ms)).toBeLessThanOrEqual(Number(tooLong.details.max_lifetime_ms))
+      expect((await sb.getInfo()).expiresAt?.getTime()).toBe(info.expiresAt?.getTime())
+      // setTimeout is activity; reading the sandbox is not.
+      const before = (await sb.getInfo()).lastActivityAt?.getTime() ?? 0
+      await sleep(1200)
+      expect((await sb.getInfo()).lastActivityAt?.getTime()).toBe(before)
+      expect((await sb.setTimeout(10 * 60_000)).lastActivityAt?.getTime()).toBeGreaterThan(before)
     })
 
     it('list finds the sandbox, also by metadata', async () => {
@@ -95,6 +108,24 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
       expect(t).toBeDefined()
       expect(t?.resources.memoryBytes).toBeGreaterThan(0)
       expect(t?.image).toContain('python')
+      expect(['crun', 'runsc']).toContain(t?.runtime)
+      expect(t?.sharedKernel).toBe(t?.runtime === 'crun')
+      expect(t?.network).toBe('allowlist')
+      // A sandbox created without a policy has the template's default allowlist.
+      expect((await sb.getInfo()).network).toMatchObject({ mode: 'allowlist', allowDomains: t?.allowDomains })
+    })
+
+    it('runs as the neutral sandbox user with the user bin directory on PATH', async () => {
+      const out = (await sb.commands.run('id -un; hostname; echo $PATH')).stdout.split('\n')
+      expect(out.slice(0, 2)).toEqual(['sandbox', 'sandbox'])
+      expect(out[2]).toMatch(/^\/workspace\/\.local\/bin:/)
+    })
+
+    it('a blocked host says why', async () => {
+      const probe =
+        "import urllib.request\ntry:\n    urllib.request.urlopen('https://blocked.example.net/', timeout=10)\nexcept Exception as e:\n    print(e)\n"
+      const r = await sb.commands.run('python3', { args: ['-c', probe] })
+      expect(r.stdout).toContain('403 Blocked by sandbox network policy: blocked.example.net is not in the allowlist')
     })
 
     it('getStats reads the cgroup', async () => {
@@ -133,7 +164,9 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
     })
 
     it('reports an unknown executable as a typed error', async () => {
-      await expect(sb.commands.run('no-such-binary-xyz', { args: [] })).rejects.toMatchObject({ code: 'command_not_found', status: 400 })
+      const err = await sb.commands.run('no-such-binary-xyz', { args: [] }).catch((e) => e)
+      expect(err).toBeInstanceOf(CommandStartError)
+      expect(err).toMatchObject({ code: 'command_not_found', status: 400 })
     })
 
     it('streams stdout and stderr to the callbacks while the command runs', async () => {
@@ -228,6 +261,7 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
     it('enforces the per-command timeout', async () => {
       const t0 = Date.now()
       const err = await sb.commands.run('sleep', { args: ['20'], timeoutMs: 500 }).catch((e) => e)
+      expect(err).toBeInstanceOf(CommandTimeoutError)
       expect(err).toBeInstanceOf(CommandExitError)
       expect(err).toMatchObject({ reason: 'timeout', exitCode: 137 })
       expect(Date.now() - t0).toBeLessThan(5000)
@@ -323,7 +357,18 @@ describe.skipIf(!live)('live: against a real sbxd', { timeout: 60_000 }, () => {
 
   describe('files', () => {
     it('writes and reads text, lists, checks existence, removes', async () => {
-      await sb.files.write('dir/héllo.txt', 'grüße 🚀\n')
+      const info = await sb.files.write('dir/héllo.txt', 'grüße 🚀\n')
+      expect(info).toEqual({ name: 'héllo.txt', type: 'file', path: '/workspace/dir/héllo.txt', size: 13 })
+      expect((await sb.files.getInfo(info.path)).size).toBe(info.size)
+      const many = await sb.files.writeFiles([
+        { path: 'multi/a.txt', data: 'A' },
+        { path: 'multi/b.sh', data: '#!/bin/sh\necho multi-ok\n', mode: 0o755 },
+      ])
+      expect(many.map((m) => [m.path, m.size])).toEqual([
+        ['/workspace/multi/a.txt', 1],
+        ['/workspace/multi/b.sh', 24],
+      ])
+      expect((await sb.commands.run('./multi/b.sh')).stdout).toBe('multi-ok\n')
       expect(await sb.files.read('dir/héllo.txt')).toBe('grüße 🚀\n')
       expect(await sb.files.read('/workspace/dir/héllo.txt', { format: 'text' })).toBe('grüße 🚀\n')
       expect((await sb.commands.run('cat dir/héllo.txt')).stdout).toBe('grüße 🚀\n')

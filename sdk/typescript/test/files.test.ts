@@ -22,10 +22,67 @@ function binary(n: number): Uint8Array {
   return b
 }
 
+describe('files.write results', () => {
+  it('reports the size of bytes, ArrayBuffer, Blob and stream uploads, and normalises the path', async () => {
+    const sb = await create()
+    const data = new Uint8Array(1000).fill(7)
+    expect(await sb.files.write('/tmp/x/../a.bin', data)).toEqual({ name: 'a.bin', type: 'file', path: '/tmp/a.bin', size: 1000 })
+    expect((await sb.files.write('./b.bin', data.buffer.slice(0, 10) as ArrayBuffer)).size).toBe(10)
+    expect(await sb.files.write('c.bin', new Blob([data as Uint8Array<ArrayBuffer>]))).toMatchObject({
+      path: '/workspace/c.bin',
+      size: 1000,
+    })
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(data)
+        controller.enqueue(data.subarray(0, 24))
+        controller.close()
+      },
+    })
+    expect(await sb.files.write('s.bin', stream)).toEqual({ name: 's.bin', type: 'file', path: '/workspace/s.bin', size: 1024 })
+    expect(server().sandbox(sb.sandboxId).files.get('/workspace/s.bin')?.data.length).toBe(1024)
+  })
+
+  it('writeFiles uploads several files in order and returns one WriteInfo each', async () => {
+    const sb = await create()
+    const out = await sb.files.writeFiles([
+      { path: 'a.txt', data: 'one' },
+      { path: '/tmp/b.sh', data: '#!/bin/sh\n', mode: 0o755 },
+      { path: 'dir/c.bin', data: new Uint8Array([1, 2, 3, 4]) },
+    ])
+    expect(out).toEqual([
+      { name: 'a.txt', type: 'file', path: '/workspace/a.txt', size: 3 },
+      { name: 'b.sh', type: 'file', path: '/tmp/b.sh', size: 10 },
+      { name: 'c.bin', type: 'file', path: '/workspace/dir/c.bin', size: 4 },
+    ])
+    const puts = server().requestsTo('PUT', '/files')
+    expect(puts.map((p) => p.query.get('path'))).toEqual(['a.txt', '/tmp/b.sh', 'dir/c.bin'])
+    expect(puts.map((p) => p.query.get('mode'))).toEqual([null, '0755', null])
+    expect(server().sandbox(sb.sandboxId).files.get('/workspace/dir/c.bin')?.data.length).toBe(4)
+    expect(await sb.files.writeFiles([])).toEqual([])
+  })
+
+  it('writeFiles stops at the first failure', async () => {
+    const sb = await create()
+    await sb.files.makeDir('adir')
+    await expect(
+      sb.files.writeFiles([
+        { path: 'first.txt', data: '1' },
+        { path: 'adir', data: 'x' },
+        { path: 'never.txt', data: '3' },
+      ]),
+    ).rejects.toBeInstanceOf(ConflictError)
+    expect(await sb.files.exists('first.txt')).toBe(true)
+    expect(await sb.files.exists('never.txt')).toBe(false)
+  })
+})
+
 describe('files.write', () => {
   it('uploads a string as UTF-8 with the default mode', async () => {
     const sb = await create()
-    await sb.files.write('notes/héllo.txt', 'grüße 🚀')
+    const info = await sb.files.write('notes/héllo.txt', 'grüße 🚀')
+    // Like E2B's WriteInfo, plus the size: the absolute path, the name, the bytes written.
+    expect(info).toEqual({ name: 'héllo.txt', type: 'file', path: '/workspace/notes/héllo.txt', size: 12 })
     const f = server().sandbox(sb.sandboxId).files.get('/workspace/notes/héllo.txt')
     expect(f?.data.toString()).toBe('grüße 🚀')
     const put = server().requestsTo('PUT', '/files')[0]

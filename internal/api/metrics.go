@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 )
 
 // latencyBuckets are the upper bounds, in seconds, of the request
@@ -67,9 +68,7 @@ func (m *metrics) streamEnded(kind string)   { m.mu.Lock(); m.streams[kind]--; m
 func (m *metrics) rateLimited(c rateClass)   { m.mu.Lock(); m.throttled[c]++; m.mu.Unlock() }
 
 // label escapes a Prometheus label value.
-func label(v string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(v)
-}
+func label(v string) string { return promtext.Label(v) }
 
 func fnum(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) }
 
@@ -161,11 +160,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	p.head("sbx_pool_sandboxes", "gauge", "Sandboxes by template and state, as of the last refill pass.")
 	for _, id := range tmplIDs {
 		t := pm.Templates[id]
+		// One series per public state. PAUSED is not a public state
+		// (publicState reports it as running), so its count is added to
+		// running rather than written as a second "running" series,
+		// which is what this loop did before and which a strict scraper
+		// rejects as a duplicate.
 		for _, sc := range []struct {
 			state core.State
 			n     int
-		}{{core.StateWarm, t.Warm}, {core.StateCreating, t.Creating}, {core.StateAssigned, t.Assigned}, {core.StateRunning, t.Running},
-			{core.StatePaused, t.Paused}, {core.StateRecycling, t.Recycling}, {core.StateFailed, t.Failed}} {
+		}{{core.StateWarm, t.Warm}, {core.StateCreating, t.Creating}, {core.StateAssigned, t.Assigned},
+			{core.StateRunning, t.Running + t.Paused}, {core.StateRecycling, t.Recycling}, {core.StateFailed, t.Failed}} {
 			p.val("sbx_pool_sandboxes", fmt.Sprintf(`template="%s",state="%s"`, label(id), publicState(sc.state)), float64(sc.n))
 		}
 	}

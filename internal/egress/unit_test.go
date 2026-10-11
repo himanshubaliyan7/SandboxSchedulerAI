@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -480,5 +481,33 @@ func TestConfigValidation(t *testing.T) {
 			m.Close()
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// A policy denial says so in words: in the reason phrase, which is all
+// an HTTPS client shows of a refused CONNECT, and in the body.
+func TestDenialSaysBlockedByPolicy(t *testing.T) {
+	resp := httpErrorText(403, VerdictDenied, ReasonHostNotAllowed, "pypi.org is not in the allowlist")
+	head, body, _ := strings.Cut(resp, "\r\n\r\n")
+	lines := strings.Split(head, "\r\n")
+	if lines[0] != "HTTP/1.1 403 Blocked by sandbox network policy: pypi.org is not in the allowlist" {
+		t.Errorf("status line: %q", lines[0])
+	}
+	if body != "blocked by sandbox network policy: pypi.org is not in the allowlist (egress proxy: denied: host_not_allowed)\n" {
+		t.Errorf("body: %q", body)
+	}
+	if !strings.Contains(head, "X-Egress-Verdict: denied\r\nX-Egress-Reason: host_not_allowed") ||
+		!strings.Contains(head, "Content-Length: "+strconv.Itoa(len(body))) {
+		t.Errorf("headers: %q", head)
+	}
+	// Free text cannot split the status line.
+	resp = httpErrorText(403, VerdictDenied, ReasonHostNotAllowed, "evil\r\nX-Injected: 1")
+	if first, _, _ := strings.Cut(resp, "\r\n"); strings.Contains(resp, "\r\nX-Injected") || !strings.HasSuffix(first, "evil  X-Injected: 1") {
+		t.Errorf("a detail with a line break reached the header block: %q", resp)
+	}
+	// An upstream failure is not a policy decision and keeps the standard phrase.
+	resp = httpErrorText(502, VerdictError, ReasonResolveFailed, "cannot resolve nowhere.invalid")
+	if !strings.HasPrefix(resp, "HTTP/1.1 502 Bad Gateway\r\n") || !strings.HasSuffix(resp, "egress proxy: error: resolve_failed: cannot resolve nowhere.invalid\n") {
+		t.Errorf("error response: %q", resp)
 	}
 }

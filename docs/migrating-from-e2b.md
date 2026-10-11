@@ -88,7 +88,7 @@ sandbox than E2B. It is a weaker isolation boundary with a lighter footprint.
 | Command | `sandbox.commands.run(cmd)` | The same name. Different shell, user and working directory. See below. |
 | Background command | `background=True`, `CommandHandle` | The same. `pid` is an opaque string, not an integer. |
 | PTY | `sandbox.pty` | `sandbox.pty`, with a different `create` signature in Python. |
-| Files | `sandbox.files` | `sandbox.files`: `read`, `write`, `list`, `exists`, `get_info`, `make_dir`, `remove`. Python also has `write_files`. No `rename`, no `watch_dir`. |
+| Files | `sandbox.files` | `sandbox.files`: `read`, `write`, `list`, `exists`, `get_info`, `make_dir`, `remove`, and `write_files` / `writeFiles` for several files. No `rename`, no `watch_dir`. |
 | Network policy | Internet on by default; `allow_internet_access`, `network={"allow_out", "deny_out"}`, `update_network` | Off by default. `network=NetworkPolicy(mode=..., allow_domains=[...])`, `update_network`. See below. |
 | Events and webhooks | A lifecycle events API and webhooks (listed in the documentation index; not read in detail) | `sandbox.events()` returns the sandbox's event log (`claimed`, `transition`, `command_started`, `command_finished`). Lifecycle webhooks (`sandbox.created`, `sandbox.running`, `sandbox.terminated`, `sandbox.destroyed`, `command.started`, `command.finished`) push the same events to an HTTPS endpoint, signed and retried; see [`webhooks.md`](webhooks.md). |
 | Resource usage | `get_metrics` | `sandbox.stats()` (Python), `sandbox.getStats()` (TypeScript): cgroup counters. |
@@ -104,21 +104,20 @@ create or after the last `set_timeout`. Warmbox has three:
 | Timer | Set by | Ends | Reason reported |
 |---|---|---|---|
 | Idle timeout | Template, `--idle-timeout` (default 10 m, `0` disables) | The sandbox, after that long without activity | `idle_timeout` |
-| Maximum lifetime | `timeout` at create and `set_timeout`, capped by the template's `--max-lifetime` (default 1 h) | The sandbox | `max_lifetime` |
+| Maximum lifetime | `timeout` at create and `set_timeout`, at most the template's `--max-lifetime` (default 1 h; more is refused) | The sandbox | `max_lifetime` |
 | Warm TTL | Template, `--warm-ttl` (default 30 m) | A warm sandbox nobody claimed. You never see it. | none |
 
 Consequences:
 
-- "Activity" means commands, file calls and delivered output. `set_timeout`
-  and `get_info` are **not** activity. An E2B keep-alive loop that calls
-  `set_timeout` every minute does not stop the idle timer. Either set
-  `--idle-timeout 0` on the template, or keep the sandbox busy with a cheap
-  data call such as `sandbox.commands.list()`.
+- "Activity" means commands, file calls, delivered output and `set_timeout`.
+  An E2B keep-alive loop that calls `set_timeout` every minute therefore also
+  restarts the idle timer. `get_info`, `is_running` and `list` are reads and
+  do **not** count.
 - If you omit `timeout`, E2B gives you 300 s. Warmbox gives you the template's
   maximum lifetime.
-- A `timeout` above the template's maximum is refused at create with
-  `400 invalid_timeout`. The same value passed to `set_timeout` is accepted and
-  silently capped; read `expires_at` from the result.
+- A lifetime past the template's maximum is refused with `400 invalid_timeout`,
+  at create and by `set_timeout` alike; nothing is capped silently.
+  `details.max_timeout_ms` is the most you could have asked for.
 - A client cannot change the idle timeout. It belongs to the template.
 
 **A claim cannot change the template.** CPU, memory, image and the widest
@@ -137,9 +136,11 @@ loopback interface. When the mode is `allowlist` or `full`, the agent sets
 - Anything else does not: raw sockets, DNS lookups, UDP, `git` over SSH,
   database drivers. E2B filters real network traffic; Warmbox has no route at
   all.
-- A template with `--network allowlist` allows nothing by itself. A sandbox
-  created without `network=` gets mode `allowlist` with an empty list. Pass the
-  hostnames at create or with `update_network`.
+- A sandbox created without `network=` gets the template's mode and, for an
+  `allowlist` template, the template's default list
+  (`sbxd admin template apply --allow-domains ...`; `list_templates` shows
+  it). A template without one allows nothing. A `network=` argument replaces
+  the default list, it does not add to it.
 - A sandbox created with mode `none` has no proxy and cannot be given one later
   (`409 network_not_attached`). Create it with `allowlist`, then tighten.
 - A sandbox can ask for the template's mode or a stricter one, never a wider
@@ -161,9 +162,11 @@ limit, and they start empty.
   not exist as a writable place.
 - `pip install` works only if the network policy allows your package index
   (`pypi.org` and `files.pythonhosted.org` for PyPI) and the tmpfs is large
-  enough. It installs into the user site, `/workspace/.local`. Scripts land in
-  `/workspace/.local/bin`, which is not on `PATH`. A venv under `/workspace`
-  also works.
+  enough. It installs into the user site, `/workspace/.local`, and the scripts
+  it writes to `/workspace/.local/bin` are on `PATH`. A venv under `/workspace`
+  also works. The operator can put the index on the template
+  (`--allow-domains pypi.org,files.pythonhosted.org`), so that a sandbox
+  created without `network=` can install.
 - Files your image puts somewhere writable in E2B are read-only here. Copy
   what must change into `/workspace` at the start of a session.
 
@@ -226,7 +229,7 @@ and contains neither.
 ```sh
 export SBX_DATABASE_URL='postgres://postgres:sbx@127.0.0.1:55432/postgres?sslmode=disable'
 
-bin/sbxd admin template apply --id pydata \
+bin/sbxd admin template apply pydata \
     --image localhost/pydata:1 \
     --cpus 1 --memory 1g --pids 256 \
     --workdir-size 256m --tmp-size 64m \
@@ -254,14 +257,14 @@ The two tmpfs sizes must fit inside `--memory` together, because tmpfs pages
 count as memory. Leave room for the processes: with `--memory 1g` and
 `--workdir-size 256m`, a full `/workspace` leaves about 700 MB for Python.
 
-`sbxd admin template show --id pydata --json` prints the stored template in the
+`sbxd admin template show pydata` prints the stored template in the
 shape `--file` reads. Applying an id again creates a new version.
 
 ### 4. Create a tenant and an API key
 
 ```sh
-bin/sbxd admin tenant create --id acme --max-concurrent 20 --rate 50 --burst 100
-bin/sbxd admin key create --tenant acme      # prints the key once
+bin/sbxd admin tenant create acme --max-concurrent 20 --rate 50 --burst 100
+bin/sbxd admin key create acme               # prints the key once
 ```
 
 `--max-concurrent` is the tenant's quota of live sandboxes. `--rate` and
@@ -275,7 +278,8 @@ pip install ./sdk/python                                   # Python 3.10+, impor
 ```
 
 Neither is published yet. For TypeScript, make your project depend on the
-built checkout (a path dependency or a link to `sdk/typescript`).
+built checkout: `npm install /path/to/warmbox/sdk/typescript`, or the tarball
+that `npm pack` makes there.
 
 ```sh
 export SBX_API_KEY=sbx_...
@@ -383,7 +387,7 @@ text = sandbox.files.read("data/in.csv")
 raw = sandbox.files.read("/workspace/upload.bin", format="bytes")
 print([entry.name for entry in sandbox.files.list("data")])
 
-# Timeout: the sandbox now ends 600 s from this call (capped by the template).
+# Timeout: the sandbox now ends 600 s from this call (more than the template's max lifetime is refused).
 info = sandbox.set_timeout(600)
 print(info.expires_at)
 
@@ -541,7 +545,7 @@ const text = await sandbox.files.read('data/in.csv')
 const bytes = await sandbox.files.read('/workspace/upload.bin', { format: 'bytes' })
 console.log((await sandbox.files.list('data')).map((entry) => entry.name), text, bytes.length)
 
-// Timeout: the sandbox now ends 600 s from this call (capped by the template).
+// Timeout: the sandbox now ends 600 s from this call (more than the template's max lifetime is refused).
 const info = await sandbox.setTimeout(600_000)
 console.log(info.expiresAt)
 
@@ -569,7 +573,7 @@ What changed:
 | `allowInternetAccess`, `network: { allowOut, denyOut }` | `network: { mode, allowDomains, allowCidrs, denyCidrs }` |
 | `commands.run(cmd, { user })` | No `user`. Adds `args`, `shell`, `stdin` as a string or bytes, `throwOnNonZeroExit`, `tag`, `idempotencyKey`, `signal`. |
 | `handle.pid` is a `number` | A `string` |
-| `files.write(path, data)` returns `WriteInfo`; `files.write([entries])` | Returns `void`; one file per call |
+| `files.write(path, data)` returns `WriteInfo`; `files.write([entries])` | Returns `WriteInfo` (`name`, `type`, `path`, plus `size`); several files with `files.writeFiles([entries])` |
 | `files.read(path, { format: 'blob' })` | `text`, `bytes` and `stream` only |
 | `sandbox.pty.sendInput(pid, bytes)` | `pty.sendInput(textOrBytes)` on the handle, or `sandbox.pty.sendInput(pid, data)` |
 | PTY `wait()` throws on a non-zero exit | Returns the result |
@@ -725,15 +729,15 @@ Each of these was reproduced on a live server. Codes are the ones in
 | `429 quota_exceeded` (`QuotaExceededError`): "the tenant's concurrent sandbox quota is exhausted" | The tenant holds `--max-concurrent` live sandboxes. | Kill sandboxes you no longer need, or `sbxd admin tenant update --id <tenant> --max-concurrent <n>`. Not retried by default; it clears only when a sandbox ends. |
 | `400 network_not_allowed`: "the template does not allow the requested network mode" | The sandbox asked for a wider mode than the template's `--network`. | Re-apply the template with `--network allowlist` or `full`, or ask for less. |
 | `409 network_not_attached` on `update_network` | The sandbox was created with mode `none` and has no proxy. | Create it with `allowlist` (an empty list denies everything), then widen. |
-| `Tunnel connection failed: 403 Forbidden` from `pip`, `curl` or `urllib`; over plain HTTP the body is `egress proxy: denied: host_not_allowed: <host> is not in the allowlist` | The hostname is not in `allow_domains`. An `allowlist` template with no list allows nothing. | Add the host. PyPI needs `pypi.org` and `files.pythonhosted.org`. `*.example.com` matches subdomains, not the apex. |
+| `Tunnel connection failed: 403 Blocked by sandbox network policy: <host> is not in the allowlist` from `pip`, `curl` or `urllib`; over plain HTTP the body starts with the same sentence | The hostname is not in the sandbox's `allow_domains`: the template's default list, or the list the create request passed instead of it. An `allowlist` template with no default list allows nothing. | Add the host to the template (`--allow-domains`) or to the request. PyPI needs `pypi.org` and `files.pythonhosted.org`. `*.example.com` matches subdomains, not the apex. |
 | `pip` reports "Could not find a version that satisfies the requirement" in a `none` sandbox | No proxy and no network at all. | Use an `allowlist` template, or bake the package into the image. |
 | `507 no_space` (`NoSpaceError`) on `files.write`; `No space left on device` from a command | `/workspace` or `/tmp` is full. They are tmpfs with a fixed size. | Raise `--workdir-size` or `--tmp-size` (and `--memory`, which they count against), or delete files. |
 | `413 payload_too_large` on `files.write` | The upload exceeds the server's `--max-upload-size` (default 256 MiB). | Raise the flag or split the file. |
 | `CommandExitError` with exit code 127 and `/bin/sh: 1: git: not found` (or `bash: not found`) | The image lacks the program. Alpine images have no bash. | Add it to the image. For bash syntax call `bash -c '...'`. |
-| `400 command_not_found` (`CommandStartError` in Python, `ValidationError` in TypeScript) | The executable given with `args=[...]`, or the TypeScript `shell` option, does not exist in the image. | The same. |
+| `400 command_not_found` (`CommandStartError` in both SDKs) | The executable given with `args=[...]`, or the TypeScript `shell` option, does not exist in the image. | The same. |
 | `Read-only file system`, or `apt-get` failing with `are you root?` | The root filesystem is read-only and the process is uid 1000. | Write under `/workspace` or `/tmp`. Install system packages in the image. |
-| `409 sandbox_not_running` (`SandboxNotRunningError`) with reason `idle_timeout` | Nothing touched the sandbox's commands or files for the template's idle timeout. | Raise `--idle-timeout` or set it to `0`. `set_timeout` does not count as activity. |
-| `400 invalid_timeout` at create | `timeout` exceeds the template's `--max-lifetime`. `details.max_timeout_ms` has the limit. | Lower it or raise the template's limit. |
+| `409 sandbox_not_running` (`SandboxNotRunningError`) with reason `idle_timeout` | Nothing touched the sandbox's commands or files, and nothing called `set_timeout`, for the template's idle timeout. | Raise `--idle-timeout` or set it to `0`, or keep calling `set_timeout`. `get_info` does not count as activity. |
+| `400 invalid_timeout` at create or from `set_timeout` | The sandbox would outlive the template's `--max-lifetime`, counted from its start. `details.max_timeout_ms` is the most the call could have asked for. | Lower it or raise the template's limit. |
 | A command ends with reason `timeout` after 60 s (`CommandTimeoutError`) | The per-command default, the same as E2B's. | Pass `timeout=0` (Python) or `timeoutMs: 0` for long-running commands. |
 | A sandbox ends with reason `oom_killed` | It exceeded `--memory`. Files in `/workspace` and `/tmp` count. | Raise `--memory`, or write less to the tmpfs. |
 

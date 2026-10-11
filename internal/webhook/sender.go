@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"syscall"
 	"time"
@@ -242,7 +243,15 @@ func classifyError(err error) Result {
 		alertErr tls.AlertError
 		netErr   net.Error
 	)
+	// The detail goes to the server log. net/http wraps a failure in a
+	// *url.Error whose text repeats the request URL, path and query
+	// included, and those are often the receiver's credential; only the
+	// cause is kept.
 	detail := err.Error()
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		detail = uerr.Op + ": " + uerr.Err.Error()
+	}
 	switch {
 	case errors.As(err, &refused):
 		return Result{Code: CodeDestinationNotAllowed, Error: "the destination address is not allowed", Detail: detail}

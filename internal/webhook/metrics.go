@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
@@ -137,7 +138,7 @@ func (m *Metrics) Write(w io.Writer) {
 	byLabel := func(name, typ, help, label string, vals map[string]uint64) {
 		head(name, typ, help)
 		for _, k := range sortedKeys(vals) {
-			fmt.Fprintf(w, "%s{%s=%q} %d\n", name, label, k, vals[k])
+			fmt.Fprintf(w, "%s{%s=\"%s\"} %d\n", name, label, promtext.Label(k), vals[k])
 		}
 	}
 	byLabel("sbx_webhook_deliveries_total", "counter", "Webhook delivery attempts by outcome (succeeded, failed).", "outcome", m.attempts)
@@ -153,7 +154,7 @@ func (m *Metrics) Write(w io.Writer) {
 	var cum uint64
 	for i, b := range attemptBuckets {
 		cum += m.buckets[i]
-		fmt.Fprintf(w, "sbx_webhook_delivery_duration_seconds_bucket{le=%q} %d\n", strconv.FormatFloat(b, 'g', -1, 64), cum)
+		fmt.Fprintf(w, "sbx_webhook_delivery_duration_seconds_bucket{le=\"%s\"} %d\n", strconv.FormatFloat(b, 'g', -1, 64), cum)
 	}
 	fmt.Fprintf(w, "sbx_webhook_delivery_duration_seconds_bucket{le=\"+Inf\"} %d\n", m.count)
 	fmt.Fprintf(w, "sbx_webhook_delivery_duration_seconds_sum %s\n", strconv.FormatFloat(m.sum, 'g', -1, 64))

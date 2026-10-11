@@ -191,7 +191,14 @@ def test_command_timeout(sandbox: Sandbox) -> None:
 
 def test_files(sandbox: Sandbox) -> None:
     files = sandbox.files
-    assert files.write("notes/hello.txt", "héllo\n").size == 7
+    info = files.write("notes/hello.txt", "héllo\n")
+    assert (info.size, info.path, info.name, info.type) == (
+        7,
+        "/workspace/notes/hello.txt",
+        "hello.txt",
+        "file",
+    )
+    assert files.get_info(info.path).size == info.size
     assert files.read("notes/hello.txt") == "héllo\n"
     assert files.read("/workspace/notes/hello.txt", format="bytes") == "héllo\n".encode()
     assert sandbox.commands.run("cat notes/hello.txt").stdout == "héllo\n"
@@ -378,6 +385,28 @@ def test_list(sandbox: Sandbox) -> None:
     ]
     templates = Sandbox.list_templates(api_key=API_KEY, base_url=BASE_URL)
     assert TEMPLATE in [t.template_id for t in templates]
+    tmpl = next(t for t in templates if t.template_id == TEMPLATE)
+    assert tmpl.runtime in ("crun", "runsc") and tmpl.shared_kernel is (tmpl.runtime == "crun")
+    assert tmpl.network == "allowlist"
+    # A sandbox created without a policy has the template's default
+    # allowlist; one created with its own has exactly its own.
+    default = sandbox.get_info().network
+    assert default is not None and default.mode == "allowlist"
+    assert tuple(default.allow_domains) == tmpl.allow_domains
+    # The sandbox user is "sandbox", whoever runs the server, and what a
+    # user install puts in ~/.local/bin is found by name.
+    out = sandbox.commands.run("id -un; hostname; echo $PATH").stdout.split()
+    assert out[:2] == ["sandbox", "sandbox"] and out[2].startswith("/workspace/.local/bin:")
+
+
+def test_blocked_host_says_why(sandbox: Sandbox) -> None:
+    probe = (
+        "import urllib.request\n"
+        "try:\n    urllib.request.urlopen('https://blocked.example.net/', timeout=10)\n"
+        "except Exception as e:\n    print(e)\n"
+    )
+    out = sandbox.commands.run("python3", args=["-c", probe]).stdout
+    assert "403 Blocked by sandbox network policy: blocked.example.net is not in the allowlist" in out
 
 
 def test_connect_from_a_second_client_with_id_and_token(
@@ -478,6 +507,19 @@ def test_set_timeout_and_expiry() -> None:
         assert first is not None
         longer = sb.set_timeout(600).expires_at
         assert longer is not None and (longer - first).total_seconds() > 200
+        # Past the template's max lifetime: refused with the limit, not capped.
+        with pytest.raises(sbx.InvalidArgumentError) as too_long:
+            sb.set_timeout(30 * 24 * 3600)
+        assert too_long.value.code == "invalid_timeout"
+        limit_ms = too_long.value.details["max_timeout_ms"]
+        assert isinstance(limit_ms, int) and 0 < limit_ms <= too_long.value.details["max_lifetime_ms"]
+        assert sb.get_info().expires_at == longer
+        # set_timeout is activity; reading the sandbox is not.
+        before = sb.get_info().last_activity_at
+        time.sleep(1.2)
+        assert sb.get_info().last_activity_at == before
+        touched = sb.set_timeout(600).last_activity_at
+        assert touched is not None and before is not None and touched > before
         handle = sb.commands.run("sleep 60", background=True)
         soon = sb.set_timeout(1.5).expires_at
         assert soon is not None and soon < first

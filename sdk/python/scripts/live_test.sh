@@ -108,7 +108,7 @@ mkdir -p "$SBX_RUN_DIR"
 KEY_A="$(key sbxpy-a)"
 KEY_B="$(key sbxpy-b)"
 "$SBXD" admin template apply --id python --image "$IMAGE" --memory 256m --workdir-size 64m --tmp-size 32m \
-    --network allowlist --warm-target 3 >/dev/null
+    --network allowlist --allow-domains pypi.org,files.pythonhosted.org --warm-target 3 >/dev/null
 
 echo "== starting sbxd on $LISTEN (host id $HOST_ID, run dir $SBX_RUN_DIR)"
 "$SBXD" serve --listen "$LISTEN" --agent-binary "$WORK/sbx-agent" --shutdown-policy destroy \

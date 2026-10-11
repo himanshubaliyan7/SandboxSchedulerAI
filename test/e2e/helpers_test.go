@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 )
 
 // env is one end-to-end environment: real binaries, a private database,
@@ -133,9 +135,17 @@ func podmanCLI(args ...string) *exec.Cmd {
 
 func runPodman(t *testing.T, args ...string) string {
 	t.Helper()
-	out, err := podmanCLI(args...).CombinedOutput()
+	// Standard output only: the podman CLI writes notices to standard
+	// error that are not about this suite (with a gVisor sandbox of some
+	// other server on the host, "OCI Runtime runsc is in use by a
+	// container, but is not available" on every command), and callers
+	// parse what this returns line by line.
+	cmd := podmanCLI(args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("podman %s: %v\n%s", strings.Join(args, " "), err, out)
+		t.Fatalf("podman %s: %v\n%s%s", strings.Join(args, " "), err, out, stderr.String())
 	}
 	return string(out)
 }
@@ -615,6 +625,12 @@ func (c *client) metric(prefix string) float64 {
 		if resp.StatusCode != 200 {
 			c.t.Fatalf("GET %s/metrics: %d %s", c.metricsBase, resp.StatusCode, body)
 		}
+	}
+	// Every scrape of the real server is checked as a strict scraper
+	// would read it: all families (HTTP, pool, egress, webhooks), no
+	// duplicate series, no malformed line.
+	if _, err := promtext.Validate(string(body)); err != nil {
+		c.t.Errorf("/metrics is not valid Prometheus exposition text: %v\n%s", err, body)
 	}
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(line, prefix+" ") {

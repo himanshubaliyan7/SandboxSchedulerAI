@@ -93,12 +93,21 @@ func TestSessionMetadataLifetimeAndListing(t *testing.T) {
 	if d := sb.ExpiresAt.Sub(*sb.AssignedAt); d < 30*time.Minute || d > 31*time.Minute {
 		t.Errorf("extended to %s after assignment, want about 30m", d)
 	}
-	sb, err = f.s.SetLifetime(ctx, a.ID, a.Generation, 5*time.Hour, time.Hour)
-	if err != nil {
-		t.Fatalf("SetLifetime: %v", err)
+	// Past the cap: refused with the most that is allowed, nothing changes.
+	before := *sb.ExpiresAt
+	var tooLong *LifetimeExceededError
+	if _, err = f.s.SetLifetime(ctx, a.ID, a.Generation, 5*time.Hour, time.Hour); !errors.As(err, &tooLong) {
+		t.Fatalf("SetLifetime past the cap: %v, want a LifetimeExceededError", err)
 	}
-	if d := sb.ExpiresAt.Sub(*sb.AssignedAt); d != time.Hour {
-		t.Errorf("capped at %s after assignment, want exactly 1h", d)
+	if tooLong.Max > time.Hour || tooLong.Max < 59*time.Minute {
+		t.Errorf("LifetimeExceededError.Max = %s, want just under 1h", tooLong.Max)
+	}
+	if cur, _ := f.s.GetSandbox(ctx, a.ID); !cur.ExpiresAt.Equal(before) {
+		t.Errorf("a refused SetLifetime moved the expiry from %s to %s", before, cur.ExpiresAt)
+	}
+	// What the error offered is accepted.
+	if _, err = f.s.SetLifetime(ctx, a.ID, a.Generation, tooLong.Max-time.Second, time.Hour); err != nil {
+		t.Errorf("SetLifetime with the offered maximum: %v", err)
 	}
 	sb, err = f.s.SetLifetime(ctx, a.ID, a.Generation, 5*time.Hour, 0)
 	if err != nil {
@@ -124,6 +133,18 @@ func TestSessionMetadataLifetimeAndListing(t *testing.T) {
 	// The shortened expiry is what the sweeper sees.
 	if _, err := f.s.Transition(ctx, TransitionParams{ID: a.ID, Generation: a.Generation, From: core.StateAssigned, To: core.StateRunning}); err != nil {
 		t.Fatalf("Transition: %v", err)
+	}
+	// Setting the lifetime of a running sandbox counts as activity: it
+	// restarts the idle timer.
+	if _, err := f.s.pool.Exec(ctx, `UPDATE sandboxes SET last_activity_at = now() - interval '10 minutes' WHERE id = $1`, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	touched, err := f.s.SetLifetime(ctx, a.ID, a.Generation, 20*time.Minute, time.Hour)
+	if err != nil {
+		t.Fatalf("SetLifetime: %v", err)
+	}
+	if touched.LastActivityAt == nil || time.Since(*touched.LastActivityAt) > time.Minute {
+		t.Errorf("SetLifetime did not reset the idle timer: last activity %v", touched.LastActivityAt)
 	}
 	if _, err := f.s.SetLifetime(ctx, a.ID, a.Generation, time.Millisecond, time.Hour); err != nil {
 		t.Fatalf("SetLifetime: %v", err)

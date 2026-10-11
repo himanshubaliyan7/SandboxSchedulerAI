@@ -14,9 +14,23 @@ shaped like E2B's (`Sandbox.create`, `sandbox.commands.run`, `sandbox.files`,
 - Typed errors, automatic retry honouring `Retry-After`, `AbortSignal` on
   every call.
 
+The package is not on npm yet (`npm install sbx-sdk` finds nothing). Install
+it from a checkout of this repository; both ways below were tested from an
+empty project:
+
 ```sh
-npm install sbx-sdk
+# Build once (dist/ is not committed):
+cd /path/to/warmbox/sdk/typescript && npm install && npm run build
+
+# Then, in your project, either link the directory ...
+npm install /path/to/warmbox/sdk/typescript
+
+# ... or install a tarball, which copies the package (better for CI and Docker):
+(cd /path/to/warmbox/sdk/typescript && npm pack --pack-destination /tmp)
+npm install /tmp/sbx-sdk-0.1.0.tgz
 ```
+
+Either way the import is `from 'sbx-sdk'`.
 
 ## Quick start
 
@@ -48,7 +62,7 @@ directly):
 
 ```ts
 const sandbox = await Sandbox.create('python', {
-  timeoutMs: 10 * 60_000,              // max lifetime; capped by the template
+  timeoutMs: 10 * 60_000,              // max lifetime; more than the template's is refused, not capped
   envs: { OPENAI_API_BASE: '...' },    // environment of every command
   metadata: { userId: 'u_123' },       // labels; usable as a list filter
   network: { mode: 'allowlist', allowDomains: ['pypi.org', '*.pythonhosted.org'] },
@@ -59,34 +73,97 @@ sandbox.accessToken        // "sbt_..." — the data-plane credential of this sa
 
 await sandbox.getInfo()                    // { state, reason, expiresAt, network, metadata, ... }
 await sandbox.isRunning()
-await sandbox.setTimeout(60_000)           // remaining lifetime from now; returns the updated info
+await sandbox.setTimeout(60_000)           // remaining lifetime from now; also restarts the idle timer
 await sandbox.updateNetwork({ mode: 'none' })   // takes effect before it returns
 await sandbox.events({ type: 'command_finished' })
 await sandbox.getStats()                   // memoryBytes, cpuUsageUsec, oomKills, pidsLimitHits, ...
-await sandbox.kill()                       // true; false if the server does not know the sandbox
+await sandbox.kill()                       // true: the server knows the sandbox and it is ended; false if it does not
 
 await Sandbox.list({ metadata: { userId: 'u_123' } })   // SandboxInfo[], newest first
 await Sandbox.connect(sandboxId)                        // by id, with the API key
 await Sandbox.connect(sandboxId, { accessToken })       // by id + token, no API key needed
 await Sandbox.kill(sandboxId)
-await Sandbox.listTemplates()
+await Sandbox.listTemplates()                           // TemplateInfo[]: runtime, sharedKernel, network, allowDomains, ...
 ```
 
 `kill()` resolves as soon as the server has fenced the sandbox: it is
 unusable and off your quota, and its container is destroyed in the
 background within a few hundred milliseconds. Pass
-`{ waitUntilDestroyed: true }` to wait for the state `destroyed`.
+`{ waitUntilDestroyed: true }` to wait for the state `destroyed`. It is
+idempotent: killing a sandbox that has already ended resolves with `true`
+again, because the server still knows it; `false` means the server has no
+such sandbox (or it is another tenant's).
 
 Three timers can end a sandbox, and the `reason` says which: the template's
 idle timeout (`idle_timeout`), the maximum lifetime (`max_lifetime`, the
 `timeoutMs` above), and — for a single command, not the sandbox — the
 command's own `timeoutMs`.
 
+- **The lifetime is never capped silently.** `Sandbox.create({ timeoutMs })`
+  and `setTimeout(ms)` reject with a `ValidationError` (`code:
+  'invalid_timeout'`) when the sandbox would outlive the template's max
+  lifetime, counted from its start. `e.details.max_timeout_ms` is the most
+  you could have asked for.
+- **What counts as activity** for the idle timer: every command, file and
+  PTY call, output arriving on a stream or terminal you are attached to, and
+  `setTimeout`. So an E2B-style keep-alive loop that calls `setTimeout` keeps
+  an idle sandbox alive.
+- **What does not:** `getInfo`, `isRunning` (with an API key), `list`,
+  `events`, `getStats`, `updateNetwork`, and a command running with nobody
+  attached to its output.
+
+```ts
+import { ValidationError } from 'sbx-sdk'
+
+try {
+  await sandbox.setTimeout(24 * 3_600_000)
+} catch (e) {
+  if (!(e instanceof ValidationError) || e.code !== 'invalid_timeout') throw e
+  await sandbox.setTimeout(Number(e.details.max_timeout_ms) - 1000) // as long as allowed
+}
+```
+
+### Network and installing packages
+
+A template has a network mode (`none`, `allowlist` or `full`) and, for
+`allowlist`, a default list of hosts set by the operator
+(`sbxd admin template apply --allow-domains pypi.org,files.pythonhosted.org`).
+`Sandbox.listTemplates()` shows both. A sandbox created without `network`
+gets that default. Passing `network` **replaces** the default list (it does
+not add to it) and can never be wider than the template's mode.
+
+A host that is not allowed fails inside the sandbox with the reason in the
+tool's own error message, for example from `pip`:
+`Tunnel connection failed: 403 Blocked by sandbox network policy: example.com is not in the allowlist`.
+You see it in `result.stderr`, or in the `CommandExitError`.
+
+Installing Python packages works out of the box when `pypi.org` and
+`files.pythonhosted.org` are allowed:
+
+```ts
+await sandbox.commands.run('pip install requests') // a user install: the root filesystem is read-only
+await sandbox.commands.run("python3 -c 'import requests; print(requests.__version__)'")
+await sandbox.commands.run('normalizer --version') // a console script the install put in /workspace/.local/bin
+```
+
+The sandbox user is uid 1000 and the image is read-only, so `pip` installs
+under `/workspace/.local` (`pip install --user` does the same), and
+`/workspace/.local/bin` is on `PATH`. A virtual environment under
+`/workspace` (`python3 -m venv /workspace/venv`) works too. Everything is
+gone with the sandbox; bake what every session needs into the template's
+image. The image's `ENTRYPOINT`, `CMD` and `USER` are ignored: the agent is
+PID 1 and every command runs as uid 1000 (`sandbox`).
+
+Python's stdout is unbuffered in a sandbox (`PYTHONUNBUFFERED=1`), so output
+arrives as the program prints it. A program that prints hundreds of
+thousands of lines pays for that; pass `envs: { PYTHONUNBUFFERED: '' }` to
+the command or the sandbox to get block buffering back.
+
 ## Commands
 
 ```ts
 // A shell command line (run with /bin/sh -c):
-await sandbox.commands.run('pip install requests && python3 main.py')
+await sandbox.commands.run('pip install requests && python3 -c "import requests"')
 
 // An executable and its arguments, no shell, no quoting:
 await sandbox.commands.run('python3', { args: ['-c', code] })
@@ -96,7 +173,7 @@ const result = await sandbox.commands.run('python3', {
   args: ['-'],
   stdin: code,                       // written to stdin, which is then closed
   envs: { DEBUG: '1' },
-  cwd: '/workspace/project',
+  cwd: '/tmp',
   timeoutMs: 30_000,                 // server-side kill; default 60000, 0 = none
   onStdout: (text) => process.stdout.write(text),
   onStderr: (text) => process.stderr.write(text),
@@ -112,43 +189,55 @@ limit) or `oom`.
 
 `run()` and `handle.wait()` reject with `CommandExitError` when the exit
 code is not 0. The error carries the whole result (`exitCode`, `stdout`,
-`stderr`, `reason`, `signal`). If you would rather inspect the result
+`stderr`, `reason`, `signal`). A command killed by its `timeoutMs` rejects
+with `CommandTimeoutError`, a subclass (`reason` is `'timeout'`). A command
+that could not be started at all, because the executable is not in the
+image, rejects with `CommandStartError` (`code: 'command_not_found'`). If you would rather inspect the result
 yourself, switch it off per call or for the whole sandbox:
 
 ```ts
 const r = await sandbox.commands.run('grep -q needle haystack.txt', { throwOnNonZeroExit: false })
 if (r.exitCode !== 0) { /* not found */ }
 
-const sandbox = await Sandbox.create('python', { throwOnNonZeroExit: false })
+const lenient = await Sandbox.create('python', { throwOnNonZeroExit: false }) // for every command of this sandbox
 ```
 
 ### Background commands
 
 ```ts
-const server = await sandbox.commands.run('python3 -m http.server 8000', { background: true })
+// timeoutMs: 0, because a server is meant to outlive the 60 s per-command default.
+const server = await sandbox.commands.run('python3 -m http.server 8000', { background: true, timeoutMs: 0 })
 server.pid                          // opaque id (not a kernel pid)
 
 for await (const event of server) { // stdout | stderr | truncated | exit
   if (event.type === 'stdout') process.stdout.write(event.text) // event.data has the raw bytes
+  if (event.type === 'stdout' && event.text.includes('Serving')) break // it is up; stop reading
 }
 
 await server.kill()                 // SIGKILL; server.kill('SIGTERM') for another signal
-await server.wait()                 // the result (throws CommandExitError unless disabled)
-server.disconnect()                 // stop listening; the command keeps running
+await server.wait({ throwOnNonZeroExit: false }) // the result: reason 'killed', exit code 137
+server.disconnect()                 // stop listening without waiting; a command still running keeps running
 
 const cat = await sandbox.commands.run('cat', { args: [], background: true, stdin: true })
 await cat.sendStdin('hello\n')
-await cat.closeStdin()
 
+const pid = cat.pid
 await sandbox.commands.list()                  // CommandInfo[]: running and exited
 const again = await sandbox.commands.connect(pid)   // reattach from anywhere, also after exit
-await sandbox.commands.kill(pid)
 await sandbox.commands.sendStdin(pid, 'data')
+await cat.closeStdin()                         // cat exits at end of input
+await sandbox.commands.kill(pid)               // false: it had already exited
 ```
 
 `commands.connect(pid)` replays the output the server still buffers (the
 last 1 MiB) and then follows live; pass `{ from: info.nextOffset }` to get
 only new output.
+
+The loop above sees "Serving HTTP on ..." at once because the sandbox sets
+`PYTHONUNBUFFERED=1`. Other programs that buffer their output when it is not
+a terminal (anything using C stdio) still deliver it in blocks; run those
+with their own unbuffered option (`stdbuf -oL`, `--line-buffered`) or on a
+PTY.
 
 ### Differences from E2B worth knowing
 
@@ -158,7 +247,8 @@ only new output.
 | `pid` | number (kernel pid) | opaque string |
 | `commands.connect(pid)` | new output only | replays buffered output first (`from` option) |
 | Output lost by a slow reader | not reported | `truncated` / `droppedBytes` / `onTruncated` |
-| `sandbox.setTimeout(ms)` | `void` | the updated `SandboxInfo` (the server may cap the value) |
+| `sandbox.setTimeout(ms)` | `void` | the updated `SandboxInfo`; past the template's max lifetime it rejects (`invalid_timeout`), it is not capped |
+| `files.write(path, data)` | `WriteInfo` (`name`, `type`, `path`) | the same, plus `size`; several files with `files.writeFiles([...])` |
 | PTY `wait()` on non-zero exit | throws | returns the result |
 | `files.exists/makeDir/getInfo` | `boolean` / `boolean` / `EntryInfo` | the same (`makeDir` is `true` only if it created the directory) |
 | Not available | `pause`, `getHost`, `files.watchDir`, `files.rename` | the server has no such routes yet |
@@ -201,7 +291,7 @@ the server starts it at most once and the second call attaches to it.
 
 ```ts
 const key = crypto.randomUUID()
-const run = () => sandbox.commands.run('python3 train.py', { idempotencyKey: key })
+const run = () => sandbox.commands.run('python3 -c "print(42)"', { idempotencyKey: key })
 const result = await run().catch((e) => (e.code === 'start_unconfirmed' ? run() : Promise.reject(e)))
 ```
 
@@ -230,13 +320,15 @@ const pty = await sandbox.pty.create({
 
 pty.sendInput('ls -la\n')        // '\x03' is Ctrl+C, '\x04' is Ctrl+D
 pty.resize({ cols: 100, rows: 30 })
-const { exitCode } = await pty.wait()
+pty.sendInput('exit\n')
+const { exitCode } = await pty.wait()   // resolves when the shell exits
 
-// By id, from anywhere:
-const same = await sandbox.pty.connect(pty.pid, { onData })
-await sandbox.pty.sendInput(pty.pid, 'echo hi\n')
-await sandbox.pty.resize(pty.pid, { cols: 80, rows: 24 })
-await sandbox.pty.kill(pty.pid)
+// By id, from anywhere (a second terminal here, so that there is one still running):
+const other = await sandbox.pty.create({ cols: 80, rows: 24, onData: () => {} })
+const same = await sandbox.pty.connect(other.pid, { onData: (bytes) => process.stdout.write(bytes) })
+await sandbox.pty.sendInput(other.pid, 'echo hi\n')
+await sandbox.pty.resize(other.pid, { cols: 80, rows: 24 })
+await sandbox.pty.kill(other.pid)
 ```
 
 The session runs over a WebSocket. The SDK handles the framing, answers
@@ -292,19 +384,25 @@ term.write(`\r\n[process exited with code ${exitCode}]\r\n`)
 Paths are absolute, or relative to the work directory `/workspace`.
 
 ```ts
-await sandbox.files.write('data/input.csv', csvText)            // string (UTF-8)
+const info = await sandbox.files.write('data/input.csv', csvText) // string (UTF-8)
+info                                                            // WriteInfo: { name: 'input.csv', type: 'file', path: '/workspace/data/input.csv', size }
 await sandbox.files.write('model.bin', uint8Array)              // bytes
 await sandbox.files.write('upload.zip', fileFromInput)          // Blob / File, not buffered
 await sandbox.files.write('big.tar', readableStream)            // streamed
 await sandbox.files.write('run.sh', script, { mode: 0o755 })
+await sandbox.files.writeFiles([                                // several, in order -> WriteInfo[]
+  { path: 'a.txt', data: 'A' },
+  { path: 'bin/tool.sh', data: script, mode: 0o755 },
+])
 
-const text = await sandbox.files.read('out/report.json')                         // string
-const bytes = await sandbox.files.read('out/plot.png', { format: 'bytes' })      // Uint8Array
-const stream = await sandbox.files.read('out/big.parquet', { format: 'stream' }) // ReadableStream
+const text = await sandbox.files.read('data/input.csv')                          // string
+const bytes = await sandbox.files.read('model.bin', { format: 'bytes' })         // Uint8Array
+const stream = await sandbox.files.read('big.tar', { format: 'stream' })         // ReadableStream
+await stream.cancel()                                                            // or read it to the end
 
-await sandbox.files.list('out')     // [{ name, path, type: 'file' | 'dir', size, mode, modifiedTime }]
-await sandbox.files.exists('out/report.json')
-await sandbox.files.getInfo('out')     // { name, path, type, size, mode, modifiedTime }; NotFoundError if absent
+await sandbox.files.list('data')    // [{ name, path, type: 'file' | 'dir', size, mode, modifiedTime }]
+await sandbox.files.exists('data/input.csv')
+await sandbox.files.getInfo('data')    // { name, path, type, size, mode, modifiedTime }; NotFoundError if absent
 await sandbox.files.makeDir('a/b/c')   // parents too; true if it created it, false if it was there
 await sandbox.files.remove('a')        // a file, or a directory and everything in it
 ```
@@ -338,6 +436,10 @@ await webhooks.rotateSecret(hook.webhookId) // new .secret; the old one keeps si
 await webhooks.list()
 await webhooks.delete(hook.webhookId)
 ```
+
+The URL is checked when the webhook is created: it must be `https` and
+resolve to a public address, so the placeholder host above is refused
+(`webhook_url_not_allowed`); use your own.
 
 `secret` is a non-enumerable property: `JSON.stringify(hook)` and `console.log(hook)` do not print it.
 
@@ -380,7 +482,8 @@ server's stable code), `status`, `requestId` and `details`.
 |---|---|---|
 | `AuthenticationError` | 401: key or token missing, wrong, revoked | |
 | `NotFoundError` | 404: sandbox, template, command or file (`code` says which); also another tenant's sandbox | |
-| `ValidationError` | 400/413: malformed request, `invalid_timeout`, `network_not_allowed`, `command_not_found` | `details` |
+| `ValidationError` | 400/413: malformed request, `invalid_timeout` (`details.max_timeout_ms`), `network_not_allowed` | `details` |
+| `CommandStartError` | the command could not start: `command_not_found`, `exec_format`, `bad_cwd` (a `ValidationError`) | |
 | `PermissionDeniedError` | 403: the sandbox user may not access the path | |
 | `ConflictError` | 409: `tag_in_use`, `stdin_closed`, `process_exited`, `is_directory`, ... | |
 | `SandboxTerminatedError` | 409: the sandbox is not running any more | `state`, `reason` |
@@ -393,6 +496,7 @@ server's stable code), `status`, `requestId` and `details`.
 | `InternalServerError` | other 5xx | |
 | `ConnectionError` | the network failed, or a stream could not be re-established | `cause` |
 | `CommandExitError` | a command exited non-zero | `exitCode`, `stdout`, `stderr`, `reason`, `signal` |
+| `CommandTimeoutError` | a command was killed by its `timeoutMs` (a `CommandExitError`) | the same |
 
 ```ts
 import { CommandExitError, SandboxTerminatedError } from 'sbx-sdk'

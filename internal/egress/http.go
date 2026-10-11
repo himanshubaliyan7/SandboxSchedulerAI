@@ -21,11 +21,31 @@ var (
 	errObsFold        = errors.New("folded header line")
 )
 
+// PolicyBlockPrefix starts the status line and the body of every answer
+// to a request the sandbox's network policy refuses.
+const PolicyBlockPrefix = "blocked by sandbox network policy"
+
 // httpErrorText renders a complete proxy error response.
+//
+// A policy denial says so in words, twice. The body is for plain HTTP
+// clients. The reason phrase of the status line is for HTTPS, where the
+// client only ever sees the answer to its CONNECT: pip, urllib, curl and
+// Node print that line and nothing else ("Tunnel connection failed: 403
+// ..."), and "403 Forbidden" tells a newcomer nothing about why. The
+// machine-readable form stays in the X-Egress-* headers and at the end
+// of the body.
 func httpErrorText(status int, v Verdict, reason Reason, detail string) string {
+	phrase := http.StatusText(status)
 	body := fmt.Sprintf("egress proxy: %s: %s: %s\n", v, reason, detail)
+	if v == VerdictDenied {
+		// detail is built from validated hosts, addresses and ports; the
+		// replacement is defence against a future caller's free text.
+		line := strings.NewReplacer("\r", " ", "\n", " ").Replace(PolicyBlockPrefix + ": " + detail)
+		phrase = strings.ToUpper(line[:1]) + line[1:]
+		body = fmt.Sprintf("%s (egress proxy: %s: %s)\n", line, v, reason)
+	}
 	return fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\nX-Egress-Verdict: %s\r\nX-Egress-Reason: %s\r\n\r\n%s",
-		status, http.StatusText(status), len(body), v, reason, body)
+		status, phrase, len(body), v, reason, body)
 }
 
 func (c *conn) httpError(status int, v Verdict, reason Reason, detail string) {

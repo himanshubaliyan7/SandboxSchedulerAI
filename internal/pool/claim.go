@@ -17,9 +17,11 @@ import (
 type ClaimOptions struct {
 	// Env is injected into the session through the in-sandbox agent.
 	Env map[string]string
-	// Network is the egress policy. Nil means the template's mode with no
-	// allow or deny entries. Its mode may be the template's or a stricter
-	// one (none < allowlist < full), never a looser one.
+	// Network is the egress policy. Nil means the template's default
+	// policy (core.Template.DefaultPolicy): its mode, and for an allowlist
+	// template its default allowlist. A policy given here replaces that
+	// default altogether, lists included; its mode may be the template's
+	// or a stricter one (none < allowlist < full), never a looser one.
 	Network *core.NetworkPolicy
 	// AccessTokenHash is stored with the sandbox (SHA-256 of the
 	// per-sandbox access token), if the caller issues one.
@@ -60,7 +62,7 @@ func resolvePolicy(tmpl core.Template, want *core.NetworkPolicy) (core.NetworkPo
 		mode = core.NetworkNone
 	}
 	if want == nil {
-		return core.NetworkPolicy{Mode: mode}, nil
+		return tmpl.DefaultPolicy(), nil
 	}
 	p := *want
 	if p.Mode == "" {

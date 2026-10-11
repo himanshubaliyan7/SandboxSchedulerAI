@@ -165,6 +165,9 @@ type Config struct {
 	// CgroupRoot is where cgroup v2 is mounted; injectable for tests.
 	// Default /sys/fs/cgroup.
 	CgroupRoot string
+	// ProcRoot is where procfs is mounted; injectable for tests. Default
+	// /proc. It is read to find leftover conmon processes (Leftovers).
+	ProcRoot string
 
 	// DialTimeout bounds connecting to the socket; RequestTimeout bounds
 	// each API request that has no earlier context deadline.

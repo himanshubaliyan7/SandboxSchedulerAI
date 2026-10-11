@@ -39,6 +39,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -77,7 +78,10 @@ const templates = `[
  {"id":"life",  "image":"` + imgAlpine + `", "cpus":0.5, "memory":"128m", "pids_limit":64, "workdir_size":"32m", "tmp_size":"16m",
   "network":"none", "idle_timeout":"0s", "max_lifetime":"4s", "warm_target":1, "max_total":4},
  {"id":"bench", "image":"` + imgAlpine + `", "cpus":0.5, "memory":"64m", "pids_limit":32, "workdir_size":"16m", "tmp_size":"8m",
-  "network":"none", "idle_timeout":"10m", "max_lifetime":"1h", "warm_target":0, "max_total":40, "refill_rate":4}
+  "network":"none", "idle_timeout":"10m", "max_lifetime":"1h", "warm_target":0, "max_total":40, "refill_rate":4},
+ {"id":"deflt", "image":"` + imgPython + `", "cpus":1, "memory":"256m", "pids_limit":64, "workdir_size":"64m", "tmp_size":"32m",
+  "network":"allowlist", "allow_domains":["example.com"], "allow_cidrs":["203.0.113.0/24"],
+  "idle_timeout":"10m", "max_lifetime":"1h", "warm_target":0, "max_total":4}
 ]`
 
 // startUpstream returns "ip:port" of an HTTP server on a private address
@@ -204,7 +208,7 @@ func TestEndToEnd(t *testing.T) {
 	if err := os.WriteFile(tplFile, []byte(withRuntime(templates)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if out := e.admin("template", "apply", "--file", tplFile); strings.Count(out, "created") != 5 {
+	if out := e.admin("template", "apply", "--file", tplFile); strings.Count(out, "created") != 6 {
 		t.Fatalf("template apply: %s", out)
 	}
 	if out := e.admin("template", "list"); !strings.Contains(out, "py") || !strings.Contains(out, "allowlist") {
@@ -328,7 +332,7 @@ func TestEndToEnd(t *testing.T) {
 			} `json:"templates"`
 		}
 		acme.must(200, "GET", "/v1/templates", nil, "").decode(t, &tl)
-		if len(tl.Templates) != 5 {
+		if len(tl.Templates) != 6 {
 			t.Fatalf("templates: %+v", tl.Templates)
 		}
 		for _, tpl := range tl.Templates {
@@ -867,6 +871,110 @@ except Exception as e:
 		}
 	})
 
+	t.Run("IdentityPathAndTemplateDefaults", func(t *testing.T) {
+		// The template's default allowlist is listed, and is the policy
+		// of a sandbox created without one.
+		var tl struct {
+			Templates []struct {
+				ID           string   `json:"id"`
+				Network      string   `json:"network"`
+				AllowDomains []string `json:"allow_domains"`
+				AllowCIDRs   []string `json:"allow_cidrs"`
+			} `json:"templates"`
+		}
+		acme.must(200, "GET", "/v1/templates", nil, "").decode(t, &tl)
+		seen := false
+		for _, tpl := range tl.Templates {
+			if tpl.ID == "deflt" {
+				seen = len(tpl.AllowDomains) == 1 && tpl.AllowDomains[0] == "example.com" && len(tpl.AllowCIDRs) == 1 && tpl.Network == "allowlist"
+			} else if tpl.AllowDomains == nil || len(tpl.AllowDomains) != 0 {
+				t.Errorf("template %s: allow_domains %v, want an empty array", tpl.ID, tpl.AllowDomains)
+			}
+		}
+		if !seen {
+			t.Errorf("GET /v1/templates does not show the default allowlist of deflt: %+v", tl.Templates)
+		}
+		type netView struct {
+			Network struct {
+				Mode         string   `json:"mode"`
+				AllowDomains []string `json:"allow_domains"`
+				AllowCIDRs   []string `json:"allow_cidrs"`
+			} `json:"network"`
+		}
+		sb := acme.create(map[string]any{"template_id": "deflt"})
+		var def netView
+		acme.must(200, "GET", "/v1/sandboxes/"+sb.ID, nil, "").decode(t, &def)
+		if def.Network.Mode != "allowlist" || len(def.Network.AllowDomains) != 1 || def.Network.AllowDomains[0] != "example.com" || len(def.Network.AllowCIDRs) != 1 {
+			t.Errorf("a sandbox created without a policy: %+v, want the template's default allowlist", def.Network)
+		}
+		own := acme.create(map[string]any{"template_id": "deflt", "network": map[string]any{"allow_domains": []string{"example.org"}}})
+		var replaced netView
+		acme.must(200, "GET", "/v1/sandboxes/"+own.ID, nil, "").decode(t, &replaced)
+		if len(replaced.Network.AllowDomains) != 1 || replaced.Network.AllowDomains[0] != "example.org" || len(replaced.Network.AllowCIDRs) != 0 {
+			t.Errorf("a sandbox created with its own list: %+v, want exactly example.org", replaced.Network)
+		}
+		acme.must(204, "DELETE", "/v1/sandboxes/"+own.ID, nil, "")
+
+		// A blocked host says why, in the one line an HTTPS client shows.
+		const blocked = `import urllib.request
+try:
+    urllib.request.urlopen("https://example.org/", timeout=10)
+    print("reached")
+except Exception as e:
+    print(e)`
+		res := acme.exec(sb, map[string]any{"cmd": "python3", "args": []string{"-c", blocked}, "timeout_ms": 20000})
+		if out := string(res.Stdout); !strings.Contains(out, "403 Blocked by sandbox network policy: example.org is not in the allowlist") {
+			t.Errorf("a blocked HTTPS request reports: %q", out)
+		}
+		res = acme.exec(sb, shell(`python3 -c "import urllib.request,urllib.error
+try: urllib.request.urlopen('http://example.org/', timeout=10)
+except urllib.error.HTTPError as e: print(e.code, e.read().decode().strip())"`))
+		if out := string(res.Stdout); !strings.HasPrefix(out, "403 blocked by sandbox network policy: example.org is not in the allowlist (egress proxy: denied: host_not_allowed)") {
+			t.Errorf("a blocked HTTP request answers: %q", out)
+		}
+		if internet {
+			res = acme.exec(sb, map[string]any{"cmd": "python3", "args": []string{"-c",
+				`import urllib.request; print(urllib.request.urlopen("https://example.com/", timeout=15).status)`}, "timeout_ms": 30000})
+			if strings.TrimSpace(string(res.Stdout)) != "200" {
+				t.Errorf("the template's default allowlist does not let example.com through: %+v %s", res.Exit, res.Stderr)
+			}
+		}
+
+		// Who the sandbox thinks it is: a fixed, neutral identity on both
+		// tiers, and nothing of the host account or the host's name.
+		res = acme.exec(sb, shell("id -un; id -gn; id -u; whoami; hostname; echo $HOME; echo $PATH; echo $PYTHONUNBUFFERED; grep -c . /etc/hosts"))
+		lines := strings.Split(strings.TrimSpace(string(res.Stdout)), "\n")
+		if len(lines) != 9 || strings.Join(lines[:6], " ") != "sandbox sandbox 1000 sandbox sandbox /workspace" ||
+			!strings.HasPrefix(lines[6], "/workspace/.local/bin:/usr/local/bin:") || lines[7] != "1" ||
+			(lines[8] != "3" && os.Getenv("SBX_E2E_PODMAN_MODE") != "external") {
+			t.Errorf("identity and environment inside a sandbox: %q", lines)
+		}
+		hostUser, hostName := "", ""
+		if u, err := user.Current(); err == nil {
+			hostUser = u.Username
+		}
+		hostName, _ = os.Hostname()
+		res = acme.exec(sb, shell("{ env; id; hostname; cat /etc/passwd /etc/group /etc/hosts /etc/hostname /proc/sys/kernel/hostname; tr '\\0' '\\n' < /proc/1/environ; ls /sys/devices/virtual/dmi/id; } 2>/dev/null"))
+		dump := strings.ToLower(string(res.Stdout))
+		for what, needle := range map[string]string{"account name": hostUser, "hostname": hostName} {
+			if needle != "" && strings.Contains(dump, strings.ToLower(needle)) {
+				t.Errorf("the host's %s (%s) is visible inside a sandbox:\n%s", what, needle, dump)
+			}
+		}
+		if strings.Contains(dump, "product_name") || strings.Contains(dump, "host.containers.internal") {
+			t.Errorf("the DMI tables or the host's address are visible inside a sandbox:\n%s", dump)
+		}
+
+		// pip installs for the user on the read-only root, and what it
+		// installs is found by name. This part needs the index; without
+		// internet only the PATH is checked.
+		res = acme.exec(sb, shell("mkdir -p ~/.local/bin && printf '#!/bin/sh\\necho from-user-bin\\n' > ~/.local/bin/mytool && chmod +x ~/.local/bin/mytool && mytool"))
+		if strings.TrimSpace(string(res.Stdout)) != "from-user-bin" {
+			t.Errorf("a program in /workspace/.local/bin is not found by name: %+v %s", res.Exit, res.Stderr)
+		}
+		acme.must(204, "DELETE", "/v1/sandboxes/"+sb.ID, nil, "")
+	})
+
 	t.Run("SecondTenantCannotTouchIt", func(t *testing.T) {
 		for _, c := range []struct{ method, path string }{
 			{"GET", "/v1/sandboxes/" + sb.ID},
@@ -1034,17 +1142,32 @@ except Exception as e:
 	t.Run("IdleTimeout", func(t *testing.T) {
 		idle := acme.create(map[string]any{"template_id": "idle"})
 		busy := acme.create(map[string]any{"template_id": "idle"})
+		// A third is kept alive the E2B way, by extending its timeout and
+		// doing nothing else; a fourth is only looked at, which is not
+		// activity.
+		kept := acme.create(map[string]any{"template_id": "idle"})
+		watched := acme.create(map[string]any{"template_id": "idle"})
 		start := time.Now()
-		// Keep one of the two active for more than two idle periods.
+		// Keep them going for more than two idle periods.
 		for time.Since(start) < 7*time.Second {
 			if res := acme.exec(busy, shell("true")); res.Exit.ExitCode != 0 {
 				t.Fatalf("busy sandbox: %+v", res.Exit)
 			}
+			acme.must(200, "POST", "/v1/sandboxes/"+kept.ID+"/timeout", map[string]any{"timeout_ms": 600_000}, "")
+			acme.do("GET", "/v1/sandboxes/"+watched.ID, nil, "")
+			acme.do("GET", "/v1/sandboxes", nil, "")
 			time.Sleep(400 * time.Millisecond)
 		}
 		if got := acme.get(busy.ID); got.State != "running" {
 			t.Errorf("the active sandbox was terminated: %+v", got)
 		}
+		if got := acme.get(kept.ID); got.State != "running" {
+			t.Errorf("the sandbox kept alive with the timeout call was terminated: %+v", got)
+		}
+		if got := acme.get(watched.ID); got.State == "running" || got.Reason != "idle_timeout" {
+			t.Errorf("reading a sandbox kept it alive: %+v", got)
+		}
+		acme.must(204, "DELETE", "/v1/sandboxes/"+kept.ID, nil, "")
 		gone, _ := acme.waitState(idle.ID, "destroyed", 20*time.Second)
 		if gone.Reason != "idle_timeout" {
 			t.Errorf("idle sandbox reason %q, want idle_timeout", gone.Reason)
@@ -1065,11 +1188,25 @@ except Exception as e:
 			acme.exec(short, shell("true"))
 			time.Sleep(300 * time.Millisecond)
 		}
-		// Neither can the timeout endpoint, past the template's limit.
-		var v sandbox
-		acme.must(200, "POST", "/v1/sandboxes/"+short.ID+"/timeout", map[string]any{"timeout_ms": 3_600_000}, "").decode(t, &v)
-		if v.ExpiresAt == nil || v.StartedAt == nil || v.ExpiresAt.Sub(*v.StartedAt) != 4*time.Second {
-			t.Errorf("timeout past the template limit: started %v expires %v", v.StartedAt, v.ExpiresAt)
+		// Neither can the timeout endpoint, past the template's limit:
+		// it refuses, as create does, and says how much is left.
+		r := acme.do("POST", "/v1/sandboxes/"+short.ID+"/timeout", map[string]any{"timeout_ms": 3_600_000}, "")
+		var refused struct {
+			Error struct {
+				Code    string `json:"code"`
+				Details struct {
+					MaxTimeoutMs  *int64 `json:"max_timeout_ms"`
+					MaxLifetimeMs int64  `json:"max_lifetime_ms"`
+				} `json:"details"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(r.Body, &refused)
+		if d := refused.Error.Details; r.Status != 400 || refused.Error.Code != "invalid_timeout" || d.MaxLifetimeMs != 4000 ||
+			d.MaxTimeoutMs == nil || *d.MaxTimeoutMs < 0 || *d.MaxTimeoutMs > 1500 {
+			t.Errorf("timeout past the template limit: %d %s", r.Status, r.Body)
+		}
+		if v := acme.get(short.ID); v.ExpiresAt == nil || v.StartedAt == nil || v.ExpiresAt.Sub(*v.StartedAt) != 4*time.Second {
+			t.Errorf("a refused timeout changed the lifetime: started %v expires %v", v.StartedAt, v.ExpiresAt)
 		}
 		gone, _ := acme.waitState(short.ID, "destroyed", 20*time.Second)
 		if lived := time.Since(start); gone.Reason != "max_lifetime" || lived < 4*time.Second || lived > 12*time.Second {

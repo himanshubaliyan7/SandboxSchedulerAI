@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -171,6 +172,9 @@ func itStartManaged() {
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "runsc-shim" {
 		os.Exit(runscshim.Main(os.Args[2:], os.Stderr))
+	}
+	if os.Getenv(fakeConmonEnv) != "" {
+		fakeConmon() // never returns; see leftovers_test.go
 	}
 	code := m.Run()
 	for _, svc := range itManaged.services {
@@ -778,6 +782,9 @@ func TestIntegrationUsernsModes(t *testing.T) {
 			if got := itMustExec(t, inst.ID, "id -u"); got != "1000" {
 				t.Errorf("container uid = %q, want 1000", got)
 			}
+			if got := itMustExec(t, inst.ID, "id -un; id -gn"); got != "sandbox\nsandbox" {
+				t.Errorf("mode %s: container user and group are %q, want sandbox", tc.mode, got)
+			}
 			itMustExec(t, inst.ID, "echo x > /workspace/f && echo x > /tmp/f")
 			out, err := itPodman(context.Background(), "inspect", "-f", "{{.State.Pid}}", inst.ID).Output()
 			if err != nil {
@@ -800,6 +807,81 @@ func TestIntegrationUsernsModes(t *testing.T) {
 				t.Errorf("mode %s: write to run dir succeeded=%v, documented=%v", tc.mode, err == nil, tc.runDirOK)
 			}
 		})
+	}
+}
+
+// TestIntegrationNoHostIdentity checks that a sandbox cannot learn who
+// runs it: the host account's login and full name, the host's name and
+// the machine's model must not appear in the sandbox's user database,
+// hostname, hosts file, environment, or the parts of /proc and /sys a
+// sandbox can read. One place is known to remain under crun and is
+// reported, not failed: /proc/self/mountinfo shows the host paths of the
+// image store (overlayfs options) and of bind-mount sources.
+func TestIntegrationNoHostIdentity(t *testing.T) {
+	b := itBackend(t, nil)
+	if os.Getenv("SBX_PODMAN_SOCKET") != "" {
+		t.Log("external Podman service: /etc/hosts is that service's business (base_hosts_file), only the user database is checked strictly")
+	}
+	needles := map[string]string{}
+	if u, err := user.Current(); err == nil {
+		needles["login name"] = u.Username
+		for _, part := range strings.Fields(strings.Split(u.Name, ",")[0]) {
+			if len(part) >= 4 {
+				needles["full name ("+part+")"] = part
+			}
+		}
+	}
+	if h, err := os.Hostname(); err == nil {
+		needles["hostname"] = h
+	}
+	if raw, err := os.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err == nil && len(strings.TrimSpace(string(raw))) >= 4 {
+		needles["DMI product name"] = strings.TrimSpace(string(raw))
+	}
+	if len(needles) == 0 {
+		t.Skip("cannot determine the host identity to look for")
+	}
+	for _, image := range []string{itAlpine, itPython} {
+		inst := itCreate(t, b, image, itResources())
+		if got := itMustExec(t, inst.ID, "id"); !strings.HasPrefix(got, "uid=1000(sandbox) gid=1000(sandbox)") {
+			t.Errorf("%s: id = %q", image, got)
+		}
+		if got := itMustExec(t, inst.ID, "whoami; hostname; cat /proc/sys/kernel/hostname; echo $HOSTNAME; grep :1000: /etc/passwd; grep :1000: /etc/group"); got !=
+			"sandbox\nsandbox\nsandbox\nsandbox\nsandbox:x:1000:1000:sandbox:/workspace:/bin/sh\nsandbox:x:1000:" {
+			t.Errorf("%s: identity inside the sandbox:\n%s", image, got)
+		}
+		t.Logf("%s /etc/hosts: %s", image, strings.Join(strings.Split(itMustExec(t, inst.ID, "cat /etc/hosts"), "\n"), " | "))
+		t.Logf("%s resolv.conf: %q", image, itMustExec(t, inst.ID, "cat /etc/resolv.conf 2>&1 || true"))
+		// Everything a sandbox can read that is not its own files: the
+		// whole of /etc, its environment and PID 1's, and the readable
+		// text files of /proc and /sys that are about the machine.
+		const sources = `{ env; id; hostname; cat /proc/1/environ /proc/self/environ | tr '\0' '\n';
+			cat /proc/sys/kernel/hostname /proc/sys/kernel/domainname /proc/self/cgroup /proc/self/uid_map /proc/self/status /proc/cmdline /proc/1/cmdline;
+			find /etc /run -xdev -type f -size -1024k 2>/dev/null | while read f; do echo "== $f"; cat "$f" 2>/dev/null; done;
+			find /sys/devices/virtual/dmi /sys/class/dmi -type f 2>/dev/null | while read f; do echo "== $f"; cat "$f" 2>/dev/null; done;
+		} 2>/dev/null | tr -d '\0'`
+		dump := strings.ToLower(itMustExec(t, inst.ID, sources))
+		mounts := strings.ToLower(itMustExec(t, inst.ID, "cat /proc/self/mountinfo"))
+		for what, needle := range needles {
+			n := strings.ToLower(needle)
+			if strings.Contains(dump, n) {
+				for _, line := range strings.Split(dump, "\n") {
+					if strings.Contains(line, n) {
+						t.Errorf("%s: the host's %s is visible inside the sandbox: %q", image, what, line)
+					}
+				}
+			}
+			if strings.Contains(mounts, n) {
+				t.Logf("%s: known remainder: /proc/self/mountinfo shows the host's %s (image store and bind-mount paths)", image, what)
+			}
+		}
+		if os.Getenv("SBX_PODMAN_SOCKET") == "" {
+			if hosts := itMustExec(t, inst.ID, "cat /etc/hosts"); strings.Contains(hosts, "host.containers.internal") {
+				t.Errorf("%s: /etc/hosts names the host's address:\n%s", image, hosts)
+			}
+		}
+		if out, err := itExec(t, inst.ID, "ls /sys/devices/virtual/dmi/id/ 2>/dev/null | head -3"); err == nil && out != "" {
+			t.Errorf("%s: the DMI tables are readable: %s", image, out)
+		}
 	}
 }
 

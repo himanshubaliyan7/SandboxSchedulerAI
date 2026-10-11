@@ -3,11 +3,13 @@ package webhook
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -462,5 +464,15 @@ func TestSenderTLS(t *testing.T) {
 	}
 	if got.count() != 1 {
 		t.Errorf("%d requests arrived", got.count())
+	}
+}
+
+// The detail of a failed attempt is logged; it must not repeat the
+// request URL, whose path and query are often the receiver's credential.
+func TestClassifyErrorDetailHasNoURL(t *testing.T) {
+	err := &url.Error{Op: "Post", URL: "https://hooks.example.com/s3cr3t-path?token=s3cr3t-token", Err: errors.New("EOF")}
+	res := classifyError(err)
+	if strings.Contains(res.Detail, "s3cr3t") || strings.Contains(res.Error, "s3cr3t") || !strings.Contains(res.Detail, "EOF") {
+		t.Errorf("classified %v as %+v", err, res)
 	}
 }

@@ -1304,3 +1304,55 @@ func TestTemplateRuntimeNotEnabled(t *testing.T) {
 	h.c.Kick()
 	eventually(t, "the pool to fill once the runtime is enabled", func() bool { return len(h.inState(core.StateWarm)) == 3 })
 }
+
+// A sandbox created without a network policy gets the template's default
+// allowlist; a policy of its own replaces the default, lists included,
+// and still may not widen the template's mode.
+func TestClaimAppliesTheTemplatesDefaultAllowlist(t *testing.T) {
+	h := newHarness(t, func(tm *core.Template) {
+		tm.Network = core.NetworkAllowlist
+		tm.AllowDomains = []string{"pypi.org", "files.pythonhosted.org"}
+		tm.AllowCIDRs = []string{"203.0.113.0/24"}
+		tm.WarmTarget = 4
+	})
+	h.start()
+	h.settled(4)
+	policyOf := func(opts pool.ClaimOptions) core.NetworkPolicy {
+		t.Helper()
+		sb, err := h.c.Claim(ctxBg(), tenant, tmplID, opts)
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		att, ok := h.egress.Attached(sb.ID)
+		if !ok {
+			t.Fatalf("sandbox %s is not attached to the egress proxy", sb.ID)
+		}
+		return att.Policy
+	}
+	// No policy: the template's defaults.
+	if p := policyOf(pool.ClaimOptions{}); p.Mode != core.NetworkAllowlist || len(p.AllowDomains) != 2 || p.AllowDomains[0] != "pypi.org" ||
+		len(p.AllowCIDRs) != 1 {
+		t.Errorf("claim without a policy: %+v, want the template's default allowlist", p)
+	}
+	// Its own list: replaces the default, does not extend it.
+	if p := policyOf(pool.ClaimOptions{Network: &core.NetworkPolicy{AllowDomains: []string{"example.com"}}}); len(p.AllowDomains) != 1 ||
+		p.AllowDomains[0] != "example.com" || len(p.AllowCIDRs) != 0 {
+		t.Errorf("claim with its own list: %+v, want exactly example.com", p)
+	}
+	// An empty policy object is a policy: allowlist mode, nothing allowed.
+	if p := policyOf(pool.ClaimOptions{Network: &core.NetworkPolicy{}}); p.Mode != core.NetworkAllowlist || len(p.AllowDomains)+len(p.AllowCIDRs) != 0 {
+		t.Errorf("claim with an empty policy: %+v, want allowlist mode with no entries", p)
+	}
+	// Wider than the template: refused, defaults or not.
+	if _, err := h.c.Claim(ctxBg(), tenant, tmplID, pool.ClaimOptions{Network: &core.NetworkPolicy{Mode: core.NetworkFull}}); !errors.Is(err, pool.ErrNetworkNotAllowed) {
+		t.Errorf("a claim wider than the template: %v", err)
+	}
+	// The defaults belong to allowlist templates only.
+	full := core.Template{Network: core.NetworkFull, AllowDomains: []string{"pypi.org"}}
+	if p := full.DefaultPolicy(); p.Mode != core.NetworkFull || len(p.AllowDomains) != 0 {
+		t.Errorf("default policy of a full template: %+v", p)
+	}
+	if p := (core.Template{}).DefaultPolicy(); p.Mode != core.NetworkNone {
+		t.Errorf("default policy of a template without a mode: %+v", p)
+	}
+}

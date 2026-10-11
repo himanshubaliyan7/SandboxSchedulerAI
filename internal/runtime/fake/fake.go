@@ -51,6 +51,42 @@ type Backend struct {
 	listErr       error
 	caps          runtime.Capabilities
 	now           func() time.Time
+	leftovers     []string // sandbox ids with a leftover host process
+}
+
+// AddLeftover records a leftover host process of a sandbox (see
+// runtime.LeftoverReaper): something Destroy has already forgotten.
+func (b *Backend) AddLeftover(sandboxID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.leftovers = append(b.leftovers, sandboxID)
+}
+
+// Leftovers returns the sandbox ids whose leftover is still there.
+func (b *Backend) Leftovers() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.leftovers...)
+}
+
+// ReapLeftovers implements runtime.LeftoverReaper.
+func (b *Backend) ReapLeftovers(ctx context.Context, owned func(sandboxID string) bool) (int, error) {
+	b.mu.Lock()
+	all := append([]string(nil), b.leftovers...)
+	b.mu.Unlock()
+	var keep []string
+	n := 0
+	for _, id := range all {
+		if owned(id) { // called without the lock: it reads the store
+			n++
+		} else {
+			keep = append(keep, id)
+		}
+	}
+	b.mu.Lock()
+	b.leftovers = keep
+	b.mu.Unlock()
+	return n, nil
 }
 
 type entry struct {

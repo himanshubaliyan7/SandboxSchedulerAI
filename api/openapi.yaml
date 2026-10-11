@@ -76,12 +76,32 @@ info:
     Three independent timers end a sandbox, each with its own `reason`:
     the template's idle timeout (`idle_timeout`), the sandbox's maximum
     lifetime (`max_lifetime`, set at create with `timeout_ms` and changed
-    with `POST /v1/sandboxes/{id}/timeout`, never beyond the template's
-    limit), and the per-command `timeout_ms` (which ends the command, not
-    the sandbox). "Activity" for the idle timer is any data-plane request
-    for the sandbox and any output delivered to an attached stream or
-    WebSocket; control-plane requests are not activity. Activity is
-    recorded at most once per `--touch-interval` (default 5 s).
+    with `POST /v1/sandboxes/{id}/timeout`), and the per-command
+    `timeout_ms` (which ends the command, not the sandbox).
+
+    The maximum lifetime never exceeds the template's `max_lifetime_ms`,
+    counted from the sandbox's start, and both routes enforce that the
+    same way: a `timeout_ms` that would is refused with `400
+    invalid_timeout`, whose `details.max_timeout_ms` is the largest value
+    the same request could have carried (and `details.max_lifetime_ms`
+    the template's limit). Nothing is capped silently, so the lifetime a
+    client asked for is the lifetime it has.
+
+    What counts as activity for the idle timer, exactly:
+
+    * every data-plane request for the sandbox (the `commands`, `files`
+      and `pty` routes), with either credential, whatever its answer;
+    * output delivered to an attached NDJSON stream or WebSocket, and
+      input received on a WebSocket;
+    * `POST /v1/sandboxes/{id}/timeout`: setting the lifetime is the
+      client saying it still uses the sandbox, so a keep-alive loop that
+      extends the timeout also keeps an idle sandbox alive.
+
+    What does not: `GET /v1/sandboxes/{id}`, `GET /v1/sandboxes`, the
+    `events` and `stats` routes, `PUT .../network`, and a command that
+    runs in the sandbox with nobody attached to its output. Data-plane
+    activity is recorded at most once per `--touch-interval` (default
+    5 s); a timeout call always is.
 
     A used sandbox is never reused: `DELETE`, a timer or a failure destroys
     the container and its storage. After a server restart every session of
@@ -286,6 +306,13 @@ paths:
         returns it `running`. If the pool is empty the request waits for
         the server's `--claim-wait` (default 5 s) before answering `503
         pool_empty`. Counts against the tenant's `create` rate bucket.
+
+        Network: without a `network` object the sandbox gets the template's
+        default policy, that is the template's mode and, for an `allowlist`
+        template, its `allow_domains` and `allow_cidrs` (see `GET
+        /v1/templates`). A `network` object replaces that default, lists
+        included, and may not be wider than the template's mode. The
+        response's `network` is the policy in force.
       requestBody:
         required: true
         content:
@@ -300,7 +327,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CreatedSandbox" }
         "400":
-          description: "`bad_request`, `invalid_timeout` (with `details.max_timeout_ms`) or `network_not_allowed` (the mode is looser than the template's)."
+          description: "`bad_request`, `invalid_timeout` (`timeout_ms` is negative or above the template's `max_lifetime_ms`; `details.max_timeout_ms` has the limit; the request is refused, not capped) or `network_not_allowed` (the mode is looser than the template's)."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
@@ -425,9 +452,19 @@ paths:
       summary: Set the remaining lifetime
       description: |
         Sets `expires_at` to now + `timeout_ms`, which may shorten or
-        extend the sandbox's life. The result is silently capped at
-        `started_at` + the template's `max_lifetime_ms`; read `expires_at`
-        in the response for the effective value.
+        extend the sandbox's life. The new end may not lie after
+        `started_at` + the template's `max_lifetime_ms`: a request that
+        would is refused with `400 invalid_timeout` and changes nothing,
+        exactly as a too-long `timeout_ms` at create is. `details.
+        max_timeout_ms` is then the largest `timeout_ms` that would have
+        been accepted at that moment (0 if the limit has already passed),
+        so a client that wants "as long as allowed" can retry with it.
+        (Before this was made consistent with create, the route silently
+        capped the value.) A template with `max_lifetime_ms` 0, or one
+        that has been deleted since, imposes no limit.
+
+        The call counts as activity: it sets `last_activity_at` and so
+        restarts the idle timer. See "Sandbox lifetime".
       requestBody:
         required: true
         content:
@@ -441,7 +478,7 @@ paths:
       responses:
         "200": { description: The updated sandbox., content: { application/json: { schema: { $ref: "#/components/schemas/Sandbox" } } } }
         "400":
-          description: "`invalid_timeout` (not positive) or `bad_request`."
+          description: "`invalid_timeout` (`timeout_ms` is not positive, or the new end would lie past the template's max lifetime; then with `details.max_timeout_ms` and `details.max_lifetime_ms`) or `bad_request`."
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1390,7 +1427,7 @@ components:
         details:
           type: object
           additionalProperties: true
-          description: "Code-specific. `state` and `reason` for `sandbox_not_running` and `sandbox_terminated`; `class` for `rate_limited`; `max_timeout_ms` for `invalid_timeout`."
+          description: "Code-specific. `state` and `reason` for `sandbox_not_running` and `sandbox_terminated`; `class` for `rate_limited`; `max_timeout_ms` (the largest `timeout_ms` the request could have carried) and `max_lifetime_ms` for `invalid_timeout`."
     SandboxState:
       type: string
       enum: [assigned, running, recycling, destroyed, failed, unknown]
@@ -1418,11 +1455,17 @@ components:
         mode:
           type: string
           enum: [none, allowlist, full]
-          description: "`none`: no egress. `allowlist`: only the listed destinations. `full`: any public destination. Omitted means the template's mode."
+          description: "`none`: no egress. `allowlist`: only the listed destinations. `full`: any public destination. Omitted means the template's mode. Never wider than the template's `network`."
         allow_domains:
           type: array
           items: { type: string }
-          description: Exact hostnames, or `*.example.com` (any depth of subdomain, not the apex).
+          description: |
+            Exact hostnames, or `*.example.com` (any depth of subdomain, not
+            the apex). A request to any other host is answered by the
+            sandbox's proxy with `403 Blocked by sandbox network policy:
+            <host> is not in the allowlist` (that sentence is the status
+            line's reason phrase, which is what `pip`, `curl` and `urllib`
+            print for a refused HTTPS tunnel, and the start of the body).
         allow_cidrs:
           type: array
           items: { type: string }
@@ -1441,7 +1484,7 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Maximum lifetime of the sandbox. At most the template's `max_lifetime_ms`; 0 or absent means the template's.
+          description: Maximum lifetime of the sandbox. At most the template's `max_lifetime_ms` (more is refused with `invalid_timeout`, not capped); 0 or absent means the template's.
         env:
           type: object
           additionalProperties: { type: string }
@@ -1472,7 +1515,7 @@ components:
         - type: object
           required: [access_token]
           properties:
-            access_token: { type: string, description: "`sbt_` + 64 hex digits. Returned only by this call.", example: "sbt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+            access_token: { type: string, description: "`sbt_` + 64 hex digits. Returned only by this call.", example: "sbt_<64 hex digits>" }
     Event:
       type: object
       required: [id, type, at]
@@ -1514,7 +1557,7 @@ components:
         memory_high_hits: { type: integer, format: int64 }
     Template:
       type: object
-      required: [id, version, image, runtime, resources, network, idle_timeout_ms, max_lifetime_ms]
+      required: [id, version, image, runtime, resources, network, allow_domains, allow_cidrs, idle_timeout_ms, max_lifetime_ms]
       properties:
         id: { type: string }
         version: { type: integer, format: int64 }
@@ -1544,6 +1587,23 @@ components:
             tmp_bytes: { type: integer, format: int64, description: Size of `/tmp`. }
             nofile_limit: { type: integer, format: int64 }
         network: { type: string, enum: [none, allowlist, full], description: The widest mode a sandbox of this template may ask for. }
+        allow_domains:
+          type: array
+          items: { type: string }
+          example: [pypi.org, files.pythonhosted.org]
+          description: |
+            The template's default allowlist (set with `sbxd admin template
+            apply --allow-domains`). A sandbox created without a `network`
+            object gets the template's mode and, when that is `allowlist`,
+            these hosts and `allow_cidrs`. A create request that carries a
+            `network` object replaces them with its own lists: it does not
+            add to them, and an empty or absent list in it means "nothing".
+            Always present; empty when the template has none, in which case
+            a sandbox created without a policy reaches nothing.
+        allow_cidrs:
+          type: array
+          items: { type: string }
+          description: The CIDR part of the default allowlist (IP-literal targets); see `allow_domains`.
         idle_timeout_ms: { type: integer, format: int64, description: 0 means none. }
         max_lifetime_ms: { type: integer, format: int64, description: 0 means none. }
     PTYSize:
@@ -1685,7 +1745,7 @@ components:
       required: [id, url, event_types, description, enabled, created_at, updated_at, consecutive_failures, dropped_events]
       properties:
         id: { type: string }
-        url: { type: string, description: Normalised (lower-case host, no default port). }
+        url: { type: string, description: "Normalised (lower-case host, no default port)." }
         event_types: { type: array, items: { $ref: "#/components/schemas/WebhookEventType" } }
         description: { type: string }
         enabled: { type: boolean }
@@ -1703,14 +1763,14 @@ components:
         last_failure_at: { type: string, format: date-time }
         last_error: { type: string }
         next_attempt_at: { type: string, format: date-time, description: Present while a failed event is waiting for its retry. }
-        dropped_events: { type: integer, format: int64, description: Events that were given up on (older than the retention window, or rejected by the endpoint too often). }
+        dropped_events: { type: integer, format: int64, description: "Events that were given up on (older than the retention window, or rejected by the endpoint too often)." }
     WebhookWithSecret:
       allOf:
         - $ref: "#/components/schemas/Webhook"
         - type: object
           required: [secret]
           properties:
-            secret: { type: string, description: "The signing secret: `whsec_` and 32 random bytes in base64. Shown in this response only.", example: whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw }
+            secret: { type: string, description: "The signing secret: `whsec_` and 32 random bytes in base64. Shown in this response only.", example: "whsec_<base64-secret>" }
     WebhookTestResult:
       type: object
       required: [event_id, delivered, duration_ms]

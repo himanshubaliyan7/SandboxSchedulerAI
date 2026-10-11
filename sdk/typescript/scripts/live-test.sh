@@ -84,7 +84,8 @@ locked() {
   key=$("$bin/sbxd" admin key create --tenant acme --json | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).key)')
   other=$("$bin/sbxd" admin key create --tenant other --json | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).key)')
   "$bin/sbxd" admin template apply --id python --image "$IMAGE" \
-    --memory 256m --workdir-size 64m --tmp-size 32m --network allowlist --warm-target 3 >/dev/null
+    --memory 256m --workdir-size 64m --tmp-size 32m --network allowlist \
+    --allow-domains pypi.org,files.pythonhosted.org --warm-target 3 >/dev/null
 
   log "starting sbxd on 127.0.0.1:$PORT"
   "$bin/sbxd" serve --listen "127.0.0.1:$PORT" --run-dir "$RUN_DIR" --host-id "$HOST_ID" \

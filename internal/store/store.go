@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	neturl "net/url"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -51,6 +53,14 @@ type Store struct {
 // Open connects to Postgres, verifies the connection and applies any
 // pending migrations.
 func Open(ctx context.Context, url string) (*Store, error) {
+	st, err := open(ctx, url)
+	if err != nil {
+		return nil, redactError(err, url)
+	}
+	return st, nil
+}
+
+func open(ctx context.Context, url string) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("store: parse database url: %w", err)
@@ -69,6 +79,64 @@ func Open(ctx context.Context, url string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// redactedError is an error whose text has had a secret removed. The
+// original stays reachable for errors.Is and errors.As, which look at
+// types and values, not at text.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+var dsnPasswordRE = regexp.MustCompile(`(?i)\bpassword\s*=\s*('(?:[^'\\]|\\.)*'|\S+)`)
+
+// redactError makes sure an error from opening the database cannot carry
+// the database URL's password, whatever the driver put in its text: the
+// error ends up on a terminal, in a log and in bug reports. The URL
+// itself, its password (as written and percent-decoded) and the value of
+// a keyword/value "password=" are each replaced.
+func redactError(err error, dsn string) error {
+	secrets := []string{}
+	if dsn != "" {
+		secrets = append(secrets, dsn)
+	}
+	if u, perr := neturl.Parse(dsn); perr == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			secrets = append(secrets, pw, neturl.QueryEscape(pw), neturl.PathEscape(pw))
+		}
+		if pw := u.Query().Get("password"); pw != "" {
+			secrets = append(secrets, pw, neturl.QueryEscape(pw))
+		}
+	}
+	// A URL that does not parse still has its password between the first
+	// ':' after the scheme and the last '@'.
+	if i := strings.Index(dsn, "://"); i >= 0 {
+		rest := dsn[i+3:]
+		if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+			if colon := strings.IndexByte(rest[:at], ':'); colon >= 0 && colon+1 < at {
+				secrets = append(secrets, rest[colon+1:at])
+			}
+		}
+	}
+	for _, m := range dsnPasswordRE.FindAllStringSubmatch(dsn, -1) {
+		secrets = append(secrets, m[1], strings.Trim(m[1], "'"))
+	}
+	msg := err.Error()
+	// Longest first, so that a secret containing another is replaced whole.
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	for _, sec := range secrets {
+		if sec != "" {
+			msg = strings.ReplaceAll(msg, sec, "REDACTED")
+		}
+	}
+	if msg == err.Error() {
+		return err
+	}
+	return &redactedError{msg: msg, err: err}
 }
 
 // New wraps an existing pool without running migrations.

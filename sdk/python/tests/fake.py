@@ -340,8 +340,11 @@ class FakeServer:
                             "version": 3,
                             "image": "docker.io/library/python:3.12-alpine",
                             "runtime": "crun",
+                            "shared_kernel": True,
                             "resources": {"cpus": 1, "memory_bytes": 268435456},
                             "network": "allowlist",
+                            "allow_domains": ["pypi.org", "files.pythonhosted.org"],
+                            "allow_cidrs": [],
                             "idle_timeout_ms": 600000,
                             "max_lifetime_ms": 3600000,
                         }
@@ -398,6 +401,11 @@ class FakeServer:
                 return error(400, "invalid_timeout", "timeout_ms must be positive")
             if sb.state != "running":
                 return not_running(sb)
+            # As the server: past the template's max lifetime is refused, not capped.
+            limit = self.templates[sb.template_id]["max_lifetime_ms"]
+            if body["timeout_ms"] > limit:
+                return error(400, "invalid_timeout", "timeout_ms would end the sandbox after the template's max lifetime",
+                             max_timeout_ms=limit, max_lifetime_ms=limit)  # fmt: skip
             sb.expires_at = f"2026-10-10T08:00:{min(body['timeout_ms'] // 1000, 59):02d}Z"
             return httpx.Response(200, json=sb.view())
         if rest == "/network" and method == "PUT":

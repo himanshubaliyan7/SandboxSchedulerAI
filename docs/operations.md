@@ -16,6 +16,7 @@
   nor changed. The service shares your image and container store, so `podman pull`
   is how images get there and `podman ps` shows the sandboxes. What the generated
   file sets: `keyring = false`, `default_sysctls = []`, `log_driver = "none"`,
+  `base_hosts_file = "none"`, `host_containers_internal_ip = "none"`,
   `events_logger = "none"`, `cgroup_manager = "systemd"` and the runtime table.
   - If the service dies, the supervisor restarts it with backoff (200 ms doubling to
     10 s); sandboxes are conmon's children, not the service's, and keep running.
@@ -53,7 +54,73 @@
 - **Metrics.** `/metrics` is unauthenticated on the API listener, which is only
   allowed while `--listen` is a loopback address: otherwise `sbxd serve` refuses to
   start unless `--metrics-token` (bearer token) or `--metrics-listen` (separate
-  listener, route removed from the API listener) is set.
+  listener, route removed from the API listener) is set. The output is Prometheus
+  text format 0.0.4 and is checked by the tests the way a strict scraper reads it
+  (no series twice, HELP and TYPE once per family). `sbx_pool_sandboxes` has one
+  series per template and state: `warm`, `creating`, `assigned`, `running`,
+  `recycling`, `failed`.
+- **Secrets.** The database URL (`SBX_DATABASE_URL`) and the metrics token
+  (`SBX_METRICS_TOKEN`) are best given in the environment: a flag is visible in the
+  process list. `-h` of every command says whether each variable is set and never
+  prints its value, and an error from opening the database never contains the URL's
+  password. Log lines name a webhook by id and by scheme and host only (the path and
+  query of a receiver's URL are often its credential). API keys, sandbox access
+  tokens and webhook secrets are shown once, by the command or the API call that
+  creates them, and are not logged.
+- **Templates.** `sbxd admin template apply <id> --image ...` creates or replaces a
+  template; `-h` lists what a sandbox takes from its image and what it does not
+  (`ENTRYPOINT`, `CMD` and `USER` are ignored; the root is read-only). Network:
+  `--network` is the widest mode a sandbox may ask for, and with `allowlist`,
+  `--allow-domains` / `--allow-cidrs` are the default allowlist of a sandbox whose
+  create request names no network policy. A request that names one replaces the
+  list. The defaults are stored on the template (migration `0004_template_egress`),
+  are applied when a sandbox is claimed and can be changed without recycling the
+  warm pool; `GET /v1/templates` shows them. A blocked host answers
+  `403 Blocked by sandbox network policy: <host> is not in the allowlist`.
+- **Timeouts.** `--idle-timeout` and `--max-lifetime` are per template. A client's
+  `timeout_ms`, at create or through `POST /v1/sandboxes/{id}/timeout`, may not take
+  a sandbox past `started_at` + max lifetime: it is refused with `400
+  invalid_timeout` (the allowed maximum is in the error's details), never capped.
+  Activity for the idle timer is data-plane traffic and the timeout call; reading a
+  sandbox's state is not. The exact list is in `api/openapi.yaml`, "Sandbox lifetime".
+- **Webhooks.** On by default (`--webhooks=false` stops the delivery worker and makes
+  the `/v1/webhooks` routes answer 501). Tenants register HTTPS endpoints through
+  the API, an operator with `sbxd admin webhook create|list|delete`. Events come
+  from the same event log the API serves; a worker in `sbxd` delivers them in order
+  per webhook, at least once, signed (Standard Webhooks), with retries that back off
+  from `--webhook-retry-base` (5 s) to `--webhook-retry-max` (15 m). An event
+  undelivered for `--webhook-retention` (24 h) is dropped and counted, and a
+  webhook failing for `--webhook-disable-after` (72 h) is switched off. Destinations
+  are validated when a webhook is created and again at every delivery: `https` only,
+  public addresses only, no redirects followed; `--webhook-allow-http`,
+  `--webhook-allow-loopback` and `--webhook-permit-private-cidrs` loosen that for
+  development and for receivers on your own network. Watch `sbx_webhook_backlog_events`,
+  `sbx_webhook_lag_seconds`, `sbx_webhook_deliveries_total` and
+  `sbx_webhooks{state="failing"}`. Several servers on one database share the work:
+  the cursor of each webhook is in the store. Everything else is in
+  [`docs/webhooks.md`](webhooks.md), "For operators".
+- **Identity inside a sandbox.** Sandboxed code does not learn who runs it. The user
+  is `sandbox` (uid and gid 1000, home `/workspace`) and the hostname is `sandbox` on
+  both tiers; `/etc/passwd`, `/etc/group`, `id`, `whoami`, the environment and
+  `/etc/hosts` (localhost, and the sandbox's own name and container name) carry
+  neither the host account's login or full name nor the host's name or LAN address,
+  and there is no `/etc/resolv.conf`. The DMI tables (`/sys/devices/virtual/dmi`:
+  vendor, model, serial numbers) are hidden. The tests check all of this in real
+  containers on crun and on runsc. What remains visible:
+  - Under crun, `/proc/self/mountinfo` shows host paths: the image store (overlayfs
+    options) and the sources of the bind mounts (the agent binary, the passwd and
+    hosts files Podman generates). With the store in a home directory that reveals
+    the account name. Run `sbxd` as a dedicated account with a neutral name, which
+    is the recommended setup anyway. Under runsc the mount table is gVisor's own
+    and shows no host path.
+  - Under crun the kernel is the host's: its version (`/proc/version`), CPU model,
+    memory size and boot id are readable. Under runsc the kernel is gVisor's, but
+    `/proc/cpuinfo` and `/proc/meminfo` still describe the host's hardware.
+  - The environment has `container=podman`, which names the engine, not the host.
+  - With `--podman-socket` (an external service) `/etc/hosts` is that service's
+    business: unless its `containers.conf` sets `base_hosts_file = "none"` and
+    `host_containers_internal_ip = "none"`, it holds a copy of the host's hosts file
+    and the host's address. The user and group names are neutral in both modes.
 - **Delete.** `DELETE /v1/sandboxes/{id}` answers once the sandbox is fenced and
   destroys the container in the background; `?wait=true` waits for it.
 - **Shutdown.** On SIGTERM or SIGINT `sbxd serve` closes the API (open streams and
@@ -99,6 +166,50 @@
   OOM-killed in those three seconds. With an external service the file lands in
   that service's directory (your home, for the systemd-activated one), `sbxd`
   does not read it, and exit code 137 alone is taken as an OOM kill, as before.
+- **Leftover processes.** Podman starts a container in steps (spawn conmon, which
+  has the runtime create the container; start it; record the new state). If the
+  Podman service dies between the first and the last, its database still says
+  "configured", and removing such a container, even with force, kills nothing: the
+  row and the storage go, and conmon stays with one process parked in the sandbox's
+  cgroup scope, invisible to `podman ps`. Two were found on the development machine,
+  a day old, made when the service crashed (SIGSEGV in libsubid under concurrent
+  creates, which `sbxd` has since avoided by sending create requests one at a
+  time). Every reconcile pass (`--reconcile-interval`, 10 s) now looks through the
+  process table for this user's conmon processes that belong to a sandbox container
+  (`-n sbx-<sandbox id>`) Podman no longer has, are older than 30 s, and whose
+  sandbox has a row with this server's host id; it kills what conmon started, then
+  conmon, and removes the runtime's state directory. They are counted in
+  `sbx_pool_orphans_destroyed_total`. A leftover of a sandbox this server has no row
+  for is never touched; find those by hand with
+  `pgrep -u $USER -a conmon | grep -- '-n sbx-'` and compare with `podman ps -a`.
+- **Process limit.** `--pids` is the cgroup's `pids.max` under crun and
+  `RLIMIT_NPROC` inside gVisor under runsc. The in-sandbox agent lives under the
+  same limit as the code it runs (about 18 of its threads count against it, 12 of
+  them reserved at start), so a fork bomb holds the sandbox at the limit and the
+  agent must not need a new thread at that moment; it was seen to die of it in
+  about 1 run of 30 before the reserve, and can in principle still. The textbook
+  fix, a lower `RLIMIT_NPROC` for every process the agent starts with the cgroup
+  limit above it, was evaluated and not adopted:
+  - `RLIMIT_NPROC` set by the runtime at container start is not per sandbox on this
+    kernel (7.0): with a limit of 30 on each of two containers, 12 forks succeeded in
+    one under keep-id and the other did not start; 10 and 11 under nomap. A limit in
+    force when a user namespace is created also applies to the parent namespace's
+    count, which holds every sandbox of the pool.
+  - Set from inside, after the namespace exists, it is per sandbox (29 of 30 in each
+    of three concurrent containers under keep-id and nomap), but not with
+    `--userns host` (29, 0, 0), where all sandboxes share one namespace.
+  - It has to be in force before the first instruction of the new program. Go's
+    process creation has no hook between fork and exec, the seccomp profile refuses
+    the `ptrace` that would hold a child at exec, and `prlimit` on the child after
+    it has started leaves a window in which a process that forks at once keeps the
+    unlimited value for itself and its descendants. Closing it needs a wrapper
+    exec of the agent before every command: 2.7 ms measured for a Go binary against
+    0.65 ms for `/bin/true`, on a first command that takes 1.5 ms today, and several
+    times that under gVisor.
+  - `pids_limit_hits` in the stats API would read 0 under crun for ever, as it does
+    under runsc, because the cgroup limit would no longer be the one that is hit.
+  So the limit stays shared, the thread reserve stays, and a sandbox whose agent
+  does die is reported `instance_lost` and replaced like any other dead sandbox.
 - **Isolation tiers.** A template's `runtime` is its tier: `crun` (a hardened
   container on the host kernel) or `runsc` (gVisor: the sandbox's system calls are
   served by a user-space kernel; no KVM needed). Enable the gVisor tier on the server

@@ -31,7 +31,10 @@ class OneShot:
 
 async def test_write_and_read_text_and_bytes(sandbox: AsyncSandbox, server: FakeServer) -> None:
     info = await sandbox.files.write("notes/hello.txt", "héllo\n")
-    assert info == WriteInfo(path="notes/hello.txt", size=7)
+    # E2B's WriteInfo plus the size: absolute path, base name, bytes written.
+    assert info == WriteInfo(path="/workspace/notes/hello.txt", size=7, name="hello.txt", type="file")
+    assert WriteInfo.for_path("/tmp/x/../a.bin", 3) == WriteInfo("/tmp/a.bin", 3, "a.bin")
+    assert WriteInfo.for_path("./b", 0).path == "/workspace/b"
     request = server.seen("PUT", r"/files$")[0]
     assert request.url.params["path"] == "notes/hello.txt" and "mode" not in request.url.params
     assert request.headers["content-type"] == "application/octet-stream"
@@ -151,10 +154,10 @@ async def test_write_files(sandbox: AsyncSandbox, server: FakeServer) -> None:
         ]
     )
     assert written == [
-        WriteInfo("a.txt", 1),
-        WriteInfo("b/b.bin", 2),
-        WriteInfo("/tmp/c.txt", 3),
-        WriteInfo("d.txt", 1),
+        WriteInfo("/workspace/a.txt", 1, "a.txt"),
+        WriteInfo("/workspace/b/b.bin", 2, "b.bin"),
+        WriteInfo("/tmp/c.txt", 3, "c.txt"),
+        WriteInfo("/workspace/d.txt", 1, "d.txt"),
     ]
     fake = server.sandbox()
     assert fake.files == {

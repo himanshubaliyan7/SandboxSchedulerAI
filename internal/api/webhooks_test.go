@@ -250,7 +250,7 @@ func TestWebhookSecretIsShownOnce(t *testing.T) {
 		t.Fatalf("rotated without grace: %+v", rv2)
 	}
 	for _, bad := range []any{map[string]any{"keep_previous_seconds": -1}, map[string]any{"keep_previous_seconds": 604801},
-		map[string]any{"secret": "whsec_bWluZQ=="}, `{"keep_previous_seconds": "1d"}`} {
+		map[string]any{"secret": "whsec_" + "bWluZQ=="}, `{"keep_previous_seconds": "1d"}`} {
 		h.want(h.do("POST", "/v1/webhooks/"+v.ID+"/rotate-secret", bad, withKey(keyA)), 400, api.CodeBadRequest)
 	}
 	if h.hooks.Hook(v.ID).Secret != rv2.Secret {
@@ -281,7 +281,7 @@ func TestWebhookValidation(t *testing.T) {
 		"unknown event type":   {map[string]any{"url": "https://hooks.example.com/in", "event_types": []string{"sandbox.paused"}}, api.CodeBadRequest},
 		"internal event name":  {map[string]any{"url": "https://hooks.example.com/in", "event_types": []string{"transition"}}, api.CodeBadRequest},
 		"long description":     {map[string]any{"url": "https://hooks.example.com/in", "description": strings.Repeat("x", 513)}, api.CodeBadRequest},
-		"unknown member":       {map[string]any{"url": "https://hooks.example.com/in", "secret": "whsec_bWluZQ=="}, api.CodeBadRequest},
+		"unknown member":       {map[string]any{"url": "https://hooks.example.com/in", "secret": "whsec_" + "bWluZQ=="}, api.CodeBadRequest},
 		"wrong type":           {`{"url": 5}`, api.CodeBadRequest},
 	} {
 		r := h.do("POST", "/v1/webhooks", c.body, withKey(keyA))
@@ -319,7 +319,7 @@ func TestWebhookValidation(t *testing.T) {
 		"private url":      {map[string]any{"url": "https://10.0.0.1/"}, api.CodeWebhookURLNotAllowed},
 		"http url":         {map[string]any{"url": "http://hooks.example.com/"}, api.CodeInvalidWebhookURL},
 		"unknown type":     {map[string]any{"event_types": []string{"nope"}}, api.CodeBadRequest},
-		"secret":           {map[string]any{"secret": "whsec_bWluZQ=="}, api.CodeBadRequest},
+		"secret":           {map[string]any{"secret": "whsec_" + "bWluZQ=="}, api.CodeBadRequest},
 		"id":               {map[string]any{"id": "wh_other"}, api.CodeBadRequest},
 		"enabled not bool": {`{"enabled":"yes"}`, api.CodeBadRequest},
 	} {

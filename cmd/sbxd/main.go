@@ -3,7 +3,7 @@
 //
 //	sbxd serve      run the server
 //	sbxd preflight  check that this host can run rootless sandboxes
-//	sbxd admin      bootstrap tenants, API keys and templates; destroy a host's sandboxes
+//	sbxd admin      manage tenants, API keys, templates and webhooks; destroy a host's sandboxes
 //	sbxd version    print the version
 //
 // Every serve flag has an environment fallback (SBX_DATABASE_URL,
@@ -38,13 +38,16 @@ var version = "dev"
 const usage = `usage: sbxd <command> [flags]
 
 commands:
-  serve       run the scheduler and its API
-  preflight   check the host and print a report (exit status 1 on failure)
-  admin       manage tenants, API keys and templates; destroy everything a
-              host id owns (see "sbxd admin")
-  version     print the version
+  serve [flags]                         run the scheduler and its API
+  preflight [flags]                     check the host and print a report (exit status 1 on failure)
+  admin <resource> <action> [id] [flags]
+                                        manage tenants, API keys, templates and webhooks; destroy
+                                        everything a host id owns (run "sbxd admin" for the list)
+  version                               print the version
 
-Run "sbxd <command> -h" for the flags of a command.
+Run "sbxd <command> -h" (or "sbxd admin <resource> <action> -h") for the flags of a command.
+Secrets (the database URL, the metrics token) are best given in the environment:
+a flag is visible in the process list. Help output never prints their values.
 `
 
 func main() {
@@ -93,17 +96,53 @@ func run(args []string, stdout, stderr io.Writer) int {
 var errUsage = errors.New("usage")
 
 func parse(fs *flag.FlagSet, args []string) error {
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return err
+	_, err := parsePositional(fs, args, 0)
+	return err
+}
+
+// parsePositional parses flags and up to max positional arguments, which
+// may come before, between or after the flags (the flag package alone
+// stops at the first one, so "show python --json" would lose --json).
+func parsePositional(fs *flag.FlagSet, args []string, max int) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil, err
+			}
+			return nil, errUsage
 		}
-		return errUsage
+		if fs.NArg() == 0 {
+			return pos, nil
+		}
+		if len(pos) == max {
+			fmt.Fprintf(fs.Output(), "%s: unexpected argument %q\n", fs.Name(), fs.Arg(0))
+			return nil, errUsage
+		}
+		pos = append(pos, fs.Arg(0))
+		args = fs.Args()[1:]
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(fs.Output(), "%s: unexpected argument %q\n", fs.Name(), fs.Arg(0))
-		return errUsage
+}
+
+// secretValue is a string flag whose value must never be printed: it has
+// no visible default, so `-h` shows the flag and not what the environment
+// holds for it.
+type secretValue struct{ p *string }
+
+func (secretValue) String() string       { return "" }
+func (s secretValue) Set(v string) error { *s.p = v; return nil }
+
+// secretVar registers a flag whose fallback is an environment variable
+// holding a secret (a database URL with its password, a token). The
+// variable's value becomes the flag's value without ever being its
+// printed default; the usage text only says whether the variable is set.
+func secretVar(fs *flag.FlagSet, p *string, name, env, usage string) {
+	*p = os.Getenv(env)
+	state := "not set"
+	if *p != "" {
+		state = "set, value not shown"
 	}
-	return nil
+	fs.Var(secretValue{p}, name, fmt.Sprintf("%s [%s: %s]; prefer the variable, a flag is visible in the process list", usage, env, state))
 }
 
 // Environment fallbacks: a flag's default is the variable's value when it
@@ -196,12 +235,12 @@ func cmdServe(args []string, stderr io.Writer) error {
 		corsOrigins         string
 		runtimes, runscArgs string
 	)
-	fs.StringVar(&cfg.DatabaseURL, "database-url", envStr("SBX_DATABASE_URL", ""), "Postgres URL [SBX_DATABASE_URL] (required)")
+	secretVar(fs, &cfg.DatabaseURL, "database-url", "SBX_DATABASE_URL", "Postgres `url` (required)")
 	fs.StringVar(&cfg.Listen, "listen", envStr("SBX_LISTEN", "127.0.0.1:8080"), "API listen address [SBX_LISTEN]")
 	fs.StringVar(&cfg.MetricsListen, "metrics-listen", envStr("SBX_METRICS_LISTEN", ""),
 		"serve /metrics on this address instead of the API listener, e.g. 127.0.0.1:9090 [SBX_METRICS_LISTEN]")
-	fs.StringVar(&cfg.MetricsToken, "metrics-token", envStr("SBX_METRICS_TOKEN", ""),
-		"bearer token required by /metrics; without it and without --metrics-listen, sbxd refuses a non-loopback --listen [SBX_METRICS_TOKEN]")
+	secretVar(fs, &cfg.MetricsToken, "metrics-token", "SBX_METRICS_TOKEN",
+		"bearer `token` required by /metrics; without it and without --metrics-listen, sbxd refuses a non-loopback --listen")
 	fs.StringVar(&cfg.AgentBinary, "agent-binary", envStr("SBX_AGENT_BINARY", defaultAgentBinary()),
 		"path of the static sbx-agent binary [SBX_AGENT_BINARY] (default: sbx-agent next to sbxd)")
 	fs.StringVar(&cfg.RunDir, "run-dir", envStr("SBX_RUN_DIR", server.DefaultRunDir()),

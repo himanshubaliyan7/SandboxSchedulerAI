@@ -147,12 +147,18 @@ class AsyncSandbox:
         Args:
             template: template id, as configured with ``sbxd admin template``.
             timeout: maximum lifetime in seconds; ``None`` for the
-                template's. It cannot exceed the template's limit.
+                template's. More than the template's max lifetime is
+                refused (:class:`~sbx.InvalidArgumentError`, code
+                ``invalid_timeout``; ``details["max_timeout_ms"]`` is the
+                limit), never silently capped.
             envs: environment of every command in the sandbox.
             metadata: free-form labels, usable as a filter in :meth:`list`.
             network: egress policy: a :class:`~sbx.NetworkPolicy`, a mapping
                 with the same keys, or just a mode (``"none"``,
                 ``"allowlist"``, ``"full"``). Never looser than the template's.
+                ``None`` gives the template's default policy, including its
+                default ``allow_domains`` (see :meth:`list_templates`); a
+                policy given here replaces that default, it does not add to it.
             api_key: tenant API key; defaults to ``SBX_API_KEY``.
             base_url: server URL; defaults to ``SBX_BASE_URL``, then
                 ``http://127.0.0.1:8080``.
@@ -353,7 +359,13 @@ class AsyncSandbox:
         return self._info
 
     async def is_running(self) -> bool:
-        """Whether the sandbox is running right now."""
+        """Whether the sandbox is running right now.
+
+        With an API key this is a read of the sandbox's state and does
+        not count as activity for the idle timer. With an access token
+        alone it lists the sandbox's commands, a data-plane request,
+        which does.
+        """
         if self._api.config.api_key:
             try:
                 return (await self.get_info()).state == "running"
@@ -368,8 +380,16 @@ class AsyncSandbox:
     async def set_timeout(self, timeout: float) -> SandboxInfo:
         """Make the sandbox end ``timeout`` seconds from now (shorter or longer than before).
 
-        The server caps the result at the template's maximum lifetime; read
-        ``expires_at`` of the returned info for the effective value.
+        The new end may not lie past the template's max lifetime, counted
+        from the sandbox's start. A request that would is refused with
+        :class:`~sbx.InvalidArgumentError` (code ``invalid_timeout``) and
+        changes nothing; ``details["max_timeout_ms"]`` is the most that
+        can be asked for at that moment. Nothing is capped silently.
+
+        The call also counts as activity: it restarts the sandbox's idle
+        timer, so a keep-alive loop that calls ``set_timeout`` keeps an
+        otherwise idle sandbox alive (up to the max lifetime).
+        ``get_info`` and ``is_running`` do not.
         """
         timeout_ms = ms(timeout)
         if not timeout_ms:
@@ -422,8 +442,11 @@ class AsyncSandbox:
     async def _kill(self, *, wait: bool = False) -> bool:
         """Kill this sandbox and destroy its storage (``sandbox.kill()``).
 
-        Returns ``True`` if the server accepted the request and ``False``
-        if there is no such sandbox. By default the call returns as soon as
+        Returns ``True`` if the server knows the sandbox: it is ended now,
+        by this call or by an earlier one (the call is idempotent, so
+        killing a sandbox twice returns ``True`` twice). Returns ``False``
+        only if there is no such sandbox, or it belongs to another tenant.
+        By default the call returns as soon as
         the sandbox is fenced (unusable, no longer counted against the
         quota); the container is removed in the background. ``wait=True``
         asks the server to answer only after the container is gone.
@@ -451,8 +474,9 @@ class AsyncSandbox:
     ) -> bool:
         """Kill a sandbox by id, without connecting to it (``Sandbox.kill(sandbox_id)``).
 
-        Needs the tenant API key. Returns ``False`` if there is no such
-        sandbox; ``wait`` is as for ``sandbox.kill()``.
+        Needs the tenant API key. Returns ``True`` if the server knows the
+        sandbox (also one that had already ended) and ``False`` if there is
+        no such sandbox; ``wait`` is as for ``sandbox.kill()``.
         """
         if not sandbox_id:
             raise ValueError("sandbox_id must not be empty")

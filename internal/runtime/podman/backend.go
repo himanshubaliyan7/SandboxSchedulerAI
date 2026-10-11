@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,57 @@ type Backend struct {
 	// a time changes nothing measurable (51 to 55 ms per sandbox at
 	// concurrency 8 either way), and starts still run in parallel.
 	createMu sync.Mutex
+	// paths caches the PATH of each template image; see imageEnvPath.
+	pathMu sync.Mutex
+	paths  map[string]imagePathEntry
+}
+
+type imagePathEntry struct {
+	path string
+	at   time.Time
+}
+
+// imagePathTTL is how long an image's PATH is remembered. A tag can be
+// pulled again with another PATH; a minute bounds how long sandboxes are
+// then created with the old one, and keeps the lookup (about 3 ms) off
+// all but one create a minute per image.
+const imagePathTTL = time.Minute
+
+// imageEnvPath returns the PATH the image sets in its ENV, or "" when it
+// sets none. DefaultEnv needs it to put the user's bin directory in front
+// of the image's PATH instead of replacing it. An image that does not
+// exist returns "": the create that follows reports that properly.
+func (b *Backend) imageEnvPath(ctx context.Context, c *client, image string) (string, error) {
+	b.pathMu.Lock()
+	e, ok := b.paths[image]
+	b.pathMu.Unlock()
+	if ok && time.Since(e.at) < imagePathTTL {
+		return e.path, nil
+	}
+	var data struct {
+		Config struct {
+			Env []string `json:"Env"`
+		} `json:"Config"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, "/images/"+url.PathEscape(image)+"/json", nil, nil, &data); err != nil {
+		if IsStatus(err, http.StatusNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("inspect image %s: %w", image, err)
+	}
+	path := ""
+	for _, kv := range data.Config.Env {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
+			path = v
+		}
+	}
+	b.pathMu.Lock()
+	if b.paths == nil {
+		b.paths = map[string]imagePathEntry{}
+	}
+	b.paths[image] = imagePathEntry{path: path, at: time.Now()}
+	b.pathMu.Unlock()
+	return path, nil
 }
 
 var _ runtime.Backend = (*Backend)(nil)
@@ -142,6 +194,11 @@ func (b *Backend) Create(ctx context.Context, spec runtime.Spec) (runtime.Instan
 	if c == nil {
 		return runtime.Instance{}, fmt.Errorf("create sandbox %s: no Podman service for runtime %q", spec.SandboxID, body.OCIRuntime)
 	}
+	imagePath, err := b.imageEnvPath(ctx, c, spec.Template.Image)
+	if err != nil {
+		return runtime.Instance{}, fmt.Errorf("create sandbox %s: %w", spec.SandboxID, err)
+	}
+	body.Env = DefaultEnv(imagePath)
 	b.createMu.Lock()
 	_, err = c.do(ctx, http.MethodPost, "/containers/create", nil, body, &created, http.StatusCreated)
 	b.createMu.Unlock()

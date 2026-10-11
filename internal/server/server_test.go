@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/egress"
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 )
 
@@ -136,3 +138,33 @@ func TestPlannedSandboxes(t *testing.T) {
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// The egress metric families are valid exposition text, whatever the
+// reasons the proxy reports.
+func TestEgressMetricsAreValidExposition(t *testing.T) {
+	m := newEgressMetrics()
+	var buf strings.Builder
+	m.write(&buf)
+	if _, err := promtext.Validate(buf.String()); err != nil {
+		t.Fatalf("empty egress metrics: %v\n%s", err, buf.String())
+	}
+	m.observe(egress.Decision{Verdict: egress.VerdictAllowed, BytesUp: 10, BytesDown: 20})
+	m.observe(egress.Decision{Verdict: egress.VerdictDenied, Reason: egress.ReasonHostNotAllowed})
+	m.observe(egress.Decision{Verdict: egress.VerdictDenied, Reason: egress.ReasonHostNotAllowed})
+	m.observe(egress.Decision{Verdict: egress.VerdictError, Reason: "odd \"reason\"\twith\\escapes\n"})
+	buf.Reset()
+	m.write(&buf)
+	samples, err := promtext.Validate(buf.String())
+	if err != nil {
+		t.Fatalf("egress metrics: %v\n%s", err, buf.String())
+	}
+	found := false
+	for _, s := range samples {
+		if s.Name == "sbx_egress_decisions_total" && s.Labels["reason"] == string(egress.ReasonHostNotAllowed) {
+			found = s.Value == 2
+		}
+	}
+	if !found {
+		t.Errorf("host_not_allowed was not counted twice:\n%s", buf.String())
+	}
+}

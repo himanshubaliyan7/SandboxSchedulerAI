@@ -51,15 +51,22 @@ export interface SandboxOptions extends ConnectionOptions {
 
 export interface SandboxCreateOptions extends SandboxOptions, CallOptions {
   /**
-   * Maximum lifetime of the sandbox in milliseconds. At most the template's
-   * limit; omitted or 0 means the template's.
+   * Maximum lifetime of the sandbox in milliseconds; omitted or 0 means
+   * the template's. More than the template's max lifetime is refused
+   * (`ValidationError`, code `invalid_timeout`, with the limit in
+   * `details.max_timeout_ms`), never silently capped.
    */
   timeoutMs?: number
   /** Environment of every command in the sandbox. */
   envs?: Record<string, string>
   /** Free-form labels, returned with the sandbox and usable as a list filter. */
   metadata?: Record<string, string>
-  /** Egress policy; the mode may be the template's or stricter. */
+  /**
+   * Egress policy; the mode may be the template's or stricter. Omitted,
+   * the sandbox gets the template's default policy, including its default
+   * `allowDomains` (see `Sandbox.listTemplates()`); a policy given here
+   * replaces that default, it does not add to it.
+   */
   network?: NetworkPolicy
 }
 
@@ -250,7 +257,7 @@ export class Sandbox implements AsyncDisposable {
     return list(res, 'sandboxes').map(sandboxInfoFromWire)
   }
 
-  /** Kills a sandbox by id. False if it does not exist (for this tenant). */
+  /** Kills a sandbox by id. True if the server knows it (also one that had already ended); false if it does not exist (for this tenant). */
   static kill(sandboxId: string, opts: ConnectionOptions & SandboxKillOptions = {}): Promise<boolean> {
     return killById(new ApiClient(opts), sandboxId, opts)
   }
@@ -286,8 +293,10 @@ export class Sandbox implements AsyncDisposable {
   }
 
   /**
-   * Kills the sandbox and destroys its storage. Idempotent. False if the
-   * server does not know the sandbox.
+   * Kills the sandbox and destroys its storage. Resolves with `true` if
+   * the server knows the sandbox: it is ended now, by this call or by an
+   * earlier one (the call is idempotent, so killing a sandbox twice gives
+   * `true` twice). `false` only if the server does not know the sandbox.
    */
   kill(opts: SandboxKillOptions = {}): Promise<boolean> {
     return killById(this.#api, this.sandboxId, opts)
@@ -295,8 +304,16 @@ export class Sandbox implements AsyncDisposable {
 
   /**
    * Sets the remaining lifetime, counted from now; it may shorten or extend
-   * it. The server caps it at the template's limit: read `expiresAt` of
-   * the result for the effective value.
+   * it. The new end may not lie past the template's max lifetime, counted
+   * from the sandbox's start: a request that would is refused with a
+   * `ValidationError` (code `invalid_timeout`) and changes nothing, and
+   * `details.max_timeout_ms` is the most that can be asked for at that
+   * moment. Nothing is capped silently.
+   *
+   * The call also counts as activity: it restarts the sandbox's idle
+   * timer, so a keep-alive loop that calls `setTimeout` keeps an otherwise
+   * idle sandbox alive (up to the max lifetime). `getInfo` and `isRunning`
+   * with an API key do not.
    */
   async setTimeout(timeoutMs: number, opts: CallOptions = {}): Promise<SandboxInfo> {
     const res = await this.#api.json<unknown>('POST', sandboxPath(this.sandboxId, 'timeout'), {

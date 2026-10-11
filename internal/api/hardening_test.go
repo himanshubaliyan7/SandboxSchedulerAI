@@ -12,6 +12,7 @@ import (
 	"github.com/himanshubaliyan7/warmbox/internal/api"
 	"github.com/himanshubaliyan7/warmbox/internal/core"
 	"github.com/himanshubaliyan7/warmbox/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
@@ -152,6 +153,26 @@ func TestPausedIsNotAPublicState(t *testing.T) {
 			t.Errorf("GET /v1/sandboxes%s: %s", q, r.Body)
 		}
 	}
+	// In the metrics it is counted with the running ones, in the one
+	// "running" series of its template: a PAUSED count written as a
+	// second series with the same labels is a duplicate, and a strict
+	// scraper rejects the whole scrape for it.
+	eventually(t, "the paused sandbox to be counted as running", func() bool {
+		body := string(h.want(h.do("GET", "/metrics", nil), 200, "").Body)
+		samples, err := promtext.Validate(body)
+		if err != nil {
+			t.Fatalf("/metrics is not valid exposition text: %v\n%s", err, body)
+		}
+		if strings.Contains(body, "paused") {
+			t.Fatalf("/metrics mentions the paused state:\n%s", body)
+		}
+		for _, sm := range samples {
+			if sm.Name == "sbx_pool_sandboxes" && sm.Labels["template"] == tmplID && sm.Labels["state"] == "running" {
+				return sm.Value == 1
+			}
+		}
+		return false
+	})
 	// The data plane refuses it without calling it paused or running.
 	r = h.want(h.do("GET", "/v1/sandboxes/"+sb.ID+"/commands", nil, withToken(sb.AccessToken)), 409, api.CodeSandboxNotRunning)
 	if strings.Contains(string(r.Body), "paused") || strings.Contains(string(r.Body), "is running") {

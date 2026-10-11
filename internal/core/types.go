@@ -80,6 +80,22 @@ const (
 	NetworkFull      NetworkMode = "full"      // proxy allows any public destination; deny set still applies
 )
 
+// DefaultPolicy is the egress policy of a sandbox created from t without
+// a policy of its own: the template's mode, and for an allowlist template
+// its default allowlist.
+func (t Template) DefaultPolicy() NetworkPolicy {
+	mode := t.Network
+	if mode == "" {
+		mode = NetworkNone
+	}
+	p := NetworkPolicy{Mode: mode}
+	if mode == NetworkAllowlist {
+		p.AllowDomains = append([]string(nil), t.AllowDomains...)
+		p.AllowCIDRs = append([]string(nil), t.AllowCIDRs...)
+	}
+	return p
+}
+
 // NetworkPolicy is the per-sandbox egress policy enforced by the egress
 // proxy. Deny always wins over allow. It can be replaced on a live sandbox.
 type NetworkPolicy struct {
@@ -124,7 +140,14 @@ type Template struct {
 	Runtime   string      `json:"runtime"`
 	Resources Resources   `json:"resources"`
 	Network   NetworkMode `json:"network"`
-	Timeouts  Timeouts    `json:"timeouts"`
+	// AllowDomains and AllowCIDRs are the template's default egress
+	// allowlist: the policy of a sandbox that is created without one of
+	// its own, when Network is allowlist. A create that names a policy
+	// replaces them (it does not add to them), and stays within Network
+	// as always. They are not part of what is baked into an instance.
+	AllowDomains []string `json:"allow_domains,omitempty"`
+	AllowCIDRs   []string `json:"allow_cidrs,omitempty"`
+	Timeouts     Timeouts `json:"timeouts"`
 	// Pool sizing.
 	WarmTarget int `json:"warm_target"`
 	MaxTotal   int `json:"max_total"`

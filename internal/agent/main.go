@@ -111,6 +111,11 @@ const threadReserve = 12
 // its kill needs at once; it counts against the sandbox's pids limit from
 // the start, where the tenant can see it, instead of being taken at the
 // worst moment.
+//
+// The alternative, giving the code a lower limit than the agent
+// (RLIMIT_NPROC on every child, the cgroup limit above it), was evaluated
+// and not adopted; docs/operations.md, "Process limit", has the
+// measurements and the reasons.
 func reserveThreads(n int) {
 	var started, release sync.WaitGroup
 	release.Add(1)

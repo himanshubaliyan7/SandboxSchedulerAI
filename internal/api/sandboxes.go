@@ -105,7 +105,8 @@ func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, v any, optio
 type CreateSandboxRequest struct {
 	TemplateID string `json:"template_id"`
 	// TimeoutMs is the sandbox's maximum lifetime. It may be at most the
-	// template's max lifetime; zero means the template's.
+	// template's max lifetime (more is refused with invalid_timeout, not
+	// capped); zero means the template's.
 	TimeoutMs int64               `json:"timeout_ms,omitempty"`
 	Env       map[string]string   `json:"env,omitempty"`
 	Metadata  map[string]string   `json:"metadata,omitempty"`
@@ -210,7 +211,8 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request, ten
 	case tmpl.Timeouts.MaxLifetime > 0 && lifetime > tmpl.Timeouts.MaxLifetime:
 		e := errf(http.StatusBadRequest, CodeInvalidTimeout, "timeout_ms exceeds the template's max lifetime of %d ms",
 			tmpl.Timeouts.MaxLifetime.Milliseconds())
-		e.Details = map[string]any{"max_timeout_ms": tmpl.Timeouts.MaxLifetime.Milliseconds()}
+		e.Details = map[string]any{"max_timeout_ms": tmpl.Timeouts.MaxLifetime.Milliseconds(),
+			"max_lifetime_ms": tmpl.Timeouts.MaxLifetime.Milliseconds()}
 		return e
 	}
 	token, err := newAccessToken()
@@ -375,7 +377,9 @@ func (s *Server) liveSandbox(ctx context.Context, tenantID, id string) (store.Sa
 
 // SetTimeoutRequest is the body of POST /v1/sandboxes/{id}/timeout.
 type SetTimeoutRequest struct {
-	// TimeoutMs is the new remaining lifetime, counted from now.
+	// TimeoutMs is the new remaining lifetime, counted from now. The new
+	// end may not lie past the template's max lifetime, counted from the
+	// sandbox's start: more is refused with invalid_timeout, not capped.
 	TimeoutMs int64 `json:"timeout_ms"`
 }
 
@@ -399,6 +403,8 @@ func (s *Server) handleSetTimeout(w http.ResponseWriter, r *http.Request, tenant
 	}
 	// The cap is the template's current max lifetime, measured from the
 	// assignment. A template that has since been deleted imposes none.
+	// A request past the cap is refused, exactly as at create: the caller
+	// is told the most it may ask for instead of silently getting less.
 	var maxTotal time.Duration
 	tmpl, err := s.store.GetTemplate(ctx, acc.Sandbox.TemplateID)
 	switch {
@@ -409,6 +415,15 @@ func (s *Server) handleSetTimeout(w http.ResponseWriter, r *http.Request, tenant
 	}
 	sb, err := s.store.SetLifetime(ctx, acc.Sandbox.ID, acc.Sandbox.Generation,
 		time.Duration(req.TimeoutMs)*time.Millisecond, maxTotal)
+	var tooLong *store.LifetimeExceededError
+	if errors.As(err, &tooLong) {
+		left := max(tooLong.Max.Milliseconds(), 0)
+		e := errf(http.StatusBadRequest, CodeInvalidTimeout,
+			"timeout_ms would end the sandbox after the template's max lifetime of %d ms (counted from its start); at most %d ms from now is allowed",
+			maxTotal.Milliseconds(), left)
+		e.Details = map[string]any{"max_timeout_ms": left, "max_lifetime_ms": maxTotal.Milliseconds()}
+		return e
+	}
 	if err != nil {
 		return err
 	}
@@ -538,11 +553,17 @@ type TemplateView struct {
 	// SharedKernel says whether sandboxes of this template run directly
 	// on the host kernel. It is omitted when the server cannot say (the
 	// template names a runtime the server has not enabled).
-	SharedKernel  *bool          `json:"shared_kernel,omitempty"`
-	Resources     core.Resources `json:"resources"`
-	Network       string         `json:"network"`
-	IdleTimeoutMs int64          `json:"idle_timeout_ms"`
-	MaxLifetimeMs int64          `json:"max_lifetime_ms"`
+	SharedKernel *bool          `json:"shared_kernel,omitempty"`
+	Resources    core.Resources `json:"resources"`
+	// Network is the widest mode a sandbox of this template may ask for.
+	Network string `json:"network"`
+	// AllowDomains and AllowCIDRs are the template's default allowlist:
+	// what a sandbox created without a network policy of its own may
+	// reach when Network is "allowlist". Always present, possibly empty.
+	AllowDomains  []string `json:"allow_domains"`
+	AllowCIDRs    []string `json:"allow_cidrs"`
+	IdleTimeoutMs int64    `json:"idle_timeout_ms"`
+	MaxLifetimeMs int64    `json:"max_lifetime_ms"`
 }
 
 func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request, _ store.Tenant) error {
@@ -555,7 +576,8 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request, _ s
 	out := make([]TemplateView, 0, len(templates))
 	for _, t := range templates {
 		v := TemplateView{ID: t.ID, Version: t.Version, Image: t.Image, Runtime: t.Runtime, Resources: t.Resources,
-			Network: string(t.Network), IdleTimeoutMs: t.Timeouts.Idle.Milliseconds(), MaxLifetimeMs: t.Timeouts.MaxLifetime.Milliseconds()}
+			Network: string(t.Network), AllowDomains: append([]string{}, t.AllowDomains...), AllowCIDRs: append([]string{}, t.AllowCIDRs...),
+			IdleTimeoutMs: t.Timeouts.Idle.Milliseconds(), MaxLifetimeMs: t.Timeouts.MaxLifetime.Milliseconds()}
 		if s.cfg.RuntimeInfo != nil {
 			if info, ok := s.cfg.RuntimeInfo(t.Runtime); ok {
 				v.SharedKernel = &info.SharedKernel

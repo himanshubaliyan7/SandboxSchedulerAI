@@ -12,6 +12,8 @@ export type { CommandExit, SandboxErrorInit } from './errors.js'
 export {
   AuthenticationError,
   CommandExitError,
+  CommandStartError,
+  CommandTimeoutError,
   ConflictError,
   ConnectionError,
   InternalServerError,
@@ -27,7 +29,7 @@ export {
   TimeoutError,
   ValidationError,
 } from './errors.js'
-export type { FileData, FileReadOptions, FileWriteOptions } from './files.js'
+export type { FileData, FileReadOptions, FileWriteOptions, WriteEntry } from './files.js'
 export { Files } from './files.js'
 export type { CallOptions, ConnectionOptions, FetchLike, RetryOptions, WebSocketConstructor, WebSocketLike } from './http.js'
 export type { PtyConnectOptions, PtyCreateOptions, PtyOutputOptions, PtyResult, PtySize } from './pty.js'
@@ -64,6 +66,7 @@ export type {
   Signal,
   TemplateInfo,
   TerminationReason,
+  WriteInfo,
 } from './types.js'
 export { VERSION } from './version.js'
 export type {

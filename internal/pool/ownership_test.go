@@ -451,3 +451,31 @@ func (h *harness) advanceUntil(what string, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// A leftover host process (a conmon whose container Podman has forgotten)
+// is ended by the reconciler only when the store says the sandbox was
+// this scheduler's: a row with this host id, live or destroyed.
+func TestReconcilerReapsOnlyItsOwnLeftovers(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start()
+	h.settled(3)
+	sb := h.claim()
+	if err := h.c.Release(ctxBg(), sb.ID, sb.Generation, core.ReasonReleased); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.get(sb.ID); got.State != core.StateDestroyed {
+		t.Fatalf("released sandbox is %s", got.State)
+	}
+	h.be.AddLeftover(sb.ID)       // ours: the row is kept after the sandbox is destroyed
+	h.be.AddLeftover("sb-nobody") // no row at all: another database, another scheduler
+	before := h.c.Metrics().OrphansDestroyed
+	if err := h.c.Reconcile(ctxBg()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if left := h.be.Leftovers(); len(left) != 1 || left[0] != "sb-nobody" {
+		t.Errorf("leftovers after the pass: %v, want only the one nobody owns", left)
+	}
+	if got := h.c.Metrics().OrphansDestroyed - before; got != 1 {
+		t.Errorf("orphans destroyed went up by %d, want 1", got)
+	}
+}

@@ -65,14 +65,18 @@ func decode(args json.RawMessage, v any) error {
 func (s *Server) buildTools() []tool {
 	networkProps := map[string]any{
 		"network_mode": map[string]any{"type": "string", "enum": []string{"none", "allowlist", "full"},
-			"description": "Egress mode. It can be the template's mode or stricter, never wider."},
-		"allow_domains": strList("Hostnames the sandbox may reach in allowlist mode, exact or '*.example.com'."),
+			"description": "Egress mode. It can be the template's mode or stricter, never wider. " +
+				"Omit it together with allow_domains to get the template's default policy (see list_templates)."},
+		"allow_domains": strList("Hostnames the sandbox may reach in allowlist mode, exact or '*.example.com'. " +
+			"Giving this replaces the template's default allow_domains; it does not add to them."),
 	}
 	return []tool{
 		{
-			Name:        "list_templates",
-			Description: "List the sandbox templates (image, resource limits, network mode) available to create_sandbox.",
-			Schema:      obj(nil, map[string]any{}),
+			Name: "list_templates",
+			Description: "List the sandbox templates available to create_sandbox: image, runtime (crun shares the host kernel, runsc is gVisor; " +
+				"see shared_kernel), resource limits, network mode, and allow_domains / allow_cidrs, the hosts a sandbox created " +
+				"without a network policy of its own can reach (a blocked host answers '403 Blocked by sandbox network policy').",
+			Schema: obj(nil, map[string]any{}),
 			Call: func(ctx context.Context, _ json.RawMessage) (string, error) {
 				return s.passthrough(ctx, http.MethodGet, "/v1/templates", nil, nil)
 			},

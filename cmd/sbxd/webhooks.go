@@ -90,7 +90,7 @@ func webhookOut(w store.Webhook, withSecret bool) webhookJSON {
 }
 
 func adminWebhookList(a *adminFlags, args []string) error {
-	tenant := a.fs.String("tenant", "", "list only this tenant's webhooks (default: every tenant's)")
+	tenant := a.fs.String("tenant", "", "list only this tenant's webhooks; the same as the `<tenant>` argument (default: every tenant's)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
@@ -173,14 +173,14 @@ func adminWebhookCreate(a *adminFlags, args []string) error {
 }
 
 func adminWebhookDelete(a *adminFlags, args []string) error {
-	id := a.fs.String("id", "", "webhook id, as printed by webhook create or webhook list (required)")
+	id := a.fs.String("id", "", "webhook id, as printed by webhook create or webhook list; the same as the `<webhook-id>` argument (required)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
 	}
 	defer done()
 	if *id == "" {
-		return errors.New("--id is required")
+		return errors.New("a webhook id is required: sbxd admin webhook delete <webhook-id>")
 	}
 	if err := st.DeleteWebhook(ctx, "", *id); err != nil {
 		return err

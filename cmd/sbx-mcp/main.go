@@ -19,7 +19,9 @@ import (
 
 func main() {
 	fs := flag.NewFlagSet("sbx-mcp", flag.ExitOnError)
-	baseURL := fs.String("base-url", envOr("SBX_BASE_URL", "http://127.0.0.1:8080"), "sbxd address (env SBX_BASE_URL)")
+	// The default is not the variable's value: a base URL may carry
+	// credentials, and a flag's default is printed by -h.
+	baseURL := fs.String("base-url", "", "sbxd address (default: $SBX_BASE_URL, or http://127.0.0.1:8080)")
 	template := fs.String("template", os.Getenv("SBX_DEFAULT_TEMPLATE"), "template used when create_sandbox names none (env SBX_DEFAULT_TEMPLATE)")
 	maxOutput := fs.Int("max-output-bytes", 32<<10, "cap on each of stdout and stderr in a tool result")
 	maxFile := fs.Int("max-file-bytes", 256<<10, "cap on what read_file returns")
@@ -32,6 +34,9 @@ func main() {
 	if *version {
 		fmt.Println(mcp.Version)
 		return
+	}
+	if *baseURL == "" {
+		*baseURL = envOr("SBX_BASE_URL", "http://127.0.0.1:8080")
 	}
 
 	// stdout carries the protocol; everything else goes to stderr.

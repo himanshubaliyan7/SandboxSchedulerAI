@@ -46,7 +46,7 @@ func (f *fakeAPI) handler(t *testing.T) http.Handler {
 		}
 	}
 	mux.HandleFunc("GET /v1/templates", auth(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"templates":[{"id":"python"}]}`)
+		io.WriteString(w, `{"templates":[{"id":"python","runtime":"crun","shared_kernel":true,"network":"allowlist","allow_domains":["pypi.org","files.pythonhosted.org"],"allow_cidrs":[]}]}`)
 	}))
 	mux.HandleFunc("POST /v1/sandboxes", auth(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
@@ -304,8 +304,9 @@ func TestSandboxLifecycle(t *testing.T) {
 	if text, _ = s.call("list_sandboxes", nil); !strings.Contains(text, "sb-1") {
 		t.Fatalf("list: %s", text)
 	}
-	if text, _ = s.call("list_templates", map[string]any{}); !strings.Contains(text, "python") {
-		t.Fatalf("templates: %s", text)
+	if text, _ = s.call("list_templates", map[string]any{}); !strings.Contains(text, "python") ||
+		!strings.Contains(text, "files.pythonhosted.org") || !strings.Contains(text, "shared_kernel") {
+		t.Fatalf("templates (the default allowlist and the runtime must reach the model): %s", text)
 	}
 	if text, isErr = s.call("set_network", map[string]any{"sandbox_id": "sb-1", "network_mode": "none"}); isErr || f.policies[0]["mode"] != "none" {
 		t.Fatalf("set_network: %s %v", text, f.policies)

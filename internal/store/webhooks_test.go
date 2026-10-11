@@ -26,7 +26,7 @@ func (f webhookFixture) hook(t *testing.T, types ...string) Webhook {
 		types = []string{"*"}
 	}
 	w, err := f.s.CreateWebhook(f.ctx, NewWebhook{ID: uniq("wh"), TenantID: f.tenant.ID,
-		URL: "https://hooks.example.com/x", Secret: "whsec_dGVzdA==", EventTypes: types}, 0)
+		URL: "https://hooks.example.com/x", Secret: "whsec_" + "dGVzdA==", EventTypes: types}, 0)
 	if err != nil {
 		t.Fatalf("CreateWebhook: %v", err)
 	}

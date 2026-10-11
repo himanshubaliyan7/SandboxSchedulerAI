@@ -51,7 +51,13 @@ const wantCreateJSON = `{
   "image": "registry.example/py:3.12",
   "entrypoint": ["/usr/local/bin/sbx-agent"],
   "command": ["serve", "--socket", "/run/sbx/agent.sock"],
-  "env": {"HOME": "/workspace", "PYTHONPYCACHEPREFIX": "/tmp/pycache", "TMPDIR": "/tmp"},
+  "env": {
+    "HOME": "/workspace",
+    "PATH": "/workspace/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONPYCACHEPREFIX": "/tmp/pycache",
+    "PYTHONUNBUFFERED": "1",
+    "TMPDIR": "/tmp"
+  },
   "work_dir": "/workspace",
   "hostname": "sandbox",
   "labels": {
@@ -96,6 +102,9 @@ const wantCreateJSON = `{
   "seccomp_profile_path": "/etc/sbx/seccomp.json",
   "userns": {"nsmode": "keep-id", "value": "uid=1000,gid=1000"},
   "idmappings": {"HostUIDMapping": false, "HostGIDMapping": false},
+  "passwd_entry": "sandbox:x:1000:1000:sandbox:/workspace:/bin/sh",
+  "group_entry": "sandbox:x:1000:",
+  "mask": ["/sys/devices/virtual/dmi"],
   "read_only_filesystem": true,
   "read_write_tmpfs": true,
   "pidns": {"nsmode": "private"},
@@ -230,6 +239,12 @@ func TestSpecVariants(t *testing.T) {
 		if s.ResourceLimits.Pids.Limit != pids*gvisorTasksPerPid+gvisorTasksReserve || crunSpec.ResourceLimits.Pids.Limit != pids {
 			t.Errorf("pids.max: runsc %d, crun %d", s.ResourceLimits.Pids.Limit, crunSpec.ResourceLimits.Pids.Limit)
 		}
+		// gVisor's sysfs shows the host's DMI product name and is not
+		// subject to masked paths; an empty tmpfs hides it.
+		if last := s.Mounts[len(s.Mounts)-1]; last.Destination != "/sys/devices/virtual/dmi/id" || last.Type != "tmpfs" {
+			t.Errorf("runsc mounts do not hide the DMI directory: %+v", s.Mounts)
+		}
+		s.Mounts = s.Mounts[:len(s.Mounts)-1]
 		s.Rlimits, s.ResourceLimits.Pids.Limit, s.OCIRuntime = crunSpec.Rlimits, pids, crunSpec.OCIRuntime
 		if !reflect.DeepEqual(s, crunSpec) {
 			t.Errorf("the runsc spec differs from the crun one in more than the process limit:\n%+v\n%+v", s, crunSpec)

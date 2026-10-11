@@ -38,23 +38,49 @@ func (s *Store) SetMetadata(ctx context.Context, id string, generation int64, me
 	return nil
 }
 
+// LifetimeExceededError is returned by SetLifetime when the requested
+// expiry lies past the sandbox's cap. Max is the longest duration from
+// now that would have been accepted (zero or negative when the cap has
+// already passed).
+type LifetimeExceededError struct {
+	Max time.Duration
+}
+
+func (e *LifetimeExceededError) Error() string {
+	return fmt.Sprintf("store: the requested lifetime exceeds the cap; at most %s from now is allowed", e.Max.Round(time.Millisecond))
+}
+
 // SetLifetime moves the max-lifetime expiry of a tenant-owned sandbox to
 // fromNow from the database's now(), fenced by generation. When maxTotal
-// is positive the expiry is capped at assigned_at + maxTotal, so a
-// session can be shortened or extended but never past the cap. It
-// returns the updated row.
+// is positive the expiry may not lie past assigned_at + maxTotal: a
+// request that would is refused with a *LifetimeExceededError and
+// changes nothing, so a session can be shortened or extended, never past
+// the cap, and never silently to something other than what was asked.
+//
+// Setting the lifetime is the tenant saying "I am still using this", so
+// it also counts as activity: last_activity_at is set to now(), which
+// restarts the idle timer. It returns the updated row.
 func (s *Store) SetLifetime(ctx context.Context, id string, generation int64, fromNow, maxTotal time.Duration) (core.Sandbox, error) {
 	if fromNow <= 0 {
 		return core.Sandbox{}, errors.New("store: SetLifetime needs a positive duration")
 	}
 	sb, err := scanSandbox(s.pool.QueryRow(ctx, `UPDATE sandboxes SET
-			expires_at = CASE WHEN $4::bigint > 0
-				THEN LEAST(now() + $3::bigint * interval '1 microsecond', assigned_at + $4::bigint * interval '1 microsecond')
-				ELSE now() + $3::bigint * interval '1 microsecond' END,
+			expires_at = now() + $3::bigint * interval '1 microsecond',
+			last_activity_at = CASE WHEN state IN ('RUNNING', 'PAUSED') THEN now() ELSE last_activity_at END,
 			updated_at = now()
 		WHERE id = $1 AND generation = $2 AND state IN ('ASSIGNED', 'RUNNING', 'PAUSED')
+			AND ($4::bigint <= 0 OR assigned_at IS NULL
+				OR now() + $3::bigint * interval '1 microsecond' <= assigned_at + $4::bigint * interval '1 microsecond')
 		RETURNING `+sandboxCols, id, generation, fromNow.Microseconds(), maxTotal.Microseconds()))
 	if errors.Is(err, pgx.ErrNoRows) {
+		// Either the row is not live at this generation, or the cap said no.
+		var leftMicros *int64
+		qerr := s.pool.QueryRow(ctx, `SELECT (EXTRACT(EPOCH FROM (assigned_at + $3::bigint * interval '1 microsecond' - now())) * 1000000)::bigint
+			FROM sandboxes WHERE id = $1 AND generation = $2 AND state IN ('ASSIGNED', 'RUNNING', 'PAUSED')`,
+			id, generation, maxTotal.Microseconds()).Scan(&leftMicros)
+		if qerr == nil && maxTotal > 0 && leftMicros != nil {
+			return core.Sandbox{}, &LifetimeExceededError{Max: time.Duration(*leftMicros) * time.Microsecond}
+		}
 		return core.Sandbox{}, s.explainMiss(ctx, id, generation, "", "")
 	}
 	if err != nil {

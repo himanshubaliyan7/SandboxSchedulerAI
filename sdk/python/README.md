@@ -50,23 +50,23 @@ from sbx import NetworkPolicy, Sandbox
 
 sandbox = Sandbox.create(
     "python",
-    timeout=300,  # seconds; capped by the template
+    timeout=300,  # seconds; more than the template's max lifetime is refused, not capped
     envs={"API_BASE": "https://example.com"},  # environment of every command
     metadata={"conversation": "c-123"},
     network=NetworkPolicy(mode="allowlist", allow_domains=["pypi.org", "*.pythonhosted.org"]),
 )
 print(sandbox.sandbox_id, sandbox.get_info().expires_at)
 
-sandbox.set_timeout(600)  # ends 600 s from now
+sandbox.set_timeout(600)  # ends 600 s from now; also restarts the idle timer
 sandbox.update_network("none")  # cut egress on the live sandbox
 sandbox.is_running()  # True
 sandbox.stats().memory_bytes
 [e.type for e in sandbox.events()]  # claimed, command_started, ...
 
 Sandbox.list(metadata={"conversation": "c-123"})  # -> list[SandboxInfo]
-Sandbox.list_templates()
+Sandbox.list_templates()  # -> list[TemplateInfo]: runtime, shared_kernel, network, allow_domains, ...
 
-sandbox.kill()  # True; False if there is no such sandbox
+sandbox.kill()  # True: the server knows the sandbox and it is ended; False if there is no such sandbox
 sandbox.kill(wait=True)  # returns only after the container is gone
 Sandbox.kill("sb-0123456789abcdef")  # by id, without connecting (needs the API key)
 ```
@@ -74,8 +74,72 @@ Sandbox.kill("sb-0123456789abcdef")  # by id, without connecting (needs the API 
 `kill()` returns as soon as the server has fenced the sandbox (it is unusable
 and no longer counts against the quota); the container is removed in the
 background. Pass `wait=True`, or poll `get_info().state` for `"destroyed"`,
-when that matters. States and reasons are plain strings and unknown values
-are passed through, so a newer server does not break an older SDK.
+when that matters. It is idempotent: killing a sandbox that has already ended
+returns `True` again, because the server still knows it. `False` means the
+server has no such sandbox (or it is another tenant's). States and reasons are
+plain strings and unknown values are passed through, so a newer server does
+not break an older SDK.
+
+### Lifetime, idle timer and keep-alive
+
+A sandbox ends at its maximum lifetime (`timeout=` at create, `set_timeout`
+later) or after the template's idle timeout without activity, whichever comes
+first.
+
+- **The lifetime is never capped silently.** `Sandbox.create(timeout=...)` and
+  `set_timeout(...)` raise `InvalidArgumentError` (code `invalid_timeout`) when
+  the sandbox would outlive the template's max lifetime, counted from its
+  start. `e.details["max_timeout_ms"]` is the most you could have asked for.
+- **What counts as activity** for the idle timer: every command, file and PTY
+  call, output arriving on a stream or terminal you are attached to, and
+  `set_timeout`. So an E2B-style keep-alive loop that calls `set_timeout`
+  keeps an idle sandbox alive.
+- **What does not:** `get_info`, `is_running` (with an API key), `list`,
+  `events`, `stats`, `update_network`, and a command running with nobody
+  attached to its output.
+
+```python
+from sbx import InvalidArgumentError
+
+try:
+    sandbox.set_timeout(24 * 3600)
+except InvalidArgumentError as e:  # past the template's max lifetime
+    sandbox.set_timeout(e.details["max_timeout_ms"] / 1000 - 1)  # as long as allowed
+```
+
+### Network and installing packages
+
+A template has a network mode (`none`, `allowlist` or `full`) and, for
+`allowlist`, a default list of hosts set by the operator
+(`sbxd admin template apply --allow-domains pypi.org,files.pythonhosted.org`).
+`Sandbox.list_templates()` shows both. A sandbox created without `network=`
+gets that default. Passing `network=` **replaces** the default list (it does
+not add to it) and can never be wider than the template's mode.
+
+A host that is not allowed fails inside the sandbox with the reason in the
+tool's own error message, for example from `pip`:
+`Tunnel connection failed: 403 Blocked by sandbox network policy: example.com is not in the allowlist`.
+You see it in `result.stderr`, or in the `CommandExitError`.
+
+Installing Python packages works out of the box when `pypi.org` and
+`files.pythonhosted.org` are allowed:
+
+```python
+sandbox.commands.run("pip install requests")  # a user install: the root filesystem is read-only
+sandbox.commands.run("python3 -c 'import requests; print(requests.__version__)'")
+sandbox.commands.run("normalizer --version")  # a console script the install put in /workspace/.local/bin
+```
+
+The sandbox user is uid 1000 and the image is read-only, so `pip` installs
+under `/workspace/.local` (`pip install --user` does the same), and
+`/workspace/.local/bin` is on `PATH`. A virtual environment under `/workspace`
+(`python3 -m venv /workspace/venv`) works too. Everything is gone with the
+sandbox; bake what every session needs into the template's image.
+
+Python's stdout is unbuffered in a sandbox (`PYTHONUNBUFFERED=1`), so output
+arrives as the program prints it. A program that prints hundreds of thousands
+of lines pays for that; pass `envs={"PYTHONUNBUFFERED": ""}` to the command or
+the sandbox to get block buffering back.
 
 ### Connecting from somewhere else
 
@@ -84,8 +148,8 @@ worker can be handed a sandbox without ever seeing the tenant API key:
 
 ```python
 worker = Sandbox.connect(sandbox_id, access_token=token)  # no API key
-worker.commands.run("echo hi")
-worker.files.read("out.txt")
+worker.commands.run("echo hi > out.txt")
+worker.files.read("out.txt")  # "hi\n"
 ```
 
 Lifecycle calls on such an object raise `ConfigurationError`, and leaving a
@@ -141,7 +205,10 @@ support; an older server ignores the key).
 ### Background commands
 
 ```python
-server = sandbox.commands.run("python3 -m http.server 8000", background=True)
+import sbx
+
+# timeout=0: a server is meant to outlive the 60 s per-command default.
+server = sandbox.commands.run("python3 -m http.server 8000", background=True, timeout=0)
 server.pid
 
 for event in server:  # StdoutEvent, StderrEvent, TruncatedEvent, ExitEvent
@@ -162,6 +229,11 @@ sandbox.commands.kill(server.pid)  # True; False if it had already exited
 `handle.wait()` raises `CommandExitError` like `run` does, unless the command
 was started or connected with `check=False`.
 
+The loop above sees "Serving HTTP on ..." at once because the sandbox sets
+`PYTHONUNBUFFERED=1`. Other programs that buffer their output when it is not a
+terminal (anything using C stdio) still deliver it in blocks; run those with
+their own unbuffered option (`stdbuf -oL`, `--line-buffered`) or on a PTY.
+
 ### Streams that survive a broken connection
 
 Output is a long-lived HTTP response, which proxies and networks cut. The
@@ -179,7 +251,8 @@ and a later `wait()` resumes from the same offset.
 Paths are absolute, or relative to `/workspace`.
 
 ```python
-sandbox.files.write("data/in.csv", "a,b\n1,2\n")  # str, bytes or a file object
+info = sandbox.files.write("data/in.csv", "a,b\n1,2\n")  # str, bytes or a file object
+info.path, info.name, info.size  # ("/workspace/data/in.csv", "in.csv", 8): WriteInfo
 with open("big.parquet", "rb") as f:
     sandbox.files.write("data/big.parquet", f)  # streamed in 64 KiB chunks
 sandbox.files.write_files([("a.txt", "A"), {"path": "b.bin", "data": b"\0", "mode": 0o600}])
@@ -216,7 +289,9 @@ terminal.send_input(b"\x03")  # Ctrl+C
 terminal.send_input("exit\n")
 terminal.wait().exit_code
 
-other = sandbox.pty.connect(terminal.pid, show)  # re-attach: replays, then live
+# By pid, from anywhere (a second terminal here, so that there is one still running):
+pid = sandbox.pty.create(80, 24, show).pid
+other = sandbox.pty.connect(pid, show)  # re-attach: replays, then live
 sandbox.pty.send_input(pid, "ls\n")
 sandbox.pty.resize(pid, 100, 30)
 sandbox.pty.kill(pid)
@@ -296,7 +371,9 @@ with Webhooks() as webhooks:  # api_key / base_url as for Sandbox
     webhooks.delete(hook.id)
 ```
 
-`AsyncWebhooks` is the same with `await`.
+`AsyncWebhooks` is the same with `await`. The URL is checked when the webhook
+is created: it must be `https` and resolve to a public address, so the
+placeholder host above is refused (`webhook_url_not_allowed`); use your own.
 
 In the handler that receives the requests, verify each one before you use it.
 `verify_webhook` needs no client and no network: pass it the **raw** body, the
@@ -335,7 +412,7 @@ subclasses with `status_code`, `code` (the server's stable code), `message`,
 |---|---|
 | `AuthenticationError` | 401: missing or wrong key or token |
 | `SandboxNotFoundError`, `TemplateNotFoundError`, `CommandNotFoundError`, `PathNotFoundError` | 404 (all are `NotFoundError`). Another tenant's sandbox is "not found". |
-| `InvalidArgumentError`, `PayloadTooLargeError` | 400 / 413: validation |
+| `InvalidArgumentError`, `PayloadTooLargeError` | 400 / 413: validation; also `invalid_timeout` (a lifetime past the template's max; `details["max_timeout_ms"]`) and `network_not_allowed` |
 | `PermissionDeniedError` | 403: the sandbox user may not access the path |
 | `SandboxNotRunningError` (`.state`, `.reason`) | 409: the sandbox ended: `released`, `idle_timeout`, `max_lifetime`, `oom_killed`, ... |
 | `SandboxTerminatedError` | subclass: it died while the request or stream was being served |
@@ -381,7 +458,9 @@ import httpx
 
 Sandbox.create("python", request_timeout=20)  # seconds per ordinary request (default 60)
 Sandbox.create("python", headers={"X-Trace": "abc"})
-Sandbox.create("python", http_client=httpx.Client(verify="/etc/ssl/internal-ca.pem"))
+Sandbox.create(
+    "python", http_client=httpx.Client(trust_env=False)
+)  # your own client: CA bundle (verify=...), proxies, limits
 Sandbox.create("python", transport=httpx.MockTransport(handler))  # tests
 Sandbox.create("python", ws_base_url="wss://ws.example.com")  # WebSocket origin, if it differs
 ```
@@ -408,6 +487,8 @@ carries `User-Agent: sbx-python/<version> (...)`.
 | Non-zero exit | raises `CommandExitException` | raises `CommandExitError`; `check=False` to opt out |
 | `pid` | integer | opaque string |
 | `files.make_dir` | returns whether it created the directory | the same |
+| `files.write` | returns `WriteInfo(name, type, path)` | the same, plus `size` |
+| Image `ENTRYPOINT`, `CMD`, `USER` | templates have a start command and a user | ignored: the agent is PID 1 and everything runs as uid 1000 (`sandbox`) |
 | `pty.create` | `create(size, ...)`, output via `handle.wait(on_pty=...)` | `create(cols, rows, on_data, ...)` |
 | Pause / resume, `get_host`, `files.watch_dir`, `files.rename` | yes | not offered by the server |
 

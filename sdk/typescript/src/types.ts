@@ -71,11 +71,29 @@ export interface SandboxStats {
   memoryHighHits: number
 }
 
+/** What `files.write` reports about the file it wrote (E2B: `WriteInfo`, plus `size`). */
+export interface WriteInfo {
+  /** The file's base name. */
+  name: string
+  type: 'file'
+  /** The absolute path; a relative path was resolved against `/workspace`. */
+  path: string
+  /** Bytes written. */
+  size: number
+}
+
 export interface TemplateInfo {
   templateId: string
   version: number
   image: string
+  /** The isolation tier: `crun` (a hardened container on the host kernel) or `runsc` (gVisor). */
   runtime: string
+  /**
+   * Whether sandboxes of this template run directly on the host kernel.
+   * `undefined` when the server cannot say (the template names a runtime
+   * the server has not enabled).
+   */
+  sharedKernel: boolean | undefined
   resources: {
     cpus: number
     memoryBytes: number
@@ -86,6 +104,14 @@ export interface TemplateInfo {
   }
   /** The widest network mode a sandbox of this template may ask for. */
   network: NetworkMode
+  /**
+   * The template's default allowlist: the hosts (and, by address, the
+   * CIDRs) a sandbox created without a `network` option of its own may
+   * reach when `network` is `allowlist`. A `network` option replaces
+   * these; it does not add to them.
+   */
+  allowDomains: string[]
+  allowCidrs: string[]
   /** 0 means none. */
   idleTimeoutMs: number
   /** 0 means none. */
@@ -228,6 +254,7 @@ export function templateFromWire(v: unknown): TemplateInfo {
     version: num(w.version),
     image: str(w.image),
     runtime: str(w.runtime),
+    sharedKernel: typeof w.shared_kernel === 'boolean' ? w.shared_kernel : undefined,
     resources: {
       cpus: num(r.cpus),
       memoryBytes: num(r.memory_bytes),
@@ -237,6 +264,8 @@ export function templateFromWire(v: unknown): TemplateInfo {
       nofileLimit: num(r.nofile_limit),
     },
     network: str(w.network, 'none'),
+    allowDomains: strings(w.allow_domains),
+    allowCidrs: strings(w.allow_cidrs),
     idleTimeoutMs: num(w.idle_timeout_ms),
     maxLifetimeMs: num(w.max_lifetime_ms),
   }

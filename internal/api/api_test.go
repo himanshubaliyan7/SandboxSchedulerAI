@@ -19,6 +19,7 @@ import (
 	"github.com/himanshubaliyan7/warmbox/internal/api"
 	"github.com/himanshubaliyan7/warmbox/internal/core"
 	"github.com/himanshubaliyan7/warmbox/internal/pool"
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 	"github.com/himanshubaliyan7/warmbox/internal/runtime"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
@@ -818,10 +819,48 @@ func TestTimeoutEndpointStaysWithinTemplateLimits(t *testing.T) {
 	if d := time.Until(*v.ExpiresAt); d < 29*time.Minute || d > 30*time.Minute {
 		t.Errorf("extended: expires in %s", d)
 	}
-	// Past the template's max lifetime: capped at assignment + max.
-	h.want(h.do("POST", path, map[string]any{"timeout_ms": 86_400_000}, withKey(keyA)), 200, "").json(t, &v)
-	if got := v.ExpiresAt.Sub(*v.StartedAt); got != time.Hour {
-		t.Errorf("capped: %s after start, want 1h", got)
+	// Past the template's max lifetime: refused, as at create, with the
+	// most that may be asked for; nothing changes.
+	before := *v.ExpiresAt
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+			Details struct {
+				MaxTimeoutMs  int64 `json:"max_timeout_ms"`
+				MaxLifetimeMs int64 `json:"max_lifetime_ms"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	h.want(h.do("POST", path, map[string]any{"timeout_ms": 86_400_000}, withKey(keyA)), 400, api.CodeInvalidTimeout).json(t, &e)
+	if d := e.Error.Details; d.MaxLifetimeMs != 3_600_000 || d.MaxTimeoutMs <= 3_590_000 || d.MaxTimeoutMs > 3_600_000 {
+		t.Errorf("details of the refusal: %+v (%s)", d, e.Error.Message)
+	}
+	h.want(h.do("GET", "/v1/sandboxes/"+sb.ID, nil, withKey(keyA)), 200, "").json(t, &v)
+	if !v.ExpiresAt.Equal(before) {
+		t.Errorf("a refused timeout moved the expiry from %s to %s", before, v.ExpiresAt)
+	}
+	// The offered maximum is accepted and ends at start + max lifetime.
+	h.want(h.do("POST", path, map[string]any{"timeout_ms": e.Error.Details.MaxTimeoutMs - 1000}, withKey(keyA)), 200, "").json(t, &v)
+	if got := v.ExpiresAt.Sub(*v.StartedAt); got > time.Hour || got < time.Hour-5*time.Second {
+		t.Errorf("the offered maximum: %s after start, want just under 1h", got)
+	}
+	// The same contract at create.
+	h.want(h.do("POST", "/v1/sandboxes", map[string]any{"template_id": tmplID, "timeout_ms": 86_400_000}, withKey(keyA)), 400, api.CodeInvalidTimeout).json(t, &e)
+	if d := e.Error.Details; d.MaxTimeoutMs != 3_600_000 || d.MaxLifetimeMs != 3_600_000 {
+		t.Errorf("details of the refusal at create: %+v", d)
+	}
+	// Setting the timeout is activity: it restarts the idle timer.
+	// Reading the sandbox is not.
+	old := time.Now().Add(-10 * time.Minute)
+	h.st.Update(sb.ID, func(s *core.Sandbox) { s.LastActivityAt = &old })
+	h.want(h.do("GET", "/v1/sandboxes/"+sb.ID, nil, withKey(keyA)), 200, "").json(t, &v)
+	h.want(h.do("GET", "/v1/sandboxes", nil, withKey(keyA)), 200, "")
+	if time.Since(*v.LastActivityAt) < 9*time.Minute {
+		t.Errorf("a read counted as activity: last activity %s ago", time.Since(*v.LastActivityAt))
+	}
+	h.want(h.do("POST", path, map[string]any{"timeout_ms": 600_000}, withKey(keyA)), 200, "").json(t, &v)
+	if time.Since(*v.LastActivityAt) > time.Minute {
+		t.Errorf("set timeout did not restart the idle timer: last activity %s ago", time.Since(*v.LastActivityAt))
 	}
 	// Shorten, and the sweeper ends the sandbox with the right reason.
 	h.want(h.do("POST", path, map[string]any{"timeout_ms": 50}, withKey(keyA)), 200, "")
@@ -998,18 +1037,10 @@ func TestStatsAndMetrics(t *testing.T) {
 			t.Errorf("metrics lack %q", want)
 		}
 	}
-	// Every sample line is "name{labels} value" with a numeric value.
-	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
-		if strings.HasPrefix(line, "#") {
-			continue
-		}
-		i := strings.LastIndexByte(line, ' ')
-		if i < 0 {
-			t.Fatalf("malformed metrics line %q", line)
-		}
-		if _, err := strconv.ParseFloat(line[i+1:], 64); err != nil {
-			t.Fatalf("malformed metrics value in %q", line)
-		}
+	// The whole output is valid exposition text: HELP and TYPE once per
+	// family, well-formed and correctly escaped samples, no series twice.
+	if _, err := promtext.Validate(body); err != nil {
+		t.Fatalf("/metrics is not valid exposition text: %v\n%s", err, body)
 	}
 }
 
@@ -1072,5 +1103,46 @@ func TestTemplateTierIsReported(t *testing.T) {
 		if tc.want != "" && !bytes.Contains(r.Body, []byte(tc.want)) {
 			t.Errorf("%s: want %s in %s", tc.runtime, tc.want, r.Body)
 		}
+	}
+}
+
+// A template's default allowlist is listed by GET /v1/templates and is
+// the policy of a sandbox created without one; a create that names a
+// policy replaces it.
+func TestTemplateDefaultAllowlist(t *testing.T) {
+	h := newHarness(t, options{template: func(tm *core.Template) {
+		tm.AllowDomains = []string{"pypi.org", "files.pythonhosted.org"}
+		tm.AllowCIDRs = []string{"203.0.113.0/24"}
+	}})
+	var list struct {
+		Templates []api.TemplateView `json:"templates"`
+	}
+	h.want(h.do("GET", "/v1/templates", nil, withKey(keyA)), 200, "").json(t, &list)
+	if len(list.Templates) != 1 || len(list.Templates[0].AllowDomains) != 2 || len(list.Templates[0].AllowCIDRs) != 1 || list.Templates[0].Network != "allowlist" {
+		t.Fatalf("templates: %+v", list.Templates)
+	}
+	def := h.create(keyA, map[string]any{"template_id": tmplID})
+	var v api.SandboxView
+	h.want(h.do("GET", "/v1/sandboxes/"+def.ID, nil, withKey(keyA)), 200, "").json(t, &v)
+	if v.Network == nil || v.Network.Mode != core.NetworkAllowlist || len(v.Network.AllowDomains) != 2 || len(v.Network.AllowCIDRs) != 1 {
+		t.Errorf("a sandbox created without a policy: %+v, want the template's default allowlist", v.Network)
+	}
+	if att, ok := h.egress.Attached(def.ID); !ok || len(att.Policy.AllowDomains) != 2 {
+		t.Errorf("proxy policy of the default sandbox: %+v %v", att, ok)
+	}
+	own := h.create(keyA, map[string]any{"template_id": tmplID, "network": map[string]any{"allow_domains": []string{"example.com"}}})
+	v = api.SandboxView{}
+	h.want(h.do("GET", "/v1/sandboxes/"+own.ID, nil, withKey(keyA)), 200, "").json(t, &v)
+	if v.Network == nil || len(v.Network.AllowDomains) != 1 || v.Network.AllowDomains[0] != "example.com" || len(v.Network.AllowCIDRs) != 0 {
+		t.Errorf("a sandbox created with its own list: %+v, want exactly example.com", v.Network)
+	}
+}
+
+// A template without defaults still lists empty arrays, not null.
+func TestTemplatesListEmptyAllowlistAsArrays(t *testing.T) {
+	h := newHarness(t, options{noStart: true})
+	r := h.want(h.do("GET", "/v1/templates", nil, withKey(keyA)), 200, "")
+	if !bytes.Contains(r.Body, []byte(`"allow_domains":[]`)) || !bytes.Contains(r.Body, []byte(`"allow_cidrs":[]`)) {
+		t.Errorf("templates: %s", r.Body)
 	}
 }

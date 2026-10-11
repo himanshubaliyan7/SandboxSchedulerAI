@@ -256,8 +256,11 @@ describe('Sandbox.list and static helpers', () => {
       version: 3,
       image: 'docker.io/library/python:3.12-alpine',
       runtime: 'crun',
+      sharedKernel: true,
       resources: { cpus: 1, memoryBytes: 268435456, pidsLimit: 256, workdirBytes: 67108864, tmpBytes: 33554432, nofileLimit: 1024 },
       network: 'allowlist',
+      allowDomains: ['pypi.org', 'files.pythonhosted.org'],
+      allowCidrs: [],
       idleTimeoutMs: 600000,
       maxLifetimeMs: 3600000,
     })
@@ -268,7 +271,8 @@ describe('sandbox lifecycle methods', () => {
   it('kill() is idempotent and returns false once the sandbox is unknown', async () => {
     const sb = await create()
     expect(await sb.kill()).toBe(true)
-    expect(await sb.kill()).toBe(true) // the server answers 204 for a terminated sandbox
+    // Documented: true means "the server knows this sandbox and it is ended", also when an earlier kill ended it.
+    expect(await sb.kill()).toBe(true)
     server().sandboxes.delete(sb.sandboxId)
     expect(await sb.kill()).toBe(false)
   })
@@ -304,6 +308,11 @@ describe('sandbox lifecycle methods', () => {
     expect(info.expiresAt?.getTime()).toBeLessThan(before)
     expect(sb.info).toBe(info)
     await expect(sb.setTimeout(0)).rejects.toMatchObject({ code: 'invalid_timeout' })
+    // Past the template's max lifetime: refused with the limit, never capped.
+    const tooFar = await sb.setTimeout(2 * 3_600_000).catch((e) => e)
+    expect(tooFar).toBeInstanceOf(ValidationError)
+    expect(tooFar).toMatchObject({ code: 'invalid_timeout', details: { max_timeout_ms: 3_600_000 } })
+    expect(sb.info).toBe(info)
     await sb.kill()
     const err = await sb.setTimeout(1000).catch((e) => e)
     expect(err).toBeInstanceOf(SandboxTerminatedError)

@@ -24,6 +24,15 @@ agent in a few milliseconds, then destroys it when the session ends.
 > against real Podman, but it has run on one development machine only. Read the
 > [threat model](#threat-model) before pointing it at code you do not trust.
 
+**Where it fits.** If you want E2B's own stack on your hardware, E2B now ships
+one: [E2B Embed](https://github.com/e2b-dev/runtime/blob/main/embed/README.md)
+(Apache-2.0) runs it on a single host with Docker Compose, with microVM
+isolation and pause/resume, and needs KVM and a privileged container. Warmbox
+is for the hosts that cannot offer that: no `/dev/kvm`, no root, one
+unprivileged user. The trade is the isolation boundary, which the
+[threat model](#threat-model) states plainly. The
+[migration guide](docs/migrating-from-e2b.md) has an honest fit check.
+
 ## Contents
 
 - [How it works](#how-it-works)
@@ -87,6 +96,29 @@ flowchart LR
 A **template** describes a pool: an image, a resource shape, a network mode and
 how many sandboxes to keep warm. A claim cannot change the template; anything
 that varies per session (environment, files) is injected after the claim.
+
+What a sandbox takes from the template's image, and what it does not:
+
+- **`ENTRYPOINT` and `CMD` are ignored.** PID 1 of every sandbox is
+  `sbx-agent`, and nothing else runs until a command is sent. A service the
+  image would start has to be started as a background command.
+- **`USER` is ignored.** Everything runs as uid 1000, gid 1000, named
+  `sandbox` inside, with no capabilities, whatever the image says. The host
+  account's name, the host's name and its `/etc/hosts` are not visible inside.
+- **The root filesystem is read-only.** `/workspace` (the home and working
+  directory) and `/tmp` are size-capped tmpfs mounts; image `VOLUME`s are
+  ignored. System packages belong in the image.
+- **`ENV` is kept.** On top of it a sandbox gets `HOME=/workspace`, `TMPDIR`,
+  `PYTHONPYCACHEPREFIX`, `PYTHONUNBUFFERED=1` (output arrives as it is
+  printed), and `/workspace/.local/bin` in front of the image's `PATH`, which
+  is where `pip install` puts programs.
+
+A template's **network mode** (`none`, `allowlist`, `full`) is the widest a
+sandbox may ask for. An `allowlist` template can carry a default list
+(`--allow-domains`, `--allow-cidrs`): a sandbox created without a network
+policy of its own gets exactly that list, and a create request that names a
+policy replaces it (it does not add to it). Without a default list such a
+sandbox reaches nothing. `sbxd admin template apply -h` has all of this.
 
 ### Sandbox lifecycle
 
@@ -185,14 +217,20 @@ export SBX_DATABASE_URL='postgres://postgres:sbx@127.0.0.1:55432/postgres?sslmod
 podman pull docker.io/library/python:3.12-alpine
 
 bin/sbxd preflight                           # checks the host; fix any FAIL line first
-bin/sbxd admin tenant create --id acme --max-concurrent 20 --rate 50 --burst 100
-bin/sbxd admin key create --tenant acme      # prints the API key once
-bin/sbxd admin template apply --id python \
+bin/sbxd admin tenant create acme --max-concurrent 20 --rate 50 --burst 100
+bin/sbxd admin key create acme               # prints the API key once
+bin/sbxd admin template apply python \
     --image docker.io/library/python:3.12-alpine \
-    --memory 256m --workdir-size 64m --tmp-size 32m \
-    --network allowlist --warm-target 2
+    --memory 512m --workdir-size 192m --tmp-size 64m \
+    --network allowlist --allow-domains pypi.org,files.pythonhosted.org \
+    --warm-target 2
 bin/sbxd serve                               # listens on 127.0.0.1:8080
 ```
+
+The template lets its sandboxes reach PyPI and nothing else. Leave
+`--allow-domains` out and an `allowlist` sandbox reaches nothing, which is
+what a `pip install` then says: `403 Blocked by sandbox network policy:
+pypi.org is not in the allowlist`.
 
 Then, from another terminal:
 
@@ -203,7 +241,17 @@ curl -s -H "X-API-Key: $SBX_API_KEY" -d '{"template_id":"python"}' \
 curl -N -H "X-API-Key: $SBX_API_KEY" \
     -d '{"cmd":"python3","args":["-c","print(6*7)"]}' \
     "localhost:8080/v1/sandboxes/$ID/commands?wait=stream"
+curl -N -H "X-API-Key: $SBX_API_KEY" \
+    -d '{"cmd":"/bin/sh","args":["-c","pip install requests && python3 -c \"import requests; print(requests.__version__)\""]}' \
+    "localhost:8080/v1/sandboxes/$ID/commands?wait=stream"
 ```
+
+`pip install` works as it is: the root filesystem is read-only and the process
+is uid 1000, so pip installs for the user under `/workspace/.local`, whose
+`bin` is on `PATH`. A virtual environment under `/workspace` works too.
+Measured once on this laptop for `pip install requests` (five wheels,
+including the download): 5 s on python:3.12-alpine and 4 s on python:3.12-slim
+under crun, 10 s and 5 to 6 s under gVisor.
 
 `sbxd preflight` warns when lingering is off. Without it your sandboxes die
 when you log out: `sudo loginctl enable-linger $USER`.
@@ -223,6 +271,7 @@ with Sandbox.create("python") as sandbox:          # killed when the block ends
     sandbox.files.write("data.csv", "a,b\n1,2\n")
     result = sandbox.commands.run("python3 -c 'print(open(\"data.csv\").read())'")
     print(result.stdout, result.exit_code)
+    sandbox.commands.run("pip install requests")   # PyPI is on the template's allowlist
 ```
 
 There is an `AsyncSandbox` with the same surface. See
@@ -231,7 +280,8 @@ There is an `AsyncSandbox` with the same surface. See
 ### TypeScript
 
 ```sh
-cd sdk/typescript && npm install && npm run build
+(cd sdk/typescript && npm install && npm run build)   # dist/ is not committed
+npm install /path/to/warmbox/sdk/typescript            # in your project
 ```
 
 ```ts
@@ -255,7 +305,7 @@ over stdio. It gives an MCP client these tools:
 | Tool | What it does |
 |---|---|
 | `create_sandbox`, `list_sandboxes`, `kill_sandbox` | Sandbox lifecycle |
-| `list_templates` | What can be created |
+| `list_templates` | What can be created: image, runtime, limits, network mode and default allowlist |
 | `run_command` | Run a shell line; returns exit code, stdout, stderr |
 | `run_python` | Run Python source in a fresh interpreter |
 | `write_file`, `read_file`, `list_files` | Move files in and out |
@@ -369,10 +419,13 @@ limits are in [`bench/RESULTS.md`](bench/RESULTS.md).
 | Memory bomb to reported `oom_killed` | 0.4-0.7 s |
 | Idle memory per sandbox | about 2.4-2.8 MB |
 
-`sbxd` runs its own Podman service, whose sandboxes hold no kernel key, so the
-old ceiling of about 190 sandboxes per user is gone: 1,200 warm sandboxes ran on
-the same laptop (11 GB) with no failed create and 3.8 GB still available. See
-`docs/operations.md` for what limits a host next.
+Density: `sbxd` runs its own Podman service by default (managed mode), whose
+sandboxes hold no kernel key, so the number of sandboxes is not bounded by the
+kernel's per-user key quota: 1,200 warm sandboxes ran on the same laptop
+(11 GB) with no failed create and 3.8 GB still available. Memory is what limits
+a host next; see `docs/operations.md`. (Only a server pointed at an existing
+Podman socket with `--podman-socket` still meets the key quota, at about 190
+sandboxes; that mode is not the default.)
 
 ### crun and gVisor side by side
 
@@ -394,31 +447,43 @@ work running.
 | 2,000 small files written, read and removed in `/workspace` | 61 ms | 386 ms |
 | 1,500 files read from the image | 22 ms | 282 ms |
 | Memory bomb to reported `oom_killed` | 0.35 s | 0.53 s |
+| `pip install requests` on python:3.12-alpine (one run, with download) | 5.0 s | 10.2 s |
+| The same on python:3.12-slim | 3.9 s | 5.2 s |
+| 200,000 `print()` lines, unbuffered as by default (best of 3) | 4.4 s | 44 s |
+| The same with `PYTHONUNBUFFERED=""` (block-buffered) | 0.6 s | 2.6 s |
 
 A claim costs the same on both tiers because it is a database pop; the price of
 gVisor is paid by the code that runs afterwards, most of all by process creation
 and file access, and by the 16 MiB or so of every sandbox's memory limit that
-its sentry uses.
+its sentry uses. The last two rows are the price of the default
+`PYTHONUNBUFFERED=1`: every `print` becomes a write, which is what lets a
+caller see output as it is produced, and which a program that prints hundreds
+of thousands of lines can switch off for itself.
 
 ## Roadmap
 
-Done so far: the benchmark spike, the single-node core, the MVP (API, agent,
-egress, SDKs, MCP server), a private Podman service per server, and the gVisor
-tier with first measurements.
+**Done.** The benchmark spike; the single-node core; the MVP (REST API,
+in-sandbox agent, egress proxy, Python and TypeScript SDKs, MCP server); and
+the hardened tier:
 
-**Next: the hardened tier.** The goal is to make the "containers are not
-enough" objection answerable without changing the scheduler.
+- a private, supervised Podman service per server (managed mode, the default),
+  which removed the per-user key ceiling;
+- the gVisor tier: `--runtimes crun,runsc`, `--runtime runsc` per template,
+  the whole test suite on both tiers, and first measurements side by side;
+- lifecycle webhooks ([`docs/webhooks.md`](docs/webhooks.md));
+- migration guides from [E2B](docs/migrating-from-e2b.md) and from
+  [open-source Daytona](docs/migrating-from-daytona.md);
+- template-level default egress, a fixed neutral identity inside sandboxes,
+  and `pip install` that works on the read-only root.
 
-1. ~~Install gVisor, enable `--runtime runsc` templates in the server and run the
-   whole test suite on them~~ (done: `--runtimes`; see the threat model).
-2. Measure gVisor's cost on real agent workloads: a first table is above
-   (interpreter start, imports, fork-heavy shell, small files); `pip install`
-   and a proper benchmark with raw data are still to do.
-3. ~~Give `sbxd` its own private Podman service and config~~ (done: managed mode
-   is the default; see `docs/operations.md`).
-4. ~~Lifecycle webhooks~~ (done: [`docs/webhooks.md`](docs/webhooks.md)), and
-   migration guides from archived Daytona and from self-hosted E2B.
-5. Re-run everything on Podman 6 and on a server-class host.
+**Next.**
+
+1. A proper benchmark with raw data on a server-class host, both tiers, real
+   agent workloads. What exists is one laptop and small samples.
+2. Re-run everything on Podman 6 and on a second machine.
+3. A start command per template, so that an image's service can be running
+   when the sandbox is claimed (today: a background command after the claim).
+4. Publish the SDKs to PyPI and npm.
 
 **After that: scale and a KVM tier.** Multi-host placement with leases and
 per-tenant caps; a Firecracker backend with snapshot restore; a TLS-terminating
@@ -429,13 +494,14 @@ for ports.
 multi-region, a hosted cloud, non-Linux guests, browser or desktop images.
 
 The reasoning behind this order is in
-[`docs/research/build-plan.md`](docs/research/build-plan.md).
+[`docs/research/build-plan.md`](docs/research/build-plan.md) (what it says about
+self-hosting E2B is superseded by E2B Embed; see "Where it fits" above).
 
 ## Repository layout
 
 | Path | What it is |
 |---|---|
-| `cmd/sbxd` | Server: `serve`, `preflight`, `admin` |
+| `cmd/sbxd` | Server: `serve`, `preflight`, `admin` (tenants, keys, templates, webhooks, host) |
 | `cmd/sbx-agent`, `internal/agent` | In-sandbox agent: processes, terminals, ring-buffer replay, files |
 | `cmd/sbx-mcp`, `internal/mcp` | MCP server over stdio |
 | `internal/api`, `api/openapi.yaml` | Public REST API |
@@ -449,8 +515,10 @@ The reasoning behind this order is in
 | `internal/agentapi`, `internal/agentclient` | Host-to-agent wire contract and client |
 | `internal/egress` | Allowlist egress proxy |
 | `internal/webhook` | Lifecycle webhooks: delivery worker, signing, SSRF-safe sender |
+| `internal/promtext` | Prometheus text format: label escaping and the validator the metric tests use |
 | `sdk/python`, `sdk/typescript` | Client SDKs (`sbx`, `sbx-sdk`) |
 | `test/e2e` | End-to-end tests against real Podman and Postgres |
+| `test/repo` | Checks on the repository itself (no secret-shaped literals) |
 | `bench` | Benchmark harness and results |
 | `docs/operations.md` | Running a server |
 | `docs/research` | The research notes and build plan this design follows |

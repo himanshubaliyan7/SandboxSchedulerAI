@@ -3,7 +3,7 @@
 import type { SandboxContext } from './commands.js'
 import { ConnectionError, NotFoundError, SandboxError } from './errors.js'
 import type { CallOptions } from './http.js'
-import { type EntryInfo, entryFromWire, list } from './types.js'
+import { type EntryInfo, entryFromWire, list, type WriteInfo } from './types.js'
 import { concatBytes, utf8 } from './util.js'
 
 export interface FileReadOptions extends CallOptions {
@@ -21,6 +21,28 @@ export interface FileWriteOptions extends CallOptions {
 }
 
 export type FileData = string | Uint8Array | ArrayBuffer | Blob | ReadableStream<Uint8Array>
+
+/** One file for {@link Files.writeFiles}. */
+export interface WriteEntry {
+  path: string
+  data: FileData
+  /** Octal permission bits, as for {@link FileWriteOptions.mode}. */
+  mode?: string | number
+}
+
+/** The work directory relative paths are resolved against. */
+const WORKDIR = '/workspace'
+
+/** The absolute, normalised form of a sandbox path, as the server resolves it. */
+function absolutePath(path: string): string {
+  const parts: string[] = []
+  for (const part of (path.startsWith('/') ? path : `${WORKDIR}/${path}`).split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') parts.pop()
+    else parts.push(part)
+  }
+  return `/${parts.join('/')}`
+}
 
 function filesPath(sandboxId: string, action?: string): string {
   const p = `/v1/sandboxes/${encodeURIComponent(sandboxId)}/files`
@@ -115,9 +137,27 @@ export class Files {
    * A ReadableStream body needs a runtime with streaming request bodies
    * (Node, Deno, Bun, workerd; in browsers only Chromium over HTTP/2) and
    * cannot be retried automatically.
+   *
+   * Resolves with a {@link WriteInfo}: the file's name, its absolute
+   * path and the number of bytes written (E2B's `WriteInfo`, plus `size`).
    */
-  async write(path: string, data: FileData, opts: FileWriteOptions = {}): Promise<void> {
-    const body = typeof data === 'string' ? utf8(data) : data instanceof ArrayBuffer ? new Uint8Array(data) : data
+  async write(path: string, data: FileData, opts: FileWriteOptions = {}): Promise<WriteInfo> {
+    let body: Exclude<FileData, string | ArrayBuffer> =
+      typeof data === 'string' ? utf8(data) : data instanceof ArrayBuffer ? new Uint8Array(data) : data
+    let size = 0
+    if (body instanceof Uint8Array) size = body.byteLength
+    else if (body instanceof Blob) size = body.size
+    else {
+      // A stream's length is only known once it has been sent.
+      body = body.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            size += chunk.byteLength
+            controller.enqueue(chunk)
+          },
+        }),
+      )
+    }
     await this.#ctx.api.empty('PUT', filesPath(this.#ctx.sandboxId), {
       auth: 'data',
       retry: 'idempotent',
@@ -127,6 +167,22 @@ export class Files {
       // An upload takes as long as it takes; only an explicit deadline applies.
       timeoutMs: opts.requestTimeoutMs ?? 0,
     })
+    const abs = absolutePath(path)
+    return { name: abs.slice(abs.lastIndexOf('/') + 1), type: 'file', path: abs, size }
+  }
+
+  /**
+   * Uploads several files, one after another, and resolves with one
+   * {@link WriteInfo} per file, in order (E2B: `write([...])`; Python:
+   * `write_files`). It stops at the first failure: the files before it
+   * have been written, the ones after it have not.
+   */
+  async writeFiles(files: Iterable<WriteEntry>, opts: CallOptions = {}): Promise<WriteInfo[]> {
+    const out: WriteInfo[] = []
+    for (const f of files) {
+      out.push(await this.write(f.path, f.data, f.mode === undefined ? opts : { ...opts, mode: f.mode }))
+    }
+    return out
   }
 
   /** Lists a directory (not recursive), sorted by name. Default: the work directory. */

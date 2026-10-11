@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   type CommandEvent,
   CommandExitError,
+  CommandStartError,
+  CommandTimeoutError,
   ConflictError,
   ConnectionError,
   NotFoundError,
@@ -69,8 +71,18 @@ describe('commands.run (foreground)', () => {
   it('reports a per-command timeout with reason and signal', async () => {
     const sb = await create()
     const err = await sb.commands.run('timeout', { timeoutMs: 10 }).catch((e) => e)
+    // The specific class, as in Python, and still a CommandExitError.
+    expect(err).toBeInstanceOf(CommandTimeoutError)
     expect(err).toBeInstanceOf(CommandExitError)
+    expect(err.name).toBe('CommandTimeoutError')
     expect(err).toMatchObject({ exitCode: 137, reason: 'timeout', signal: 'SIGKILL' })
+    // Any other failure is not a timeout.
+    const failed = await sb.commands.run('fail 3').catch((e) => e)
+    expect(failed).toBeInstanceOf(CommandExitError)
+    expect(failed).not.toBeInstanceOf(CommandTimeoutError)
+    // The handle's wait() makes the same distinction.
+    const handle = await sb.commands.run('timeout', { timeoutMs: 10, background: true })
+    await expect(handle.wait()).rejects.toBeInstanceOf(CommandTimeoutError)
   })
 
   it('streams output to onStdout and onStderr in order', async () => {
@@ -130,6 +142,8 @@ describe('commands.run (foreground)', () => {
 
   it('surfaces a start error from the server as a typed error', async () => {
     const sb = await create()
+    // CommandStartError, as in Python; a ValidationError as before the class existed.
+    await expect(sb.commands.run('nosuch', { args: [] })).rejects.toBeInstanceOf(CommandStartError)
     await expect(sb.commands.run('nosuch', { args: [] })).rejects.toBeInstanceOf(ValidationError)
     await expect(sb.commands.run('nosuch', { args: [] })).rejects.toMatchObject({ code: 'command_not_found', status: 400 })
   })

@@ -163,7 +163,7 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request, ten
 	if err != nil {
 		return webhookError(err, "")
 	}
-	s.log.Info("webhook created", "request_id", requestID(r), "tenant", tenant.ID, "webhook", wh.ID, "url", wh.URL)
+	s.log.Info("webhook created", "request_id", requestID(r), "tenant", tenant.ID, "webhook", wh.ID, "url", webhook.LogURL(wh.URL))
 	writeJSON(w, http.StatusCreated, webhookView(wh, true))
 	return nil
 }
@@ -232,7 +232,7 @@ func (s *Server) handleUpdateWebhook(w http.ResponseWriter, r *http.Request, ten
 	if err != nil {
 		return webhookError(err, id)
 	}
-	s.log.Info("webhook updated", "request_id", requestID(r), "tenant", tenant.ID, "webhook", wh.ID, "url", wh.URL, "enabled", wh.Enabled)
+	s.log.Info("webhook updated", "request_id", requestID(r), "tenant", tenant.ID, "webhook", wh.ID, "url", webhook.LogURL(wh.URL), "enabled", wh.Enabled)
 	writeJSON(w, http.StatusOK, webhookView(wh, false))
 	return nil
 }

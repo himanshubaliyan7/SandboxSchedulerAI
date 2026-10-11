@@ -1,0 +1,14 @@
+# ggshield configuration (schema checked against ggshield's own
+# .gitguardian.example.yml: version 2, secret.ignored_matches).
+version: 2
+
+secret:
+  show_secrets: false
+  # The only secret-shaped value this repository ever held is the public
+  # known-answer vector of the Standard Webhooks specification, used to
+  # test signature verification. It is no longer written as one literal
+  # anywhere (test/repo/secrets_test.go enforces that); this entry covers
+  # its occurrences in the history. The match is the SHA-256 of the value.
+  ignored_matches:
+    - name: Standard Webhooks specification test vector (public example, not a credential)
+      match: 96ad2ccd81462a766178ae09a71df55f548a3f66da11606f9cdf40b391e22dd0

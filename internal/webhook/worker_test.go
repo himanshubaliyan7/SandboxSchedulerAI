@@ -17,6 +17,7 @@ import (
 
 	"github.com/himanshubaliyan7/warmbox/internal/core"
 	"github.com/himanshubaliyan7/warmbox/internal/pool/pooltest"
+	"github.com/himanshubaliyan7/warmbox/internal/promtext"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 	"github.com/himanshubaliyan7/warmbox/internal/webhook/webhooktest"
 )
@@ -1074,6 +1075,9 @@ func TestWorkerConfigAndMetricsOutput(t *testing.T) {
 	var buf bytes.Buffer
 	e.w.Metrics().Write(&buf)
 	out := buf.String()
+	if _, err := promtext.Validate(out); err != nil {
+		t.Errorf("the webhook metrics are not valid exposition text: %v\n%s", err, out)
+	}
 	for _, want := range []string{
 		`sbx_webhook_deliveries_total{outcome="failed"} 1`, `sbx_webhook_deliveries_total{outcome="succeeded"} 0`,
 		`sbx_webhook_delivery_failures_total{code="http_status"} 1`, `sbx_webhook_dropped_events_total{reason="retention_expired"} 0`,

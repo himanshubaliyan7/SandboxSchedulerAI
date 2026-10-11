@@ -37,7 +37,7 @@ func TestContainersConf(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"[containers]\nkeyring = false\ndefault_sysctls = []\nlog_driver = \"none\"\n",
+		"[containers]\nkeyring = false\ndefault_sysctls = []\nlog_driver = \"none\"\nbase_hosts_file = \"none\"\nhost_containers_internal_ip = \"none\"\n",
 		"[engine]\ncgroup_manager = \"systemd\"\nevents_logger = \"none\"\nruntime = \"runsc\"\n",
 		"[engine.runtimes]\ncrun = [\"/usr/bin/crun\"]\nrunsc = [\"/run/user/1000/s b\\\"x/runsc\"]\n",
 	} {

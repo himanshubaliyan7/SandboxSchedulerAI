@@ -172,10 +172,36 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 
 	c.removeStaleRunDirs(ctx, byID)
+	c.reapLeftovers(ctx)
 	if changed {
 		c.Kick()
 	}
 	return nil
+}
+
+// reapLeftovers ends host processes of this scheduler's sandboxes that
+// the backend's listing no longer shows (runtime.LeftoverReaper). A
+// leftover is this scheduler's if the store has a row for its sandbox
+// with this host id, in any state: the row of a destroyed sandbox is
+// kept, which is what makes the leftover attributable.
+func (c *Controller) reapLeftovers(ctx context.Context) {
+	reaper, ok := c.backend.(runtime.LeftoverReaper)
+	if !ok {
+		return
+	}
+	n, err := reaper.ReapLeftovers(ctx, func(sandboxID string) bool {
+		row, err := c.store.GetSandbox(ctx, sandboxID)
+		return err == nil && row.HostID == c.cfg.HostID && !c.busyRow(row)
+	})
+	if err != nil {
+		c.log.Warn("reconcile: reap leftover processes", "err", err)
+	}
+	if n > 0 {
+		c.mu.Lock()
+		c.m.OrphansDestroyed += uint64(n)
+		c.mu.Unlock()
+		c.log.Warn("reconcile: ended leftover host processes of removed sandboxes", "count", n)
+	}
 }
 
 // diedOf says why an instance that List reported as not running ended.

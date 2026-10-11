@@ -7,6 +7,7 @@ types are plain strings, never closed enums.
 
 from __future__ import annotations
 
+import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -264,8 +265,20 @@ class TemplateInfo:
     template_id: str
     version: int = 0
     image: str = ""
+    #: The isolation tier: ``crun`` (a hardened container on the host
+    #: kernel) or ``runsc`` (gVisor).
     runtime: str = ""
+    #: Whether sandboxes of this template run directly on the host kernel;
+    #: ``None`` when the server cannot say (the template names a runtime
+    #: the server has not enabled).
+    shared_kernel: bool | None = None
+    #: The widest network mode a sandbox of this template may ask for.
     network: str = ""
+    #: The template's default allowlist: what a sandbox created without a
+    #: ``network`` of its own may reach when ``network`` is ``allowlist``.
+    #: A ``network`` argument replaces these; it does not add to them.
+    allow_domains: tuple[str, ...] = ()
+    allow_cidrs: tuple[str, ...] = ()
     idle_timeout_ms: int = 0
     max_lifetime_ms: int = 0
     resources: Mapping[str, Any] = field(default_factory=lambda: dict[str, Any]())
@@ -274,12 +287,16 @@ class TemplateInfo:
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> TemplateInfo:
         res = d.get("resources")
+        shared = d.get("shared_kernel")
         return cls(
             template_id=_str(d, "id"),
             version=_int(d, "version"),
             image=_str(d, "image"),
             runtime=_str(d, "runtime"),
+            shared_kernel=shared if isinstance(shared, bool) else None,
             network=_str(d, "network"),
+            allow_domains=tuple(_str_list(d.get("allow_domains"))),
+            allow_cidrs=tuple(_str_list(d.get("allow_cidrs"))),
             idle_timeout_ms=_int(d, "idle_timeout_ms"),
             max_lifetime_ms=_int(d, "max_lifetime_ms"),
             resources=dict(res) if isinstance(res, Mapping) else {},
@@ -465,10 +482,25 @@ class EntryInfo:
 
 @dataclass(frozen=True)
 class WriteInfo:
-    """A file written by ``files.write``."""
+    """A file written by ``files.write`` (E2B's ``WriteInfo``, plus ``size``).
+
+    ``path`` is absolute: a relative path was resolved against
+    ``/workspace``. ``name`` is the file's base name and ``type`` is always
+    ``"file"``. ``size`` is the number of bytes written.
+    """
 
     path: str
     size: int
+    name: str = ""
+    type: str = "file"
+
+    @classmethod
+    def for_path(cls, path: str, size: int) -> WriteInfo:
+        """The info for a file written at ``path`` as the caller spelled it."""
+        absolute = posixpath.normpath(path if path.startswith("/") else posixpath.join("/workspace", path))
+        # POSIX keeps a leading "//" distinct; a sandbox path never needs it.
+        absolute = "/" + absolute.lstrip("/")
+        return cls(path=absolute, size=size, name=posixpath.basename(absolute))
 
 
 @dataclass(frozen=True)

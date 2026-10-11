@@ -299,3 +299,15 @@ func asDestinationError(err error) (*DestinationError, bool) {
 	ok := errors.As(err, &de)
 	return de, ok
 }
+
+// LogURL is a webhook URL as it may appear in a log line: scheme and
+// host only. The path and the query of a receiver's URL are often its
+// credential (an unguessable path, a ?token=), and logs are read by more
+// people than the webhook's owner.
+func LogURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "(unparsable)"
+	}
+	return u.Scheme + "://" + u.Host + "/..."
+}

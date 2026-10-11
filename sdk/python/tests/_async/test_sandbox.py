@@ -205,6 +205,13 @@ async def test_list_and_filters(server: FakeServer) -> None:
     templates = await AsyncSandbox.list_templates(api_key=API_KEY, transport=server.transport())
     assert templates[0].template_id == "python" and templates[0].max_lifetime_ms == 3_600_000
     assert templates[0].resources["memory_bytes"] == 268435456
+    # The isolation tier and the default allowlist are part of the type.
+    assert templates[0].runtime == "crun" and templates[0].shared_kernel is True
+    assert templates[0].network == "allowlist"
+    assert (
+        templates[0].allow_domains == ("pypi.org", "files.pythonhosted.org")
+        and templates[0].allow_cidrs == ()
+    )
 
 
 async def test_info_running_kill(sandbox: AsyncSandbox, server: FakeServer) -> None:
@@ -251,6 +258,10 @@ async def test_set_timeout(sandbox: AsyncSandbox, server: FakeServer) -> None:
     assert info.expires_at == datetime(2026, 10, 10, 8, 0, 30, tzinfo=timezone.utc)
     await sandbox.set_timeout(0.0004)  # rounds up to the smallest value the API accepts
     assert httpx.Response(200, content=server.requests[-1].content).json() == {"timeout_ms": 1}
+    # Past the template's max lifetime: refused with the limit, never capped.
+    with pytest.raises(InvalidArgumentError) as e:
+        await sandbox.set_timeout(7200)
+    assert e.value.code == "invalid_timeout" and e.value.details["max_timeout_ms"] == 3_600_000
     with pytest.raises(ValueError):
         await sandbox.set_timeout(0)
     with pytest.raises(ValueError):

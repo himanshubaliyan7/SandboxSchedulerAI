@@ -11,37 +11,85 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/himanshubaliyan7/warmbox/internal/core"
+	"github.com/himanshubaliyan7/warmbox/internal/egress"
 	"github.com/himanshubaliyan7/warmbox/internal/runtime/podman"
 	"github.com/himanshubaliyan7/warmbox/internal/server"
 	"github.com/himanshubaliyan7/warmbox/internal/store"
 )
 
-const adminUsage = `usage: sbxd admin <resource> <action> [flags]
+// adminAction is one "sbxd admin <resource> <action>". The table drives
+// the dispatch, the usage text and the help test, so that an action
+// cannot exist without being listed.
+type adminAction struct {
+	name string // "template show"
+	// arg is the flag a single positional argument fills ("id" makes
+	// "template show python" mean "--id python"); empty takes none.
+	arg  string
+	args string // the argument synopsis, for usage lines
+	help string
+	run  func(a *adminFlags, args []string) error
+}
 
-  tenant   create | update | list | delete
-  key      create | list | revoke
-  template apply | list | show | delete
-  webhook  create | list | delete
-  host     destroy
+// adminActions is filled in by init: the actions refer to cmdAdmin's
+// helpers, which refer to the table.
+var adminActions []adminAction
 
-Every action takes --database-url (or SBX_DATABASE_URL) and --json.
+func init() {
+	adminActions = []adminAction{
+		{"tenant create", "id", "<id> [flags]", "add a tenant", func(a *adminFlags, args []string) error { return adminTenantWrite(a, args, true) }},
+		{"tenant update", "id", "<id> [flags]", "change the flags given, keep the rest", func(a *adminFlags, args []string) error { return adminTenantWrite(a, args, false) }},
+		{"tenant list", "", "", "list tenants", adminTenantList},
+		{"tenant delete", "id", "<id>", "delete a tenant and its API keys", adminTenantDelete},
+		{"key create", "tenant", "<tenant>", "create an API key; prints it once", adminKeyCreate},
+		{"key list", "tenant", "<tenant>", "list a tenant's keys (never the key itself)", adminKeyList},
+		{"key revoke", "id", "<key-id>", "revoke a key", adminKeyRevoke},
+		{"template apply", "id", "<id> --image <image> [flags] | --file <file>", "create or replace a template", adminTemplateApply},
+		{"template list", "", "", "list templates", adminTemplateList},
+		{"template show", "id", "<id>", "print a template as JSON, the shape --file reads", adminTemplateShow},
+		{"template delete", "id", "<id>", "delete a template", adminTemplateDelete},
+		{"webhook create", "", "--tenant <tenant> --url <url> [flags]", "register a webhook; prints its signing secret once", adminWebhookCreate},
+		{"webhook list", "tenant", "[<tenant>]", "list webhooks (never their secrets)", adminWebhookList},
+		{"webhook delete", "id", "<webhook-id>", "delete a webhook", adminWebhookDelete},
+		{"host destroy", "", "[--run-dir <dir>] [--host-id <id>] [flags]", "with the server stopped: remove its containers, run dirs and live sandbox rows", adminHostDestroy},
+	}
+}
+
+func adminUsage() string {
+	var b bytes.Buffer
+	b.WriteString("usage: sbxd admin <resource> <action> [argument] [flags]\n\n")
+	tw := tabwriter.NewWriter(&b, 0, 4, 2, ' ', 0)
+	for _, act := range adminActions {
+		fmt.Fprintf(tw, "  %s %s\t%s\n", act.name, act.args, act.help)
+	}
+	_ = tw.Flush()
+	b.WriteString(`
+An id may be given as the argument shown or with its flag (--id, --tenant);
+flags may come before or after it. Every action takes --json, and
+--database-url or, better, SBX_DATABASE_URL (a flag is visible in the
+process list; help output never prints the value). Run
+"sbxd admin <resource> <action> -h" for the flags of an action.
 
 examples:
-  sbxd admin tenant create --id acme --max-concurrent 20 --rate 50 --burst 100
-  sbxd admin key create --tenant acme            # prints the key once
-  sbxd admin template apply --id python --image docker.io/library/python:3.12-alpine \
+  sbxd admin tenant create acme --max-concurrent 20 --rate 50 --burst 100
+  sbxd admin key create acme                     # prints the key once
+  sbxd admin template apply python --image docker.io/library/python:3.12-alpine \
       --cpus 1 --memory 512m --pids 256 --workdir-size 128m --tmp-size 64m \
-      --network allowlist --idle-timeout 10m --max-lifetime 1h --warm-target 3 --max-total 20
+      --network allowlist --allow-domains pypi.org,files.pythonhosted.org \
+      --idle-timeout 10m --max-lifetime 1h --warm-target 3 --max-total 20
   sbxd admin template apply --file templates.json   # one object or an array
+  sbxd admin template show python
   sbxd admin webhook create --tenant acme --url https://hooks.example.com/warmbox \
       --events sandbox.terminated,command.finished   # prints the signing secret once
   sbxd admin host destroy --run-dir /run/user/1000/sbx   # server stopped: remove its containers,
                                                          # run dirs and live sandbox rows
-`
+`)
+	return b.String()
+}
 
 // adminFlags are the flags every admin action shares.
 type adminFlags struct {
@@ -49,27 +97,56 @@ type adminFlags struct {
 	dbURL  *string
 	asJSON *bool
 	stdout io.Writer
+	// arg is the flag a positional argument fills; see adminAction.
+	arg string
 }
 
-func newAdminFlags(name string, stdout, stderr io.Writer) *adminFlags {
-	fs := flag.NewFlagSet("sbxd admin "+name, flag.ContinueOnError)
+func newAdminFlags(act adminAction, stdout, stderr io.Writer) *adminFlags {
+	fs := flag.NewFlagSet("sbxd admin "+act.name, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	return &adminFlags{
-		fs:     fs,
-		dbURL:  fs.String("database-url", envStr("SBX_DATABASE_URL", ""), "Postgres URL [SBX_DATABASE_URL]"),
-		asJSON: fs.Bool("json", false, "print the result as JSON"),
-		stdout: stdout,
+	a := &adminFlags{fs: fs, dbURL: new(string), asJSON: fs.Bool("json", false, "print the result as JSON"), stdout: stdout, arg: act.arg}
+	secretVar(fs, a.dbURL, "database-url", "SBX_DATABASE_URL", "Postgres `url`")
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "usage: sbxd admin %s %s\n\n%s\n\nflags:\n", act.name, strings.TrimSpace(act.args+" [--json]"), act.help)
+		fs.PrintDefaults()
 	}
+	return a
+}
+
+// parse parses the action's flags and its positional argument, if it
+// takes one: the argument sets the flag named by a.arg, and giving both
+// with different values is an error rather than a silent choice.
+func (a *adminFlags) parse(args []string) error {
+	max := 0
+	if a.arg != "" {
+		max = 1
+	}
+	pos, err := parsePositional(a.fs, args, max)
+	if err != nil {
+		return err
+	}
+	if len(pos) == 1 {
+		f := a.fs.Lookup(a.arg)
+		given := false
+		a.fs.Visit(func(v *flag.Flag) { given = given || v.Name == a.arg })
+		if given && f.Value.String() != pos[0] {
+			return fmt.Errorf("--%s %q and the argument %q disagree; give one", a.arg, f.Value.String(), pos[0])
+		}
+		if err := a.fs.Set(a.arg, pos[0]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // open parses the flags and connects to the store (applying migrations,
 // so admin commands work against an empty database).
 func (a *adminFlags) open(args []string) (*store.Store, context.Context, func(), error) {
-	if err := parse(a.fs, args); err != nil {
+	if err := a.parse(args); err != nil {
 		return nil, nil, nil, err
 	}
 	if *a.dbURL == "" {
-		return nil, nil, nil, errors.New("a database URL is required (--database-url or SBX_DATABASE_URL)")
+		return nil, nil, nil, errors.New("a database URL is required (SBX_DATABASE_URL or --database-url)")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	st, err := store.Open(ctx, *a.dbURL)
@@ -95,46 +172,20 @@ func (a *adminFlags) table(header string, rows func(w io.Writer)) {
 
 func cmdAdmin(args []string, stdout, stderr io.Writer) error {
 	if len(args) < 2 {
-		fmt.Fprint(stderr, adminUsage)
 		if len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
+			fmt.Fprint(stdout, adminUsage())
 			return nil
 		}
+		fmt.Fprint(stderr, adminUsage())
 		return errUsage
 	}
 	name := args[0] + " " + args[1]
-	a := newAdminFlags(name, stdout, stderr)
-	rest := args[2:]
-	switch name {
-	case "tenant create", "tenant update":
-		return adminTenantWrite(a, rest, args[1] == "create")
-	case "tenant list":
-		return adminTenantList(a, rest)
-	case "tenant delete":
-		return adminTenantDelete(a, rest)
-	case "key create":
-		return adminKeyCreate(a, rest)
-	case "key list":
-		return adminKeyList(a, rest)
-	case "key revoke":
-		return adminKeyRevoke(a, rest)
-	case "template apply":
-		return adminTemplateApply(a, rest)
-	case "template list":
-		return adminTemplateList(a, rest)
-	case "template show":
-		return adminTemplateShow(a, rest)
-	case "template delete":
-		return adminTemplateDelete(a, rest)
-	case "webhook create":
-		return adminWebhookCreate(a, rest)
-	case "webhook list":
-		return adminWebhookList(a, rest)
-	case "webhook delete":
-		return adminWebhookDelete(a, rest)
-	case "host destroy":
-		return adminHostDestroy(a, rest)
+	for _, act := range adminActions {
+		if act.name == name {
+			return act.run(newAdminFlags(act, stdout, stderr), args[2:])
+		}
 	}
-	fmt.Fprintf(stderr, "sbxd admin: unknown action %q\n\n%s", name, adminUsage)
+	fmt.Fprintf(stderr, "sbxd admin: unknown action %q\n\n%s", name, adminUsage())
 	return errUsage
 }
 
@@ -151,7 +202,7 @@ func adminHostDestroy(a *adminFlags, args []string) error {
 		"managed (start a throwaway Podman service, as the server did; the default without --podman-socket) or external [SBX_PODMAN_MODE]")
 	socket := a.fs.String("podman-socket", envStr("SBX_PODMAN_SOCKET", ""), "Podman API socket of an existing service; implies external mode [SBX_PODMAN_SOCKET]")
 	noDB := a.fs.Bool("no-database", false, "only remove containers and run dirs; leave the sandbox rows to the next server start")
-	if err := parse(a.fs, args); err != nil {
+	if err := a.parse(args); err != nil {
 		return err
 	}
 	if *hostID == "" && *runDir == "" {
@@ -167,7 +218,7 @@ func adminHostDestroy(a *adminFlags, args []string) error {
 	case *noDB:
 		dbURL = ""
 	case dbURL == "":
-		return errors.New("a database URL is required (--database-url or SBX_DATABASE_URL), or pass --no-database to leave the rows alone")
+		return errors.New("a database URL is required (SBX_DATABASE_URL or --database-url), or pass --no-database to leave the rows alone")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -203,7 +254,7 @@ func tenantOut(t store.Tenant) tenantJSON {
 var idRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 
 func adminTenantWrite(a *adminFlags, args []string, create bool) error {
-	id := a.fs.String("id", "", "tenant id (required)")
+	id := a.fs.String("id", "", "tenant id; the same as the `<id>` argument (required)")
 	name := a.fs.String("name", "", "display name (default: the id)")
 	maxc := a.fs.Int("max-concurrent", 10, "concurrent sandbox quota")
 	rps := a.fs.Float64("rate", 20, "API requests per second (0 disables rate limiting)")
@@ -287,12 +338,15 @@ func adminTenantList(a *adminFlags, args []string) error {
 }
 
 func adminTenantDelete(a *adminFlags, args []string) error {
-	id := a.fs.String("id", "", "tenant id (required)")
+	id := a.fs.String("id", "", "tenant id; the same as the `<id>` argument (required)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
 	}
 	defer done()
+	if *id == "" {
+		return errors.New("a tenant id is required: sbxd admin tenant delete <id>")
+	}
 	if err := st.DeleteTenant(ctx, *id); err != nil {
 		return err
 	}
@@ -316,14 +370,14 @@ type keyJSON struct {
 }
 
 func adminKeyCreate(a *adminFlags, args []string) error {
-	tenant := a.fs.String("tenant", "", "tenant id (required)")
+	tenant := a.fs.String("tenant", "", "tenant id; the same as the `<tenant>` argument (required)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
 	}
 	defer done()
 	if *tenant == "" {
-		return errors.New("--tenant is required")
+		return errors.New("a tenant is required: sbxd admin key create <tenant>")
 	}
 	plaintext, key, err := st.CreateAPIKey(ctx, *tenant)
 	if err != nil {
@@ -337,14 +391,14 @@ func adminKeyCreate(a *adminFlags, args []string) error {
 }
 
 func adminKeyList(a *adminFlags, args []string) error {
-	tenant := a.fs.String("tenant", "", "tenant id (required)")
+	tenant := a.fs.String("tenant", "", "tenant id; the same as the `<tenant>` argument (required)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
 	}
 	defer done()
 	if *tenant == "" {
-		return errors.New("--tenant is required")
+		return errors.New("a tenant is required: sbxd admin key list <tenant>")
 	}
 	keys, err := st.ListAPIKeys(ctx, *tenant)
 	if err != nil {
@@ -370,12 +424,15 @@ func adminKeyList(a *adminFlags, args []string) error {
 }
 
 func adminKeyRevoke(a *adminFlags, args []string) error {
-	id := a.fs.String("id", "", "key id, as printed by key create or key list (required)")
+	id := a.fs.String("id", "", "key id, as printed by key create or key list; the same as the `<key-id>` argument (required)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
 	}
 	defer done()
+	if *id == "" {
+		return errors.New("a key id is required: sbxd admin key revoke <key-id>")
+	}
 	if err := st.RevokeAPIKey(ctx, *id); err != nil {
 		return err
 	}
@@ -403,12 +460,17 @@ type templateFile struct {
 	TmpSize     size    `json:"tmp_size"`
 	NofileLimit int64   `json:"nofile_limit,omitempty"`
 	Network     string  `json:"network,omitempty"`
-	IdleTimeout dur     `json:"idle_timeout,omitempty"`
-	MaxLifetime dur     `json:"max_lifetime,omitempty"`
-	WarmTTL     dur     `json:"warm_ttl,omitempty"`
-	WarmTarget  int     `json:"warm_target"`
-	MaxTotal    int     `json:"max_total,omitempty"`
-	RefillRate  int     `json:"refill_rate,omitempty"`
+	// AllowDomains and AllowCIDRs are the default egress allowlist of
+	// an allowlist template: what a sandbox created without a network
+	// policy of its own may reach.
+	AllowDomains []string `json:"allow_domains,omitempty"`
+	AllowCIDRs   []string `json:"allow_cidrs,omitempty"`
+	IdleTimeout  dur      `json:"idle_timeout,omitempty"`
+	MaxLifetime  dur      `json:"max_lifetime,omitempty"`
+	WarmTTL      dur      `json:"warm_ttl,omitempty"`
+	WarmTarget   int      `json:"warm_target"`
+	MaxTotal     int      `json:"max_total,omitempty"`
+	RefillRate   int      `json:"refill_rate,omitempty"`
 }
 
 // size is a byte count that also unmarshals from "512m".
@@ -450,7 +512,8 @@ func (f templateFile) template() (core.Template, error) {
 		ID: f.ID, Image: f.Image, Runtime: f.Runtime,
 		Resources: core.Resources{CPUs: f.CPUs, MemoryBytes: int64(f.Memory), PidsLimit: f.PidsLimit,
 			WorkdirBytes: int64(f.WorkdirSize), TmpBytes: int64(f.TmpSize), NofileLimit: f.NofileLimit},
-		Network:    core.NetworkMode(f.Network),
+		Network:      core.NetworkMode(f.Network),
+		AllowDomains: f.AllowDomains, AllowCIDRs: f.AllowCIDRs,
 		Timeouts:   core.Timeouts{Idle: time.Duration(f.IdleTimeout), MaxLifetime: time.Duration(f.MaxLifetime), WarmTTL: time.Duration(f.WarmTTL)},
 		WarmTarget: f.WarmTarget, MaxTotal: f.MaxTotal, RefillRate: f.RefillRate,
 	}
@@ -473,6 +536,7 @@ func templateOut(t core.Template) templateFile {
 	return templateFile{ID: t.ID, Version: t.Version, Image: t.Image, Runtime: t.Runtime, CPUs: t.Resources.CPUs,
 		Memory: size(t.Resources.MemoryBytes), PidsLimit: t.Resources.PidsLimit, WorkdirSize: size(t.Resources.WorkdirBytes),
 		TmpSize: size(t.Resources.TmpBytes), NofileLimit: t.Resources.NofileLimit, Network: string(t.Network),
+		AllowDomains: t.AllowDomains, AllowCIDRs: t.AllowCIDRs,
 		IdleTimeout: dur(t.Timeouts.Idle), MaxLifetime: dur(t.Timeouts.MaxLifetime), WarmTTL: dur(t.Timeouts.WarmTTL),
 		WarmTarget: t.WarmTarget, MaxTotal: t.MaxTotal, RefillRate: t.RefillRate}
 }
@@ -494,6 +558,9 @@ func validateTemplate(t core.Template) error {
 			r.WorkdirBytes, r.TmpBytes, r.MemoryBytes)
 	case t.Network != core.NetworkNone && t.Network != core.NetworkAllowlist && t.Network != core.NetworkFull:
 		return fmt.Errorf("network %q is invalid: want none, allowlist or full", t.Network)
+	case (len(t.AllowDomains) > 0 || len(t.AllowCIDRs) > 0) && t.Network != core.NetworkAllowlist:
+		return fmt.Errorf("allow domains and allow CIDRs are the default allowlist of an allowlist template; this template's network is %q "+
+			"(none reaches nothing, full reaches every public address)", t.Network)
 	case t.Timeouts.Idle < 0 || t.Timeouts.MaxLifetime < 0 || t.Timeouts.WarmTTL < 0:
 		return errors.New("timeouts must not be negative")
 	case t.WarmTarget < 0 || t.MaxTotal < 0 || t.RefillRate < 1:
@@ -501,16 +568,45 @@ func validateTemplate(t core.Template) error {
 	case t.MaxTotal > 0 && t.WarmTarget > t.MaxTotal:
 		return fmt.Errorf("warm target (%d) exceeds max total (%d)", t.WarmTarget, t.MaxTotal)
 	}
+	// The same checks the API applies to a sandbox's own policy, so that
+	// a bad default is refused here and not at the first create.
+	if err := egress.ValidatePolicy(t.DefaultPolicy()); err != nil {
+		return fmt.Errorf("default allowlist: %s", strings.TrimPrefix(err.Error(), "egress: "))
+	}
 	return nil
 }
+
+// templateNotes is printed with `template apply -h`: what a template does
+// not carry over from its image is the first thing people trip over.
+const templateNotes = `
+What a sandbox takes from the image, and what it does not:
+  - The image's ENTRYPOINT and CMD are ignored. PID 1 of every sandbox is the
+    Warmbox agent, and nothing runs until a command is sent. A service the
+    image would start has to be started as a (background) command.
+  - The image's USER is ignored. Every process runs as uid 1000, gid 1000
+    (user "sandbox") with no capabilities, whatever the image says.
+  - The root filesystem is read-only. /workspace (HOME, the working
+    directory) and /tmp are size-capped tmpfs mounts; image VOLUMEs are ignored.
+  - The image's ENV is kept. HOME, TMPDIR, PYTHONPYCACHEPREFIX and
+    PYTHONUNBUFFERED are set on top of it, and /workspace/.local/bin is put in
+    front of the image's PATH (where "pip install" puts programs).
+  - The image must already be pulled for this user: podman pull <image>.
+
+Network: --network is the widest mode a sandbox may ask for. With allowlist,
+--allow-domains and --allow-cidrs are what a sandbox reaches when its create
+request names no network policy; a request that names one replaces the list
+(it does not add to it). Without them such a sandbox reaches nothing.
+`
 
 func adminTemplateApply(a *adminFlags, args []string) error {
 	var f templateFile
 	var mem, workdir, tmp string
 	var idle, life, warmTTL time.Duration
 	file := a.fs.String("file", "", "JSON file with one template object or an array of them (\"-\" for stdin); replaces the flags below")
-	a.fs.StringVar(&f.ID, "id", "", "template id")
-	a.fs.StringVar(&f.Image, "image", "", "container image; it must already be pulled for the Podman user")
+	a.fs.StringVar(&f.ID, "id", "", "template id; the same as the `<id>` argument")
+	usage := a.fs.Usage
+	a.fs.Usage = func() { usage(); fmt.Fprint(a.fs.Output(), templateNotes) }
+	a.fs.StringVar(&f.Image, "image", "", "container image; it must already be pulled for the Podman user. Its ENTRYPOINT, CMD and USER are ignored (see below)")
 	a.fs.StringVar(&f.Runtime, "runtime", "crun", "OCI runtime (isolation tier): crun, or runsc for gVisor; it must be among --runtimes")
 	var runtimes string
 	addRuntimeFlags(a.fs, &runtimes)
@@ -521,6 +617,10 @@ func adminTemplateApply(a *adminFlags, args []string) error {
 	a.fs.StringVar(&tmp, "tmp-size", "64m", "size of the /tmp tmpfs")
 	a.fs.Int64Var(&f.NofileLimit, "nofile", defaultNofile, "open file limit")
 	a.fs.StringVar(&f.Network, "network", "none", "widest network mode a sandbox may ask for: none, allowlist or full")
+	var allowDomains, allowCIDRs string
+	a.fs.StringVar(&allowDomains, "allow-domains", "", "with --network allowlist: comma-separated `hosts` a sandbox may reach when its create request names no "+
+		"network policy, e.g. pypi.org,files.pythonhosted.org; *.example.com matches subdomains, not example.com itself")
+	a.fs.StringVar(&allowCIDRs, "allow-cidrs", "", "with --network allowlist: comma-separated `cidrs` reachable by IP address in the same case, e.g. 203.0.113.0/24")
 	a.fs.DurationVar(&idle, "idle-timeout", 10*time.Minute, "terminate a sandbox after this long without activity (0 disables)")
 	a.fs.DurationVar(&life, "max-lifetime", time.Hour, "hard cap on a sandbox's lifetime (0 disables)")
 	a.fs.DurationVar(&warmTTL, "warm-ttl", 30*time.Minute, "recycle a warm sandbox that was never claimed after this long (0 disables)")
@@ -559,6 +659,7 @@ func adminTemplateApply(a *adminFlags, args []string) error {
 			*s.out = size(n)
 		}
 		f.IdleTimeout, f.MaxLifetime, f.WarmTTL = dur(idle), dur(life), dur(warmTTL)
+		f.AllowDomains, f.AllowCIDRs = splitList(allowDomains), splitList(allowCIDRs)
 		t, err := f.template()
 		if err != nil {
 			return err
@@ -653,22 +754,29 @@ func adminTemplateList(a *adminFlags, args []string) error {
 		}
 		return a.printJSON(out)
 	}
-	a.table("ID\tVERSION\tIMAGE\tCPUS\tMEMORY\tPIDS\tNETWORK\tIDLE\tMAX_LIFETIME\tWARM\tMAX", func(w io.Writer) {
+	a.table("ID\tVERSION\tIMAGE\tRUNTIME\tCPUS\tMEMORY\tPIDS\tNETWORK\tIDLE\tMAX_LIFETIME\tWARM\tMAX", func(w io.Writer) {
 		for _, t := range templates {
-			fmt.Fprintf(w, "%s\t%d\t%s\t%g\t%s\t%d\t%s\t%s\t%s\t%d\t%d\n", t.ID, t.Version, t.Image, t.Resources.CPUs,
-				humanSize(t.Resources.MemoryBytes), t.Resources.PidsLimit, t.Network, t.Timeouts.Idle, t.Timeouts.MaxLifetime, t.WarmTarget, t.MaxTotal)
+			network := string(t.Network)
+			if n := len(t.AllowDomains) + len(t.AllowCIDRs); n > 0 {
+				network += fmt.Sprintf(" (%d allowed)", n)
+			}
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%g\t%s\t%d\t%s\t%s\t%s\t%d\t%d\n", t.ID, t.Version, t.Image, t.Runtime, t.Resources.CPUs,
+				humanSize(t.Resources.MemoryBytes), t.Resources.PidsLimit, network, t.Timeouts.Idle, t.Timeouts.MaxLifetime, t.WarmTarget, t.MaxTotal)
 		}
 	})
 	return nil
 }
 
 func adminTemplateShow(a *adminFlags, args []string) error {
-	id := a.fs.String("id", "", "template id (required)")
+	id := a.fs.String("id", "", "template id; the same as the `<id>` argument (required)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
 	}
 	defer done()
+	if *id == "" {
+		return errors.New("a template id is required: sbxd admin template show <id>")
+	}
 	t, err := st.GetTemplate(ctx, *id)
 	if err != nil {
 		return err
@@ -677,12 +785,15 @@ func adminTemplateShow(a *adminFlags, args []string) error {
 }
 
 func adminTemplateDelete(a *adminFlags, args []string) error {
-	id := a.fs.String("id", "", "template id (required)")
+	id := a.fs.String("id", "", "template id; the same as the `<id>` argument (required)")
 	st, ctx, done, err := a.open(args)
 	if err != nil {
 		return err
 	}
 	defer done()
+	if *id == "" {
+		return errors.New("a template id is required: sbxd admin template delete <id>")
+	}
 	if err := st.DeleteTemplate(ctx, *id); err != nil {
 		return err
 	}

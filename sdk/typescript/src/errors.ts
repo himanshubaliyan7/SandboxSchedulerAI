@@ -63,6 +63,16 @@ export class NotFoundError extends SandboxError {}
 /** 400 / 413: the request was malformed or a value was out of range. */
 export class ValidationError extends SandboxError {}
 
+/**
+ * The command could not be started: the executable does not exist in the
+ * image (`command_not_found`), is not something the kernel can run
+ * (`exec_format`), or the working directory is unusable (`bad_cwd`).
+ * Nothing ran. It is a {@link ValidationError}, as these codes were
+ * before the class existed, so older `instanceof` checks keep working.
+ * (Python: `CommandStartError`.)
+ */
+export class CommandStartError extends ValidationError {}
+
 /** 403: the sandbox user may not access the path or run the file. */
 export class PermissionDeniedError extends SandboxError {}
 
@@ -168,6 +178,18 @@ export class CommandExitError extends SandboxError implements CommandExit {
   }
 }
 
+/**
+ * The command was killed because its per-command timeout (`timeoutMs`,
+ * 60 s by default) expired: a {@link CommandExitError} whose `reason` is
+ * `timeout`. (Python: `CommandTimeoutError`.)
+ */
+export class CommandTimeoutError extends CommandExitError {}
+
+/** The error for a command that ended with a non-zero exit code: the timeout subclass when that is why. */
+export function commandExitError(result: CommandExit): CommandExitError {
+  return result.reason === 'timeout' ? new CommandTimeoutError(result) : new CommandExitError(result)
+}
+
 /** The body of the server's error envelope (also the payload of an NDJSON `error` event). */
 export interface ErrorBody {
   code?: unknown
@@ -233,13 +255,14 @@ export function errorFromBody(
     case 'network_not_allowed':
     case 'payload_too_large':
     case 'too_large':
-    case 'bad_cwd':
     case 'bad_signal':
     case 'bad_frame':
-    case 'command_not_found':
-    case 'exec_format':
     case 'method_not_allowed':
       return new ValidationError(message, init)
+    case 'command_not_found':
+    case 'exec_format':
+    case 'bad_cwd':
+      return new CommandStartError(message, init)
     case 'permission_denied':
       return new PermissionDeniedError(message, init)
     case 'no_space':

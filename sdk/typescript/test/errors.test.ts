@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 import {
   AuthenticationError,
   CommandExitError,
+  CommandStartError,
+  CommandTimeoutError,
   ConflictError,
+  commandExitError,
   errorFromBody,
   InternalServerError,
   NotEnoughSpaceError,
@@ -37,7 +40,9 @@ describe('errorFromBody', () => {
     [400, 'bad_request', ValidationError],
     [400, 'invalid_timeout', ValidationError],
     [400, 'network_not_allowed', ValidationError],
-    [400, 'command_not_found', ValidationError],
+    [400, 'command_not_found', CommandStartError],
+    [400, 'exec_format', CommandStartError],
+    [400, 'bad_cwd', CommandStartError],
     [413, 'payload_too_large', ValidationError],
     [403, 'permission_denied', PermissionDeniedError],
     [409, 'tag_in_use', ConflictError],
@@ -117,6 +122,20 @@ describe('parseRetryAfter', () => {
     const now = Date.parse('2026-10-10T00:00:00Z')
     expect(parseRetryAfter('Sat, 10 Oct 2026 00:00:07 GMT', now)).toBe(7000)
     expect(parseRetryAfter('Sat, 10 Oct 2020 00:00:00 GMT', now)).toBe(0)
+  })
+})
+
+describe('CommandStartError and CommandTimeoutError', () => {
+  it('keep the classes they had before they existed', () => {
+    const start = errorFromBody(400, { code: 'command_not_found', message: 'command not found: nosuch' })
+    expect(start).toBeInstanceOf(CommandStartError)
+    expect(start).toBeInstanceOf(ValidationError)
+    const exit = { pid: 'p1', exitCode: 137, signal: 'SIGKILL', stdout: '', stderr: '', truncated: false, droppedBytes: 0 }
+    const timedOut = commandExitError({ ...exit, reason: 'timeout' })
+    expect(timedOut).toBeInstanceOf(CommandTimeoutError)
+    expect(timedOut).toBeInstanceOf(CommandExitError)
+    expect(timedOut).toMatchObject({ name: 'CommandTimeoutError', reason: 'timeout', code: 'command_exit' })
+    expect(commandExitError({ ...exit, reason: 'killed' })).not.toBeInstanceOf(CommandTimeoutError)
   })
 })
 

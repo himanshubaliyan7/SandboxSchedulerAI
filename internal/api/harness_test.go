@@ -152,13 +152,14 @@ func (f *fakeStore) SetLifetime(ctx context.Context, id string, generation int64
 	if sb.Generation != generation {
 		return core.Sandbox{}, store.ErrStaleGeneration
 	}
-	exp := time.Now().Add(fromNow)
+	now := time.Now()
+	exp := now.Add(fromNow)
 	if maxTotal > 0 {
 		if limit := sb.AssignedAt.Add(maxTotal); limit.Before(exp) {
-			exp = limit
+			return core.Sandbox{}, &store.LifetimeExceededError{Max: limit.Sub(now)}
 		}
 	}
-	f.Update(id, func(s *core.Sandbox) { s.ExpiresAt = &exp })
+	f.Update(id, func(s *core.Sandbox) { s.ExpiresAt = &exp; s.LastActivityAt = &now })
 	return f.GetSandbox(ctx, id)
 }
 

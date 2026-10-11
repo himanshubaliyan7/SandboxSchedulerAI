@@ -74,6 +74,12 @@ type createSpec struct {
 	SeccompProfile  string      `json:"seccomp_profile_path,omitempty"`
 	UserNS          namespace   `json:"userns"`
 	IDMappings      *idMappings `json:"idmappings,omitempty"`
+	// PasswdEntry and GroupEntry are the lines Libpod writes to the
+	// container's /etc/passwd and /etc/group for User; see SandboxUser.
+	PasswdEntry string `json:"passwd_entry"`
+	GroupEntry  string `json:"group_entry"`
+	// Mask is added to Libpod's default masked paths.
+	Mask []string `json:"mask"`
 
 	ReadOnlyFilesystem bool `json:"read_only_filesystem"`
 	ReadWriteTmpfs     bool `json:"read_write_tmpfs"`
@@ -196,13 +202,66 @@ const PycachePrefix = "/tmp/pycache"
 //     does not add to it); callers of such a template can pass
 //     PYTHONPYCACHEPREFIX="" in the sandbox env, which Python treats as
 //     unset.
-func DefaultEnv() map[string]string {
+//   - PYTHONUNBUFFERED=1: a command's stdout is a pipe to the agent, and
+//     Python block-buffers a pipe, so without this a caller streaming the
+//     output of `python3 -m http.server` or of a long-running script sees
+//     nothing until 8 KiB have accumulated or the process ends, which is
+//     not what someone watching a stream expects. The cost is one write
+//     per print instead of one per 8 KiB (measured in the README: a
+//     print-heavy loop is slower, most of all under gVisor); a caller who
+//     wants the buffering back passes PYTHONUNBUFFERED="" in the sandbox
+//     or command env, which Python treats as unset.
+//   - PATH is the image's own PATH with UserBinDir in front. The root is
+//     read-only and the process is uid 1000, so `pip install` falls back
+//     to a user install under HOME (/workspace/.local), and the console
+//     scripts it writes land in /workspace/.local/bin; without this entry
+//     an installed tool is not found by name. The image's PATH is passed
+//     in by the backend, which reads it from the image (Backend.Create);
+//     it has to be, because a value set here replaces the image's
+//     variable instead of extending it, and images do extend PATH (Go,
+//     Rust and conda images, for example).
+func DefaultEnv(imagePath string) map[string]string {
+	if imagePath == "" {
+		imagePath = StandardPath
+	}
 	return map[string]string{
 		"HOME":                runtime.Workdir,
 		"TMPDIR":              "/tmp",
 		"PYTHONPYCACHEPREFIX": PycachePrefix,
+		"PYTHONUNBUFFERED":    "1",
+		"PATH":                UserBinDir + ":" + imagePath,
 	}
 }
+
+// UserBinDir is where per-user installs put their programs when HOME is
+// the work directory (`pip install --user`, pipx, cargo and others follow
+// the same ~/.local/bin convention).
+const UserBinDir = runtime.Workdir + "/.local/bin"
+
+// StandardPath is the PATH Podman gives a container whose image sets
+// none; DefaultEnv extends it when the image's own is not known.
+const StandardPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// SandboxUser is the name of the sandbox user and group inside every
+// sandbox, whatever the host account is called.
+//
+// Left to itself, Libpod names the container user after the host: with
+// the keep-id mapping it copies the service user's passwd entry (login
+// name and full name) into the container's /etc/passwd, so `whoami`,
+// `id` and getpwuid() in a sandbox print the operator's account name to
+// untrusted code. passwd_entry and group_entry replace that line with a
+// fixed one. The home directory is the work directory (as HOME in
+// DefaultEnv) and the shell is /bin/sh, which every supported image has.
+const SandboxUser = "sandbox"
+
+// maskedPaths are hidden from a sandbox in addition to Libpod's default
+// masked paths: the DMI tables name the host's vendor, model and serial
+// numbers, which identify the machine and are of no use to sandboxed
+// code. (Under runsc /sys is gVisor's own and has no such directory; the
+// entry is then ignored.)
+var maskedPaths = []string{dmiPath}
+
+const dmiPath = "/sys/devices/virtual/dmi"
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,200}$`)
 
@@ -294,7 +353,9 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		// The host environment and host proxy variables are never
 		// forwarded (env_host, httpproxy): the proxy is configured per
 		// session by the agent, and host variables may hold secrets.
-		Env:      DefaultEnv(),
+		// PATH is derived from the image's own; Backend.Create replaces
+		// this default with it (imageEnvPath).
+		Env:      DefaultEnv(""),
 		WorkDir:  runtime.Workdir,
 		Hostname: DefaultHostname,
 
@@ -334,6 +395,9 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 		// Non-root inside the container, no capabilities in any set, and
 		// no way to regain them through setuid binaries or file caps.
 		User:            user,
+		PasswdEntry:     fmt.Sprintf("%s:x:%d:%d:%s:%s:/bin/sh", SandboxUser, cfg.ContainerUID, cfg.ContainerGID, SandboxUser, runtime.Workdir),
+		GroupEntry:      fmt.Sprintf("%s:x:%d:", SandboxUser, cfg.ContainerGID),
+		Mask:            append([]string(nil), maskedPaths...),
 		Privileged:      false,
 		CapAdd:          []string{},
 		CapDrop:         []string{"ALL"},
@@ -375,9 +439,17 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 			// memory.swap.max 0. Left unset, Podman allows swap equal to
 			// the memory limit again, doubling what a sandbox can hold.
 			Memory: memoryLimits{Limit: res.MemoryBytes, Swap: res.MemoryBytes},
-			// pids.max is the fork-bomb control. An nproc rlimit is
-			// deliberately not used: it is per host user, so it would
-			// be shared by every sandbox of the pool.
+			// pids.max is the fork-bomb control. An nproc rlimit set
+			// here is deliberately not used. Measured on kernel 7.0 with
+			// RLIMIT_NPROC=30 on each of two containers: 12 forks
+			// succeeded in one under keep-id (the other did not start),
+			// 10 and 11 under nomap, 28 and 0 under the host mapping. The
+			// kernel counts the limit per user namespace, but a limit
+			// that is in force when the namespace is created is also
+			// applied to the parent namespace's count, which holds every
+			// sandbox of the pool. See "Process limit" in
+			// docs/operations.md for why the agent does not lower it for
+			// its children either.
 			Pids: pidsLimits{Limit: res.PidsLimit},
 			// memory.oom.group makes an OOM kill take the whole sandbox,
 			// not one process of a then half-dead tree.
@@ -462,6 +534,13 @@ func buildCreateSpec(cfg Config, spec runtime.Spec) (*createSpec, error) {
 			Destination: runtime.AgentBinary, Type: "bind", Source: spec.AgentBinaryPath,
 			Options: []string{"rbind", "ro", "nosuid", "nodev", "exec", "rprivate"},
 		})
+	}
+	if ociRuntime == RunscRuntime {
+		// runsc does not apply masked paths to its own sysfs, which
+		// publishes the host's DMI product name; an empty read-only tmpfs
+		// over the directory hides it the way the mask does under crun.
+		s.Mounts = append(s.Mounts, ociMount{Destination: dmiPath + "/id", Type: "tmpfs", Source: "tmpfs",
+			Options: []string{"ro", "nosuid", "nodev", "noexec", "size=4096", "mode=0555"}})
 	}
 	return s, nil
 }

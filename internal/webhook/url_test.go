@@ -301,3 +301,15 @@ func TestCheckForStoring(t *testing.T) {
 		t.Errorf("public literal: %v", err)
 	}
 }
+
+func TestLogURLDropsPathAndQuery(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://hooks.example.com/services/T000/B000/s3cr3tPath?token=abc": "https://hooks.example.com/...",
+		"https://example.com:8443": "https://example.com:8443/...",
+		"::not a url":              "(unparsable)",
+	} {
+		if got := LogURL(in); got != want {
+			t.Errorf("LogURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

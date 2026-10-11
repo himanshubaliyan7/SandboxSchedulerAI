@@ -8,7 +8,16 @@
  * with a `truncated` event, which the handle surfaces instead of hiding.
  */
 
-import { type CommandExit, CommandExitError, ConnectionError, type ErrorBody, errorFromBody, SandboxError, TimeoutError } from './errors.js'
+import {
+  type CommandExit,
+  CommandExitError,
+  ConnectionError,
+  commandExitError,
+  type ErrorBody,
+  errorFromBody,
+  SandboxError,
+  TimeoutError,
+} from './errors.js'
 import type { ApiClient, CallOptions } from './http.js'
 import { readNdjson } from './ndjson.js'
 import { type CommandInfo, commandInfoFromWire, type ExitReason, exitFromWire, list, type Signal } from './types.js'
@@ -271,15 +280,16 @@ export class CommandHandle implements AsyncIterable<CommandEvent> {
 
   /**
    * Waits for the command to exit and returns its result. Rejects with
-   * {@link CommandExitError} on a non-zero exit code unless
-   * `throwOnNonZeroExit` is false, and with the stream's error if the
-   * output stream could not be kept alive.
+   * {@link CommandExitError} on a non-zero exit code (its subclass
+   * {@link CommandTimeoutError} when the per-command timeout killed it)
+   * unless `throwOnNonZeroExit` is false, and with the stream's error if
+   * the output stream could not be kept alive.
    */
   async wait(opts: { throwOnNonZeroExit?: boolean } = {}): Promise<CommandResult> {
     if (!this.#iterating) this.#queue = null
     const result = await this.#done.promise
     const strict = opts.throwOnNonZeroExit ?? this.#opts.throwOnNonZeroExit ?? this.#ctx.throwOnNonZeroExit
-    if (strict && result.exitCode !== 0) throw new CommandExitError(result)
+    if (strict && result.exitCode !== 0) throw commandExitError(result)
     return result
   }
 

@@ -151,6 +151,18 @@ type Stats struct {
 }
 
 // Backend is one isolation engine on one host.
+// LeftoverReaper is implemented by a backend whose instances can leave
+// host processes behind that the backend's own listing no longer shows
+// (Podman: a conmon whose container was removed while it was between
+// "created" and "started"; see podman.Leftover). The pool's reconciler
+// calls it on every pass.
+type LeftoverReaper interface {
+	// ReapLeftovers ends the leftovers of the sandboxes for which owned
+	// returns true and reports how many it ended. Leftovers of other
+	// sandboxes are not touched: they may be another scheduler's.
+	ReapLeftovers(ctx context.Context, owned func(sandboxID string) bool) (int, error)
+}
+
 type Backend interface {
 	Name() string
 	Capabilities() Capabilities

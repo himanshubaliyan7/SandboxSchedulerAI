@@ -112,6 +112,9 @@ class Files:
         ``data`` may be ``str`` (written as UTF-8), bytes, or a file-like
         object, which is streamed in chunks and never read into memory as a
         whole. The file appears atomically when the upload is complete.
+
+        Returns a :class:`~sbx.WriteInfo`: the file's name, its absolute
+        path and the number of bytes written.
         """
         params: dict[str, str] = {"path": path}
         octal = _mode(mode)
@@ -124,7 +127,7 @@ class Files:
             body = bytes(data)
             sent[0] = len(body)
             self._api.request("PUT", self._base, plane="data", params=params, content=body, idempotent=True)
-            return WriteInfo(path=path, size=sent[0])
+            return WriteInfo.for_path(path, sent[0])
 
         reader: Any = data
         if not callable(getattr(reader, "read", None)):
@@ -152,7 +155,7 @@ class Files:
             idempotent=True,
             retries=start is not None,
         )
-        return WriteInfo(path=path, size=sent[0])
+        return WriteInfo.for_path(path, sent[0])
 
     def write_files(self, files: Iterable[FileSpec]) -> List[WriteInfo]:
         """Upload several files, one after another.
