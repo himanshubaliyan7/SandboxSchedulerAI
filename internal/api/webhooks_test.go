@@ -500,6 +500,10 @@ func TestWebhookDeliveryOfARealSandboxLife(t *testing.T) {
 	if !strings.Contains(string(r.Body), `"exit_code":3`) {
 		t.Fatalf("command: %s", r.Body)
 	}
+	// ?wait=true answers from its own read of the process stream; the
+	// recorder writes command_finished from another. Deleting before that
+	// write would put sandbox.terminated ahead of it.
+	eventually(t, "command.finished recorded before the delete", func() bool { return filtered.count() >= 1 })
 	h.want(h.do("DELETE", "/v1/sandboxes/"+sb.ID, nil, withKey(keyA)), 204, "")
 
 	want := []string{"sandbox.created", "sandbox.running", "command.started", "command.finished", "sandbox.terminated", "sandbox.destroyed"}
