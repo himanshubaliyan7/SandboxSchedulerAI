@@ -851,7 +851,9 @@ func TestTimeoutEndpointStaysWithinTemplateLimits(t *testing.T) {
 	}
 	// Setting the timeout is activity: it restarts the idle timer.
 	// Reading the sandbox is not.
-	old := time.Now().Add(-10 * time.Minute)
+	// Kept inside the template's 10-minute idle timeout: at or past it,
+	// the sweeper may end the sandbox before the next request.
+	old := time.Now().Add(-9*time.Minute - 30*time.Second)
 	h.st.Update(sb.ID, func(s *core.Sandbox) { s.LastActivityAt = &old })
 	h.want(h.do("GET", "/v1/sandboxes/"+sb.ID, nil, withKey(keyA)), 200, "").json(t, &v)
 	h.want(h.do("GET", "/v1/sandboxes", nil, withKey(keyA)), 200, "")
