@@ -1,6 +1,12 @@
-# bench: phase-0 benchmark harness
+# bench: benchmark harnesses
 
-Results and their interpretation for the first host measured are in `RESULTS.md`.
+Two harnesses live here:
+
+- `sbxbench.py` drives Podman directly (phase 0, crun). Results: `RESULTS.md`.
+- `tierbench.py` drives a real `sbxd` and compares the crun and gVisor tiers.
+  Results: `TIERS.md`. See "tierbench" at the end of this file.
+
+The rest of this file up to "tierbench" describes `sbxbench.py`.
 
 Measures the numbers the build plan could not source (`docs/research/build-plan.md`,
 "What research could not source, and so must be measured in phase 0") on the host it
@@ -106,6 +112,41 @@ podman unshare rm -rf bench/.work "$XDG_RUNTIME_DIR"/sbxb-*
 
 ## Not covered here
 
-gVisor (`runsc` is selected by `--runtime runsc` for the workload suite but was not
-installed where this was written), Podman 6, Firecracker, the egress tamper tests, and
-any root-only setting (XFS project quotas, raising sysctls).
+Podman 6, Firecracker, the egress tamper tests, and any root-only setting (XFS project
+quotas, raising sysctls). gVisor is covered by `tierbench.py`, below.
+
+## tierbench
+
+`tierbench.py` starts its own `sbxd` in managed Podman mode with both tiers enabled, its
+own Postgres (Docker, container `sbx-bn-pg`, port 55446), host ids `sbxbench-*`, run dirs
+under `$XDG_RUNTIME_DIR` and ports 18461/18462, and drives the REST API. Python 3 standard
+library only. It needs rootless Podman, Docker for Postgres, Go, and `runsc` at
+`~/.local/opt/gvisor/runsc`.
+
+```sh
+python3 bench/tierbench.py setup                 # build from git HEAD, start Postgres and the server, fill the pools
+python3 bench/tierbench.py run claim,create,startup --round 1
+python3 bench/tierbench.py run rate,density --round 1
+python3 bench/tierbench.py run wl --round 1      # --images alpine|slim, --only <workloads> to split it
+python3 bench/tierbench.py run stream,limits,net --round 1 --download 3
+python3 bench/tierbench.py run knobs --round 1
+python3 bench/tierbench.py report                # results.json, summary.csv, summary.md
+python3 bench/tierbench.py teardown --images --work
+```
+
+Repeat the `run` lines with `--round 2`, `--round 3` at different times; the order of the
+tiers inside a block alternates with the round. `setup --run <name>` continues an existing
+results directory after an interruption, which is how the published run was finished.
+
+Each measurement is a block (one tier, one cell, one round), written to
+`bench/results/<run>/blocks/` the moment it ends with the load average, `MemAvailable` and
+host busy share at its start and end, so an interrupted run loses at most one block.
+`report` pools the samples of a cell over the rounds and prints p50, p95, the per-round
+medians and the runsc-over-crun ratio; blocks that started at a load average of 3 or more
+and every recorded error are listed at the end of `summary.md`.
+
+Everything written under `bench/` passes through a redaction step that replaces the home
+directory, user name and host name; `report` checks the tree and says so if any is left.
+The binaries are built once from `git archive HEAD` into `bench/.work/` (git-ignored), never
+from the working tree. Only containers labelled with the harness's own host ids are ever
+removed.

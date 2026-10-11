@@ -1,0 +1,3 @@
+# Workload image for bench/tierbench.py (musl). Removed again by `tierbench.py teardown`.
+FROM docker.io/library/python:3.12-alpine
+RUN apk add --no-cache git && pip install --no-cache-dir --no-compile numpy==2.1.2

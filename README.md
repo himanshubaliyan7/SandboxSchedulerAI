@@ -429,33 +429,40 @@ sandboxes; that mode is not the default.)
 
 ### crun and gVisor side by side
 
-One server, two templates that differ only in `--runtime` (python:3.12-alpine,
-1 CPU, 256 MiB), same laptop, release-20261005.0 of gVisor on the systrap
-platform. A first measurement, not a benchmark: one machine, small samples, other
-work running.
+One server, two templates that differ only in `--runtime`, same laptop,
+release-20261005.0 of gVisor on the systrap platform, three rounds. p50 values on
+`python:3.12-alpine` unless the row says otherwise; the method, every table and
+the limits of these numbers are in [`bench/TIERS.md`](bench/TIERS.md).
 
 | Measurement | crun | runsc (gVisor) |
 |---|---|---|
-| Create to agent ready (p50, n=24, one at a time) | 130 ms | 203 ms |
-| Warm claim, `POST /v1/sandboxes` (p50 / p95, n=30) | 5.8 / 12.9 ms | 7.6 / 8.9 ms |
-| Claim to first output byte (p50, n=30) | 11.2 ms | 18.0 ms |
-| Idle host memory per warm sandbox (44 sandboxes) | 2.2 MB | 19 MB |
-| `python3 -c pass` (mean of 20) | 17.5 ms | 61 ms |
-| 30 stdlib imports, bytecode cached | 148 ms | 401 ms |
-| The same, uncached (first import in a sandbox) | 1.1 s | 3.9 s |
-| Shell loop, 500 x fork+exec of `/bin/true` | 0.31 s | 3.1 s |
-| 2,000 small files written, read and removed in `/workspace` | 61 ms | 386 ms |
-| 1,500 files read from the image | 22 ms | 282 ms |
-| Memory bomb to reported `oom_killed` | 0.35 s | 0.53 s |
-| `pip install requests` on python:3.12-alpine (one run, with download) | 5.0 s | 10.2 s |
-| The same on python:3.12-slim | 3.9 s | 5.2 s |
-| 200,000 `print()` lines, unbuffered as by default (best of 3) | 4.4 s | 44 s |
-| The same with `PYTHONUNBUFFERED=""` (block-buffered) | 0.6 s | 2.6 s |
+| Warm claim, `POST /v1/sandboxes` (p50 / p95, n=90) | 10.5 / 30 ms | 12.7 / 32 ms |
+| Claim to first output byte | 18.6 ms | 26.8 ms |
+| Create to WARM, one at a time | 102 ms | 205 ms |
+| Pool refill rate, 2 workers | 15.5 /s | 7.5 /s |
+| Idle memory per warm sandbox (cgroup) | 2.3 MB | 17.1 MB |
+| Sandboxes per GB of `MemAvailable` | about 250 | about 60 |
+| `python3 -c pass` | 18.5 ms | 74 ms |
+| The same on python:3.12-slim | 13.9 ms | 24.6 ms |
+| 30 stdlib imports, bytecode cached | 214 ms | 523 ms |
+| The same, uncached | 1.3 s | 4.2 s |
+| Pure-Python CPU loop | 317 ms | 292 ms |
+| Shell loop, 500 x fork+exec of `/bin/true` | 0.28 s | 3.1 s |
+| 2,000 small files written, read and removed in `/workspace` | 98 ms | 534 ms |
+| 1,500 files read from the image | 27 ms | 218 ms |
+| 200 git commits (automatic maintenance off) | 1.1 s | 8.6 s |
+| Memory bomb to reported `oom_killed` | 0.42 s | 0.68 s |
+| `pip install requests`, cold | 4.1 s | 10.0 s |
+| The same on python:3.12-slim | 2.8 s | 3.8 s |
+| 256 KiB of short lines through a PTY | 0.7 s | 10.3 s |
+| 200,000 `print()` lines, unbuffered as by default (best of 3, earlier run) | 4.4 s | 44 s |
+| The same with `PYTHONUNBUFFERED=""` (block-buffered, earlier run) | 0.6 s | 2.6 s |
 
 A claim costs the same on both tiers because it is a database pop; the price of
 gVisor is paid by the code that runs afterwards, most of all by process creation
-and file access, and by the 16 MiB or so of every sandbox's memory limit that
-its sentry uses. The last two rows are the price of the default
+and file access, and by the 17 MiB or so of every sandbox's memory limit that
+its sentry uses. Debian-based images cost markedly less under gVisor than
+Alpine ones. The last two rows are the price of the default
 `PYTHONUNBUFFERED=1`: every `print` becomes a write, which is what lets a
 caller see output as it is produced, and which a program that prints hundreds
 of thousands of lines can switch off for itself.
@@ -469,7 +476,8 @@ the hardened tier:
 - a private, supervised Podman service per server (managed mode, the default),
   which removed the per-user key ceiling;
 - the gVisor tier: `--runtimes crun,runsc`, `--runtime runsc` per template,
-  the whole test suite on both tiers, and first measurements side by side;
+  the whole test suite on both tiers, and a three-round benchmark of both
+  tiers ([`bench/TIERS.md`](bench/TIERS.md));
 - lifecycle webhooks ([`docs/webhooks.md`](docs/webhooks.md));
 - migration guides from [E2B](docs/migrating-from-e2b.md) and from
   [open-source Daytona](docs/migrating-from-daytona.md);

@@ -1,0 +1,86 @@
+{
+ "commit": "fe5655d9f7a5e791392f3f3eaaed071f524004a6",
+ "kernel": "7.0.0-28-generic",
+ "cpu_model": "Intel(R) Core(TM) i5-7200U CPU @ 2.50GHz",
+ "cpu_threads": 4,
+ "cpu_governor": "powersave",
+ "cpu_scaling_driver": "intel_pstate",
+ "transparent_hugepage": {
+  "enabled": "always [madvise] never",
+  "shmem_enabled": "always within_size advise [never] deny force"
+ },
+ "meminfo_kb": {
+  "MemTotal": 12021128,
+  "MemAvailable": 6939024,
+  "SwapTotal": 10204860,
+  "SwapFree": 9886328
+ },
+ "podman": "podman version 4.9.3",
+ "crun": "crun version 1.14.1",
+ "runsc": [
+  "runsc version release-20261005.0",
+  "spec: 1.2.1"
+ ],
+ "runsc_path": "~/.local/opt/gvisor/runsc",
+ "runsc_platform": "systrap (default; --platform not set)",
+ "podman_info": {
+  "graph_driver": "overlay",
+  "graph_root": "~/.local/share/containers/storage",
+  "cgroup_manager": "systemd",
+  "cgroup_version": "v2",
+  "cgroup_controllers": [
+   "memory",
+   "pids"
+  ],
+  "conmon": "conmon version 2.1.10, commit: unknown",
+  "oci_runtime": "crun version 1.14.1"
+ },
+ "go": "go version go1.27.2 linux/amd64",
+ "python": "3.12.3",
+ "postgres_image": "postgres:17-alpine",
+ "load_average_at_setup": [
+  0.49,
+  0.58,
+  0.67
+ ],
+ "time": "2026-10-11 01:06:22 +0530",
+ "top_cpu_at_setup": [
+  "%CPU %MEM COMMAND",
+  "31.6  2.1 chrome",
+  " 8.9  0.0 python3",
+  " 7.0  0.0 python3",
+  " 2.6  0.2 python3",
+  " 2.6  0.2 postgres",
+  " 1.4  3.7 claude",
+  " 0.9  0.0 containerd-shim",
+  " 0.8  3.0 gnome-shell"
+ ],
+ "postgres": "PostgreSQL 17.11 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+ "preflight": [
+  "OK    cgroup_v2             unified hierarchy; root controllers: cpuset cpu io memory hugetlb pids rdma misc dmem",
+  "WARN  cgroup_delegation     delegated: cpu memory pids; not delegated: io, cpuset (no I/O throttling or CPU pinning)",
+  "                            -> as root, create /etc/systemd/system/user@.service.d/delegate.conf containing `[Service]` and `Delegate=cpu cpuset io memory pids`, run `systemctl daemon-reload`, then log the user out and back in (or reboot)",
+  "OK    xdg_runtime_dir       /run/user/1000",
+  "OK    systemd_user_session  systemd user manager is running (/run/user/1000/systemd)",
+  "WARN  linger                lingering is not enabled for user: every sandbox is killed when the user's last session ends",
+  "                            -> loginctl enable-linger user",
+  "OK    subuid                65536 IDs (100000+65536)",
+  "OK    subgid                65536 IDs (100000+65536)",
+  "OK    newuidmap             newuidmap and newgidmap found",
+  "OK    user_namespaces       user.max_user_namespaces=40650",
+  "OK    apparmor_userns       restriction is on (=1); AppArmor profiles allowing user namespaces found for: podman, crun, runc",
+  "WARN  inotify_instances     fs.inotify.max_user_instances=512 (< 1024): shared by all sandboxes of the user, a dense pool will exhaust it",
+  "                            -> as root: sysctl -w fs.inotify.max_user_instances=8192 (persist it in /etc/sysctl.d)",
+  "OK    kernel_keys           kernel.keys.maxkeys=200, 6 in use by user; sbxd's own Podman service runs with keyring = false, so sandboxes take no key and this quota does not limit them",
+  "OK    nofile_rlimit         soft=1048576 hard=1048576",
+  "OK    kernel_version        7.0.0-28-generic (native rootless overlayfs and cgroup.kill available)",
+  "OK    podman_binary         /usr/bin/podman: version 4.9.3",
+  "OK    podman_service        managed: a private `podman system service` with sbxd's configuration starts and answers (Libpod API 4.9.3)",
+  "OK    crun                  /usr/bin/crun: crun version 1.14.1; enabled (sandboxes share the host kernel)",
+  "OK    runsc                 ~/.local/opt/gvisor/runsc: runsc version release-20261005.0; enabled and usable (user-space kernel; limits through systemd scopes)",
+  "INFO  kvm                   /dev/kvm is present (a microVM tier is possible on this host; nothing here needs it)",
+  "WARN  swap                  swap is enabled (/swap.img, /dev/zram0): sandboxes cannot use it (memory.swap.max=0), but the host can, which hides memory pressure behind latency",
+  "                            -> as root: swapoff -a and remove the swap entries from /etc/fstab on dedicated sandbox hosts",
+  "20 checks: 0 failed, 4 warnings"
+ ]
+}
